@@ -30,7 +30,9 @@ The second path provides Pinocchio's dependencies (`eigenpy`, `coal`). Packages 
 ## Run
 
 ```bash
-venv/bin/python rigid_body_dynamics/franka_dynamics.py
+venv/bin/python -m test.meshcat_viz
 ```
 
-Loads the model and prints gravity torques (RNEA), mass matrix (CRBA), forward dynamics (ABA) and forward kinematics at the neutral configuration.
+Closed-loop CasADi/IPOPT MPC on the FR3 (`dynamics/franka_dynamics.py`, 9 DoF: 7 arm joints + 2 gripper fingers), played back in Meshcat. Start and goal are TCP poses (SE(3)): the start is turned into a joint state by one IK solve, the goal enters the cost through a CasADi forward-kinematics pose error. The red sphere marks the goal position (visual only).
+
+Planning uses an inverse-dynamics formulation: the decision variables are joint accelerations `a`, and the torques `tau = RNEA(q, v, a)` are constrained to the effort limits. Brew's Pinocchio has no CasADi bindings, so the RNEA and FK are written symbolically in CasADi from the Pinocchio model data and checked against Pinocchio; the simulated plant uses `pin.aba`.
