@@ -28,7 +28,6 @@ def main() -> None:
     config = {
         "dt": 0.05,
         "horizon": 20,
-        "mode": "mpc",
         # Arm joint positions are free: the TCP pose cost drives them. Fingers are only
         # softly kept at their starting width, and velocities are damped.
         "Q_diag": [0.0] * 7 + [500.0] * 2 + [2.0] * 9,

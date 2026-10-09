@@ -74,15 +74,13 @@ class FrankaDynamics(DynamicsSimulator):
 
         self.nx = 2 * self.n
         self.nu = self.n
-        self.obs_dim = self.nx
         self.max_torque = self.model.effortLimit.copy()
         self.max_action = np.asarray(config.get("max_acceleration", [15.0] * 7 + [20.0] * 2), dtype=float)
         self.state_lower_bounds = np.concatenate([self.model.lowerPositionLimit, -self.model.velocityLimit])
         self.state_upper_bounds = np.concatenate([self.model.upperPositionLimit, self.model.velocityLimit])
 
-        self.goal = np.asarray(config.get("goal", Q_READY), dtype=float).copy()
         # Goal TCP pose as [position(3), rotation matrix row-major(9)]; weights = (position, orientation)
-        self.task_goal = np.asarray(config.get("task_goal", np.zeros(12)), dtype=float)
+        self.set_task_goal(self.tcp_placement(Q_READY))
         self.task_weights = config.get("task_weights", (1000.0, 100.0))
         self._build_casadi_model()
 
@@ -193,41 +191,34 @@ class FrankaDynamics(DynamicsSimulator):
         q_next = q + self.dt * v_next
         return ca.vertcat(q_next, v_next)
 
-    # --- numeric simulation ------------------------------------------------
+        # --- numeric simulation ------------------------------------------------
 
-    def predict_next_state(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
-        if validate:
-            state, action = self.validate_state(state), self.validate_action(action)
+    def step(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
         q, v = state[: self.n], state[self.n :]
         tau = np.clip(pin.rnea(self.model, self.data, q, v, action), -self.max_torque, self.max_torque)
         acc = pin.aba(self.model, self.data, q, v, tau)
         v_next = v + self.dt * acc
         return np.concatenate([q + self.dt * v_next, v_next])
 
-    def step(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
-        self.time += 1
-        return self.predict_next_state(state, action, validate)
-
-    def observe(self, state: np.ndarray, validate: bool = True) -> np.ndarray:
-        return self.validate_state(state) if validate else state
-
-    def invert_obs(self, obs: np.ndarray, validate: bool = True) -> np.ndarray:
-        return self.validate_observation(obs) if validate else obs
+    def observe(self, state: np.ndarray) -> np.ndarray:
+        return state
 
     @property
     def goal_state(self) -> np.ndarray:
-        return np.concatenate([self.goal, np.zeros(self.n)])
+        """Reference joint state; the planner's Q_diag decides which entries matter."""
+        return np.concatenate([Q_READY, np.zeros(self.n)])
 
-    def is_done(self, state: np.ndarray, validate: bool = True) -> bool:
-        state = self.validate_state(state) if validate else state
+    def is_done(self, state: np.ndarray) -> bool:
+        """TCP at the goal pose (within tolerances) and the arm at rest."""
+        pose = self.tcp_placement(state[: self.n])
+        goal = pin.SE3(self.task_goal[3:].reshape(3, 3), self.task_goal[:3])
+        position_error = np.linalg.norm(pose.translation - goal.translation)
+        rotation_error = np.linalg.norm(pin.log3(pose.rotation.T @ goal.rotation))
         return bool(
-            np.linalg.norm(state - self.goal_state) < self.config.get("done_tolerance", 1e-2)
+            position_error < self.config.get("position_tolerance", 2e-3)
+            and rotation_error < self.config.get("rotation_tolerance", 2e-2)
+            and np.abs(state[self.n :]).max() < self.config.get("velocity_tolerance", 2e-2)
         )
-
-    def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
-        lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
-        q = np.clip(Q_READY + rng.uniform(-0.3, 0.3, self.n) * (np.arange(self.n) < 7), lower, upper)
-        return np.concatenate([q, np.zeros(self.n)])
 
     # --- kinematics and dataset
 
@@ -249,19 +240,56 @@ class FrankaDynamics(DynamicsSimulator):
             q = np.clip(pin.integrate(self.model, q, dq), lower, upper)
         raise RuntimeError("IK did not converge; pose may be unreachable.")
 
+    def sample_start_goal(self, rng: np.random.Generator) -> tuple[np.ndarray, pin.SE3]:
+        """Random rest state and goal TCP pose; both come from FK of sampled joint
+        configurations, so the goal is reachable by construction.
+
+        Poses must be in front of the base, above the table plane and at least
+        ``min_start_goal_distance`` apart. Fingers start at the open width.
+        """
+        lower, upper = self.model.lowerPositionLimit[:7], self.model.upperPositionLimit[:7]
+        margin = 0.1 * (upper - lower)
+        min_distance = self.config.get("min_start_goal_distance", 0.25)
+
+        def sample_config() -> tuple[np.ndarray, pin.SE3]:
+            while True:
+                q = np.concatenate([rng.uniform(lower + margin, upper - margin), Q_READY[7:]])
+                pose = self.tcp_placement(q)
+                if pose.translation[0] > 0.2 and 0.1 < pose.translation[2] < 0.8:
+                    return q, pose
+
+        q_start, start_pose = sample_config()
+        while True:
+            _, goal_pose = sample_config()
+            if np.linalg.norm(goal_pose.translation - start_pose.translation) > min_distance:
+                return np.concatenate([q_start, np.zeros(self.n)]), goal_pose
+
     def tcp_placement(self, q: np.ndarray) -> pin.SE3:
         pin.forwardKinematics(self.model, self.data, q)
         pin.updateFramePlacements(self.model, self.data)
         return self.data.oMf[self.tcp_id].copy()
 
     def get_dataset_features(self) -> dict[str, Any]:
+        """LeRobot features: state [q, v], goal TCP pose as environment state, acceleration action."""
+        joints = list(self.model.names[1:])
         return {
-            "observation.state": {"dtype": "float32", "shape": (self.obs_dim,)},
-            "action": {"dtype": "float32", "shape": (self.nu,)},
+            "observation.state": {
+                "dtype": "float32",
+                "shape": (self.nx,),
+                "names": [f"{j}.pos" for j in joints] + [f"{j}.vel" for j in joints],
+            },
+            "observation.environment_state": {
+                "dtype": "float32",
+                "shape": (12,),
+                "names": ["goal.x", "goal.y", "goal.z"] + [f"goal.R{i}{j}" for i in range(3) for j in range(3)],
+            },
+            "action": {"dtype": "float32", "shape": (self.nu,), "names": [f"{j}.acc" for j in joints]},
         }
 
     def format_dataset_frame(self, obs: np.ndarray, action: np.ndarray) -> dict[str, Any]:
+        """One frame without ``task``, which LeRobot's add_frame requires from the caller."""
         return {
             "observation.state": np.asarray(obs, dtype=np.float32),
+            "observation.environment_state": self.task_goal.astype(np.float32),
             "action": np.asarray(action, dtype=np.float32),
         }
