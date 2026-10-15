@@ -1,0 +1,29 @@
+# Flow Policy architecture config for learning/train_dagger.py -- triple-integrator point mass (toy system)
+model:
+  policy_type: flow             # options: flow, safeflow
+
+  flow:
+    num_inference_steps: 5      # Euler integration steps for ODE sampling
+
+  # The policy predicts a chunk of prediction_horizon jerks per state (DAgger labels it with the expert's plan)
+  prediction_horizon: 10
+  hidden_dims: [256, 256, 256]  # widths of the hidden layers
+
+# Optional DAgger defaults. Explicit command-line arguments override these values.
+training:
+  dagger_iterations: 4        # one round at beta 1: the expert's rollouts only, like SafeFlowMPC's pretraining
+  trajectories_per_iteration: [500, 500, 500, 500]
+  steps_per_trajectory: 100
+  target_epochs_per_round: [50, 50, 50, 50]
+  action_noise_std: 0.0         # m/s^3, Gaussian noise on the executed jerk
+  expert_mix_beta_start: 0.8
+  expert_mix_beta_decay_rate: 0.2
+  expert_mix_decay_after_eval_success: 0.5
+  eval_episodes: 100
+  tolerance_overrides:
+    pos_tol: 0.05
+    vel_tol: 0.02
+  # Deliberately more relaxed than tolerance_overrides above, falls back to tolerance_overrides if omitted.
+  eval_tolerance_overrides:
+    pos_tol: 0.1
+    vel_tol: 0.02

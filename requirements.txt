@@ -1,8 +1,15 @@
-# Pinocchio is not listed: it comes from Homebrew via the .pth file (see README).
+pin>=4.1,<5
+ompl>=2.0,<3
 casadi>=3.8,<4
 meshcat>=0.3
 numpy>=2.2
 scipy>=1.15
 xacro>=2.1
 pyyaml
-lerobot[dataset]>=0.6.1
+torch
+tqdm
+lerobot[av-dep]>=0.6.1
+datasets>=4.8,<5
+pandas>=2,<3
+pyarrow>=21,<30
+jsonlines>=4,<5

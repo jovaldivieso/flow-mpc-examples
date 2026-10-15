@@ -1,0 +1,356 @@
+from __future__ import annotations
+
+import os
+import sys
+import unittest
+from unittest import mock
+
+import torch
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+from learning.models.flow_policy import FlowPolicy
+from learning.models.policy import PolicyFactory, observation_features
+
+
+def _build_policy(action_scale=None) -> FlowPolicy:
+    return FlowPolicy(
+        action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=4,
+        num_inference_steps=4, action_scale=action_scale,
+    )
+
+
+def _fake_observation(batch_size: int) -> dict[str, torch.Tensor]:
+    return {
+        "observation.environment_state": torch.zeros(batch_size, 2),
+        "observation.state": torch.zeros(batch_size, 4),
+    }
+
+
+class ActionScaleValidationTests(unittest.TestCase):
+    def test_wrong_length_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            _build_policy(action_scale=[1.0, 2.0, 3.0])
+
+    def test_non_positive_entry_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            _build_policy(action_scale=[1.0, 0.0])
+        with self.assertRaises(ValueError):
+            _build_policy(action_scale=[-1.0, 1.0])
+
+    def test_non_finite_entry_rejected(self) -> None:
+        for bad_value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(bad_value=bad_value):
+                with self.assertRaises(ValueError):
+                    _build_policy(action_scale=[1.0, bad_value])
+
+    def test_omitted_defaults_to_all_ones(self) -> None:
+        policy = _build_policy(action_scale=None)
+        torch.testing.assert_close(policy.velocity_net.action_scale, torch.ones(2))
+
+
+class FlowTimeSamplingTests(unittest.TestCase):
+    """The training flow time is t = 1 - Beta(1.5, 1): its density rises toward t = 0, so the noisy start of the
+    flow gets more of the training samples (mean 1 - 1.5 / 2.5 = 0.4, against 0.5 for a uniform t)."""
+
+    def test_flow_times_follow_one_minus_beta_1_5_1(self) -> None:
+        policy = _build_policy()
+        recorded: list[torch.Tensor] = []
+        real_predict = policy.velocity_net.predict_velocity
+
+        def recording_predict(action_state_flat, obs_cond, timesteps):
+            recorded.append(timesteps.clone())
+            return real_predict(action_state_flat, obs_cond, timesteps)
+
+        torch.manual_seed(0)
+        with mock.patch.object(policy.velocity_net, "predict_velocity", recording_predict):
+            policy.compute_loss(_fake_observation(20000), torch.zeros(20000, 4, 2))
+
+        t = recorded[0]
+        self.assertEqual(tuple(t.shape), (20000,))
+        self.assertTrue(bool(((t >= 0.0) & (t <= 1.0)).all()))
+        self.assertAlmostEqual(float(t.mean()), 0.4, delta=0.01)
+        # P(t < 0.25) = P(Beta > 0.75) = 1 - 0.75^1.5 = 0.351 (uniform: 0.25)
+        self.assertAlmostEqual(float((t < 0.25).float().mean()), 1.0 - 0.75**1.5, delta=0.015)
+
+
+class VelocityNetworkTests(unittest.TestCase):
+    """The network is an MLP on the flattened chunk, the condition and a sinusoidal embedding of the flow time."""
+
+    def test_the_velocity_is_predicted_by_the_mlp_on_the_chunk_the_condition_and_the_time_embedding(self) -> None:
+        policy = _build_policy()
+        net = policy.velocity_net
+        chunk, condition, time = torch.randn(3, 4, 2), torch.randn(3, 6), torch.rand(3)
+
+        velocity = net.predict_velocity(chunk.flatten(1), condition, time)
+
+        net_input = torch.cat([chunk.flatten(1), condition, net.time_embed(time * 1000.0)], dim=-1)
+        torch.testing.assert_close(velocity, net.net(net_input))
+        self.assertEqual(tuple(velocity.shape), (3, 8))
+
+    def test_the_time_embedding_is_sinusoidal_and_needs_an_even_width(self) -> None:
+        from learning.models.flow_velocity_net import SinusoidalTimeEmbedding
+
+        embedding = SinusoidalTimeEmbedding(8)(torch.tensor([0.0, 3.0]))
+
+        self.assertEqual(tuple(embedding.shape), (2, 8))
+        torch.testing.assert_close(embedding[0], torch.tensor([0.0] * 4 + [1.0] * 4))  # sin(0), cos(0)
+        with self.assertRaises(ValueError):
+            SinusoidalTimeEmbedding(7)
+
+    def test_the_hidden_widths_must_be_positive_and_not_empty(self) -> None:
+        for hidden_dims in ((), (16, 0)):
+            with self.subTest(hidden_dims=hidden_dims), self.assertRaises(ValueError):
+                FlowPolicy(action_dim=2, state_dim=6, hidden_dims=hidden_dims, prediction_horizon=4)
+
+    def test_the_default_network_has_three_hidden_layers_of_256(self) -> None:
+        net = FlowPolicy(action_dim=7, state_dim=33, prediction_horizon=16).velocity_net
+
+        widths = [layer.out_features for layer in net.net if isinstance(layer, torch.nn.Linear)]
+        self.assertEqual(widths, [256, 256, 256, 7 * 16])
+
+
+class PathLossTests(unittest.TestCase):
+    """compute_path_loss regresses the velocity onto given path velocities (the safety fine-tuning stage)."""
+
+    @staticmethod
+    def _path_batch(batch_size: int = 4):
+        x_t = torch.randn(batch_size, 4, 2)
+        dx_t = torch.randn(batch_size, 4, 2)
+        t = torch.rand(batch_size)
+        return x_t, dx_t, t
+
+    def test_loss_is_zero_for_a_network_that_predicts_the_path_velocity(self) -> None:
+        policy = _build_policy()
+        x_t, dx_t, t = self._path_batch()
+        with mock.patch.object(policy.velocity_net, "predict_velocity", return_value=dx_t.flatten(1)):
+            loss = policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
+        self.assertEqual(float(loss), 0.0)
+
+    def test_the_network_is_queried_at_the_path_point_and_time(self) -> None:
+        policy = _build_policy()
+        x_t, dx_t, t = self._path_batch()
+        with mock.patch.object(policy.velocity_net, "predict_velocity", return_value=torch.zeros(4, 8)) as predict:
+            policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
+        flat_input, obs_cond, timesteps = predict.call_args.args
+        torch.testing.assert_close(flat_input, x_t.flatten(1))
+        torch.testing.assert_close(timesteps, t)
+        self.assertEqual(tuple(obs_cond.shape), (4, 6))
+
+    def test_paths_in_physical_units_reproduce_the_unscaled_loss(self) -> None:
+        x_t, dx_t, t = self._path_batch()
+        torch.manual_seed(0)
+        unscaled = _build_policy(action_scale=None)
+        baseline = unscaled.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
+
+        scale = torch.tensor([2.0, 5.0])
+        torch.manual_seed(0)
+        scaled = _build_policy(action_scale=scale.tolist())
+        rescaled = scaled.compute_path_loss(_fake_observation(4), x_t * scale, dx_t * scale, t)
+
+        torch.testing.assert_close(rescaled, baseline)
+
+    def test_the_loss_is_differentiable_with_respect_to_the_network(self) -> None:
+        policy = _build_policy()
+        x_t, dx_t, t = self._path_batch()
+        policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t).backward()
+        self.assertTrue(any(p.grad is not None and bool(p.grad.abs().sum() > 0) for p in policy.parameters()))
+
+
+class ComputeLossActionScaleInvarianceTests(unittest.TestCase):
+    """compute_loss divides actions by action_scale before ever touching the
+    x_0 ~ N(0, 1) noise prior (see FlowPolicy's own docstring for why: an
+    isotropic prior trained against anisotropic raw action bounds lets
+    whichever dimension has the largest physical range dominate the loss,
+    regardless of task relevance). That means feeding in actions already
+    pre-multiplied by a given scale, under that same scale, must reduce to
+    exactly the unscaled case: both compute x_1 = raw_actions internally.
+    """
+
+    def test_prescaled_actions_reproduce_the_unscaled_loss(self) -> None:
+        policy = _build_policy(action_scale=None)
+        obs = _fake_observation(batch_size=5)
+        raw_actions = torch.randn(5, policy.velocity_net.prediction_horizon, policy.velocity_net.action_dim)
+
+        torch.manual_seed(0)
+        baseline_loss = policy.compute_loss(obs, raw_actions)
+
+        scale = torch.tensor([2.0, 5.0])
+        with torch.no_grad():
+            policy.velocity_net.action_scale.copy_(scale)
+        scaled_actions = raw_actions * scale
+
+        torch.manual_seed(0)
+        rescaled_loss = policy.compute_loss(obs, scaled_actions)
+
+        torch.testing.assert_close(rescaled_loss, baseline_loss)
+
+    def test_skipping_normalization_gives_a_different_loss(self) -> None:
+        """Sanity check that the test above isn't vacuously true -- omitting
+        the division by action_scale for the same prescaled input must land
+        on a genuinely different loss value, confirming the test can fail.
+        """
+        policy = _build_policy(action_scale=None)
+        obs = _fake_observation(batch_size=5)
+        raw_actions = torch.randn(5, policy.velocity_net.prediction_horizon, policy.velocity_net.action_dim)
+
+        torch.manual_seed(0)
+        baseline_loss = policy.compute_loss(obs, raw_actions)
+
+        scale = torch.tensor([2.0, 5.0])
+        scaled_actions = raw_actions * scale  # deliberately NOT re-pointing action_scale
+
+        torch.manual_seed(0)
+        unnormalized_loss = policy.compute_loss(obs, scaled_actions)
+
+        self.assertFalse(torch.allclose(unnormalized_loss, baseline_loss))
+
+
+class SelectActionRescalesToPhysicalUnitsTests(unittest.TestCase):
+    """select_action integrates entirely in the normalized space compute_loss
+    trains in, then must rescale back to physical action units before
+    returning -- every downstream consumer (apply_execution_noise,
+    simulator.step, ...) expects physical units, not the network's internal
+    representation.
+    """
+
+    def test_zero_network_output_returns_exactly_the_scaled_noise_draw(self) -> None:
+        # With every weight and bias zeroed, predict_velocity is
+        # identically 0 regardless of input (Linear(0)=0, Mish(0)=0
+        # propagates through every layer), so the Euler loop's
+        # x.add_(0, alpha=dt) never changes x away from its initial
+        # torch.randn draw -- the only transformation left to verify is
+        # select_action's final "* action_scale" rescale.
+        scale = [1.0, 100.0]
+        policy = _build_policy(action_scale=scale)
+        with torch.no_grad():
+            for param in policy.velocity_net.net.parameters():
+                param.zero_()
+
+        torch.manual_seed(42)
+        expected_x0 = torch.randn(1, policy.velocity_net.prediction_horizon, policy.velocity_net.action_dim)
+
+        torch.manual_seed(42)
+        obs = _fake_observation(batch_size=1)
+        action = policy.select_action(obs)
+
+        torch.testing.assert_close(action, expected_x0 * torch.tensor(scale))
+
+
+class ObservationConditioningTests(unittest.TestCase):
+    """FlowPolicy conditions its velocity network directly on
+    observation_features, i.e. [observation.environment_state,
+    observation.state] in that order (the same flat vector
+    CasadiTrajectoryProjector's invert_obs takes), so the network's
+    conditioning width is simply environment_state_dim + state_dim.
+    """
+
+    @staticmethod
+    def _distinguishable_observation() -> dict[str, torch.Tensor]:
+        return {
+            "observation.environment_state": torch.tensor([[1.0, 2.0], [7.0, 8.0]]),
+            "observation.state": torch.tensor([[3.0, 4.0, 5.0, 6.0], [9.0, 10.0, 11.0, 12.0]]),
+        }
+
+    def test_observation_features_concatenates_environment_state_then_state(self) -> None:
+        torch.testing.assert_close(
+            observation_features(self._distinguishable_observation()),
+            torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]]),
+        )
+
+    def test_velocity_net_conditioning_width_is_state_dim(self) -> None:
+        self.assertEqual(_build_policy().velocity_net.obs_cond_dim, 6)
+
+    def test_compute_loss_and_select_action_condition_on_observation_features(self) -> None:
+        policy = _build_policy()
+        observation = self._distinguishable_observation()
+        expected = observation_features(observation)
+        actions = torch.randn(2, policy.velocity_net.prediction_horizon, policy.velocity_net.action_dim)
+
+        with mock.patch.object(
+            policy.velocity_net, "compute_loss", wraps=policy.velocity_net.compute_loss
+        ) as compute_loss:
+            policy.compute_loss(observation, actions)
+        torch.testing.assert_close(compute_loss.call_args.args[0], expected)
+
+        with mock.patch.object(
+            policy.velocity_net, "integrate", wraps=policy.velocity_net.integrate
+        ) as integrate:
+            policy.select_action(observation)
+        torch.testing.assert_close(integrate.call_args.args[0], expected)
+
+
+class FlowPolicyLearnsAConditionalMappingTests(unittest.TestCase):
+    """End-to-end check of the flow-matching math (loss direction, time convention, Euler integration):
+    a small policy trained for a few hundred steps on a deterministic observation -> action-chunk
+    mapping must reproduce it at inference time, and because of its conditioning, not because it
+    matched the marginal action statistics."""
+
+    def test_trained_policy_follows_the_mapping_and_depends_on_the_observation(self) -> None:
+        torch.manual_seed(0)
+        policy = FlowPolicy(
+            action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=2, num_inference_steps=8
+        )
+        mixing = torch.randn(6, 4) * 0.5
+
+        def make_batch(size: int) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+            features = torch.rand(size, 6) * 2 - 1
+            observation = {"observation.environment_state": features[:, :2], "observation.state": features[:, 2:]}
+            return observation, torch.tanh(features @ mixing).reshape(size, 2, 2)
+
+        optimizer = torch.optim.Adam(policy.parameters(), lr=3e-3)
+        for _ in range(800):
+            observation, target = make_batch(256)
+            loss = policy.compute_loss(observation, target)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        observation, target = make_batch(512)
+        matched_error = torch.mean((policy.select_action(observation) - target) ** 2).item()
+        permutation = torch.randperm(512)
+        shuffled = {key: value[permutation] for key, value in observation.items()}
+        shuffled_error = torch.mean((policy.select_action(shuffled) - target) ** 2).item()
+
+        self.assertLess(matched_error, 0.3 * target.var().item())
+        self.assertLess(matched_error, 0.4 * shuffled_error)
+
+
+class LegacyCheckpointTests(unittest.TestCase):
+    def test_keys_saved_while_the_network_was_torch_compiled_still_load(self) -> None:
+        policy = _build_policy()
+        legacy = {name.replace("net.", "net._orig_mod.", 1): value.clone() for name, value in policy.state_dict().items()}
+        self.assertTrue(any("_orig_mod" in name for name in legacy))
+        _build_policy().load_state_dict(legacy)
+
+
+class PolicyFactoryTests(unittest.TestCase):
+    @staticmethod
+    def _flow_kwargs() -> dict[str, object]:
+        return dict(
+            action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=4,
+            num_inference_steps=4, action_scale=[1.0, 2.0],
+        )
+
+    def test_creates_flow_policy(self) -> None:
+        policy = PolicyFactory.create("flow", **self._flow_kwargs())
+        self.assertIsInstance(policy, FlowPolicy)
+        self.assertEqual(policy.velocity_net.prediction_horizon, 4)
+        self.assertEqual(policy.velocity_net.num_inference_steps, 4)
+        torch.testing.assert_close(policy.velocity_net.action_scale, torch.tensor([1.0, 2.0]))
+
+    def test_policy_type_is_case_and_whitespace_insensitive(self) -> None:
+        policy = PolicyFactory.create("  FLOW ", **self._flow_kwargs())
+        self.assertIsInstance(policy, FlowPolicy)
+
+    def test_unknown_policy_types_are_rejected(self) -> None:
+        for policy_type in ("mlp", "wam", "not_a_real_policy_type"):
+            with self.subTest(policy_type=policy_type):
+                with self.assertRaises(ValueError) as ctx:
+                    PolicyFactory.create(policy_type)
+                self.assertIn("'flow', 'safeflow'", str(ctx.exception))
+
+
+if __name__ == "__main__":
+    unittest.main()

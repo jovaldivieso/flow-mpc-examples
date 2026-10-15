@@ -1,18 +1,23 @@
-"""Franka FR3 arm with gripper (9 DoF: 7 arm joints + 2 prismatic fingers).
+"""Franka FR3 arm (7 joints) with the gripper as fixed geometry.
 
-State  x = [q, v]  (joint positions, joint velocities), nx = 18
-Action u = a       (joint accelerations, fingers included), nu = 9
+State  x = [q, v, a]  (joint positions, velocities, accelerations), nx = 21
+Action u = j          (joint jerks), nu = 7
+Goal   g = TCP pose [position(3), rotation matrix row-major(9)]
+Observation o = [g, x] (obs_dim = 33); the LeRobot frame stores g as ``observation.environment_state`` and x as
+``observation.state``.
 
-Inverse-dynamics formulation: the planner chooses accelerations and the torques
-tau = RNEA(q, v, a) are constrained to the effort limits (``casadi_torque``).
-This needs one RNEA pass per step instead of the mass matrix and a linear solve.
+Kinematic model: every joint is a triple integrator with piecewise constant jerk, with SafeFlowMPC's limits (the
+joint position limits narrowed by ``JOINT_LIMIT_MARGIN``, the velocity limits scaled by ``VELOCITY_LIMIT_SCALE``,
+acceleration and jerk limits from the config). No masses or torques: a joint tracking controller is assumed to
+follow the motion.
 
-The model comes from the franka_description xacro via Pinocchio. Brew's
-Pinocchio has no ``pinocchio.casadi``, so the symbolic dynamics are a CasADi
-RNEA built from the Pinocchio model's inertias, placements and joint axes;
-the numeric ``step`` uses Pinocchio's ABA (same semi-implicit Euler scheme).
+The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. The only collision
+checked is the floor (z = 0, the plane the base stands on): the joint frames and the TCP keep ``floor_clearance``
+above it. Start and goal configurations are sampled well inside the joint limits, where the arm hardly ever hits
+itself, so self-collision is not checked.
 """
 
+import functools
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,7 +28,23 @@ import xacro
 from pinocchio.robot_wrapper import RobotWrapper
 from xacro import substitution_args
 
-from .dynamics import DynamicsSimulator
+from .dynamics import DynamicsSimulator, constant_jerk_step, saturated_step
+
+FRANKA_NUM_JOINTS = 7
+FRANKA_DEFAULT_MAX_ACCELERATION = (5.0,) * 7
+FRANKA_DEFAULT_MAX_JERK = (15.0,) * 7
+# Goal = TCP pose [position(3), rotation matrix row-major(9)]
+FRANKA_GOAL_DIM = 12
+# Cartesian TCP box [[x_min, x_max], [y_min, y_max], [z_min, z_max]] both random goals and random start poses are drawn from
+FRANKA_DEFAULT_WORKSPACE_BOUNDS = ((0.2, 1.0), (-1.0, 1.0), (0.1, 0.8))
+FRANKA_DEFAULT_FLOOR_CLEARANCE = 0.05
+
+# SafeFlowMPC's joint limits: positions 3 degrees inside the description's, velocities at 92 %
+JOINT_LIMIT_MARGIN = np.deg2rad(3.0)
+VELOCITY_LIMIT_SCALE = 0.92
+# Random start/goal configurations keep this fraction of every joint range away from the limits
+JOINT_SAMPLING_MARGIN = 0.1
+SAMPLING_ATTEMPTS = 256
 
 # Official franka_description, pinned as a git submodule
 FRANKA_DESCRIPTION = Path(__file__).resolve().parents[1] / "third_party" / "franka_description"
@@ -32,201 +53,162 @@ XACRO_PATH = FRANKA_DESCRIPTION / "robots" / "fr3" / "fr3.urdf.xacro"
 # xacro resolves $(find pkg) via ament_index_python (ROS-only, not on PyPI)
 substitution_args._eval_find = lambda pkg: str(FRANKA_DESCRIPTION)
 
+# The finger joints are locked at this opening, the hand and fingers are fixed geometry
 FINGER_OPEN = 0.04
-Q_READY = np.array([0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4, FINGER_OPEN, FINGER_OPEN])
+FINGER_JOINTS = ("fr3_finger_joint1", "fr3_finger_joint2")
+Q_READY = np.array([0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4])
 TCP_FRAME = "fr3_hand_tcp"
 
 
+@functools.lru_cache(maxsize=None)
+def _urdf() -> str:
+    return xacro.process_file(XACRO_PATH, mappings={"hand": "true"}).toxml()
+
+
+def _finger_locks(full_model: pin.Model) -> tuple[list[int], np.ndarray]:
+    """Ids of the finger joints and the full 9-D configuration (arm at its ready pose, fingers open) they are locked at."""
+    ids = [full_model.getJointId(name) for name in FINGER_JOINTS]
+    return ids, np.concatenate([Q_READY, [FINGER_OPEN] * len(FINGER_JOINTS)])
+
+
+def build_model() -> pin.Model:
+    """The 7-DoF FR3 with the finger joints locked open and the limits of SafeFlowMPC (kinematics only)."""
+    full = pin.buildModelFromXML(_urdf())
+    ids, reference = _finger_locks(full)
+    model = pin.buildReducedModel(full, ids, reference)
+    model.lowerPositionLimit = model.lowerPositionLimit + JOINT_LIMIT_MARGIN
+    model.upperPositionLimit = model.upperPositionLimit - JOINT_LIMIT_MARGIN
+    model.velocityLimit = VELOCITY_LIMIT_SCALE * model.velocityLimit
+    return model
+
+
 def build_robot() -> RobotWrapper:
-    """Full 9-DoF FR3 with gripper, from the franka_description xacro."""
-    urdf = xacro.process_file(XACRO_PATH, mappings={"hand": "true"}).toxml()
+    """The 7-DoF FR3 with collision and visual geometry (for Meshcat), the hand and fingers fixed on the last joint."""
+    urdf = _urdf()
     # meshes are package://franka_description/..., resolved from the clone's parent
     pkg = [str(FRANKA_DESCRIPTION.parent)]
-    model = pin.buildModelFromXML(urdf)
-    visual = pin.buildGeomFromUrdfString(model, urdf, pin.GeometryType.VISUAL, package_dirs=pkg)
-    collision = pin.buildGeomFromUrdfString(model, urdf, pin.GeometryType.COLLISION, package_dirs=pkg)
+    full = pin.buildModelFromXML(urdf)
+    visual = pin.buildGeomFromUrdfString(full, urdf, pin.GeometryType.VISUAL, package_dirs=pkg)
+    collision = pin.buildGeomFromUrdfString(full, urdf, pin.GeometryType.COLLISION, package_dirs=pkg)
+    ids, reference = _finger_locks(full)
+    model, (collision, visual) = pin.buildReducedModel(full, [collision, visual], ids, reference)
     return RobotWrapper(model, collision, visual)
 
 
-def _rotation(axis: np.ndarray, angle: Any) -> Any:
-    """Rodrigues rotation about a constant unit axis; ``angle`` may be symbolic."""
-    ax = ca.DM(axis)
-    skew = ca.skew(ax)
-    return ca.DM.eye(3) + ca.sin(angle) * skew + (1 - ca.cos(angle)) * ca.mtimes(skew, skew)
-
-
-def _crm(v: Any) -> Any:
-    """Spatial motion cross-product matrix (linear; angular ordering)."""
-    lin, ang = v[:3], v[3:]
-    return ca.blockcat([[ca.skew(ang), ca.skew(lin)], [ca.DM.zeros(3, 3), ca.skew(ang)]])
-
-
 class FrankaDynamics(DynamicsSimulator):
-    """Joint-space torque-controlled FR3 + gripper; the goal is a joint configuration (fingers included)."""
+    """Triple-integrator 7-joint FR3 with jerk as the action; the goal is a TCP pose, the floor is the only obstacle."""
+
+    task_description = "reach target pose"
 
     def __init__(self, config: Mapping[str, Any]):
         super().__init__(config)
-        self.robot = build_robot()
-        self.model = self.robot.model
-        self.data = self.robot.data
+        self.model = build_model()
+        self.data = self.model.createData()
+        self._robot: RobotWrapper | None = None
         self.tcp_id = self.model.getFrameId(TCP_FRAME)
         self.n = self.model.nv
+        if self.n != FRANKA_NUM_JOINTS:
+            raise ValueError(f"Expected {FRANKA_NUM_JOINTS} joints, the reduced franka_description has {self.n}.")
 
-        self.nx = 2 * self.n
+        self.nx = 3 * self.n
         self.nu = self.n
-        self.max_torque = self.model.effortLimit.copy()
-        self.max_action = np.asarray(config.get("max_acceleration", [15.0] * 7 + [20.0] * 2), dtype=float)
-        self.state_lower_bounds = np.concatenate([self.model.lowerPositionLimit, -self.model.velocityLimit])
-        self.state_upper_bounds = np.concatenate([self.model.upperPositionLimit, self.model.velocityLimit])
+        self.obs_dim = FRANKA_GOAL_DIM + self.nx
+        per_joint = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (self.n,)).copy()
+        self.max_acceleration = per_joint("max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION)
+        self.max_action = per_joint("max_jerk", FRANKA_DEFAULT_MAX_JERK)
+        self.state_lower_bounds = np.concatenate([self.model.lowerPositionLimit, -self.model.velocityLimit, -self.max_acceleration])
+        self.state_upper_bounds = np.concatenate([self.model.upperPositionLimit, self.model.velocityLimit, self.max_acceleration])
 
-        # Goal TCP pose as [position(3), rotation matrix row-major(9)]; weights = (position, orientation)
-        self.set_task_goal(self.tcp_placement(Q_READY))
-        self.task_weights = config.get("task_weights", (1000.0, 100.0))
-        self._build_casadi_model()
-
-    # --- symbolic dynamics -------------------------------------------------
-
-    def _build_casadi_model(self) -> None:
-        """Extract constant link data for the CasADi RNEA."""
-        model = self.model
-        q0 = pin.neutral(model)
-        data = model.createData()
-        pin.computeJointJacobians(model, data, q0)
-
-        self._parents = list(model.parents)
-        self._placements = []  # (R, p) of joint frame in parent frame at q=0
-        self._axes = []
-        self._prismatic = []
-        self._inertias = []  # 6x6 spatial inertia at the joint frame (linear; angular)
-        for i in range(1, model.njoints):
-            joint = model.joints[i]
-            S = pin.getJointJacobian(model, data, i, pin.ReferenceFrame.LOCAL)[:, joint.idx_v]
-            prismatic = np.allclose(S[3:], 0.0)
-            if joint.nv != 1 or not (prismatic or np.allclose(S[:3], 0.0)):
-                raise ValueError("Only 1-DoF revolute/prismatic joints are supported by the CasADi dynamics.")
-            self._prismatic.append(prismatic)
-            self._axes.append(S[:3].copy() if prismatic else S[3:].copy())
-            placement = model.jointPlacements[i]
-            self._placements.append((placement.rotation.copy(), placement.translation.copy()))
-            self._inertias.append(model.inertias[i].matrix().copy())
-        self._gravity_acc = -model.gravity.vector.copy()  # base acceleration (linear; angular)
-
-    def _joint_transform(self, i: int, q_i: Any) -> tuple[Any, Any]:
-        """Rotation and translation of joint i's frame in its parent's frame."""
-        R0, p0 = self._placements[i - 1]
-        axis = self._axes[i - 1]
-        if self._prismatic[i - 1]:
-            R = ca.DM(R0)
-            return R, ca.DM(p0) + ca.mtimes(R, ca.DM(axis)) * q_i
-        return ca.mtimes(ca.DM(R0), _rotation(axis, q_i)), ca.DM(p0)
-
-    def _fk(self, q: Any) -> tuple[Any, Any]:
-        """TCP rotation (3x3) and position (3) in the world frame."""
-        R_w = [ca.DM.eye(3)] * self.model.njoints
-        p_w = [ca.DM.zeros(3)] * self.model.njoints
-        for i in range(1, self.model.njoints):
-            R, p = self._joint_transform(i, q[i - 1])
-            parent = self._parents[i]
-            R_w[i] = ca.mtimes(R_w[parent], R)
-            p_w[i] = p_w[parent] + ca.mtimes(R_w[parent], p)
-        frame = self.model.frames[self.tcp_id]
-        R_f, p_f = frame.placement.rotation, frame.placement.translation
-        j = frame.parentJoint
-        return ca.mtimes(R_w[j], ca.DM(R_f)), p_w[j] + ca.mtimes(R_w[j], ca.DM(p_f))
-
-    def casadi_task_cost(self, x: Any, task_goal: Any) -> Any:
-        """TCP SE(3) error to ``task_goal`` = [position(3), rotation matrix row-major(9)].
-
-        Orientation error is 3 - tr(R_goal^T R) = 2 (1 - cos(angle)): smooth, no wrapping.
-        """
-        R, p = self._fk(x[: self.n])
-        R_goal = ca.reshape(task_goal[3:12], 3, 3).T
-        position = ca.sumsqr(p - task_goal[:3])
-        orientation = 3 - ca.trace(ca.mtimes(R_goal.T, R))
-        return self.task_weights[0] * position + self.task_weights[1] * orientation
-
-    def _rnea(self, q: Any, v: Any, a: Any, gravity: bool = True) -> Any:
-        """Joint torques for (q, v, a) via recursive Newton-Euler in CasADi."""
-        n_j = self.model.njoints
-        v_s = [ca.DM.zeros(6)] * n_j
-        a_s = [ca.DM(self._gravity_acc) if gravity else ca.DM.zeros(6)] + [None] * (n_j - 1)
-        f_s = [None] * n_j
-        X = [None] * n_j  # motion transforms parent -> child
-
-        for i in range(1, n_j):
-            axis = self._axes[i - 1]
-            R, p = self._joint_transform(i, q[i - 1])
-            S = ca.DM(np.concatenate([axis, np.zeros(3)]) if self._prismatic[i - 1]
-                      else np.concatenate([np.zeros(3), axis]))
-            Rt = R.T
-            X[i] = ca.blockcat([[Rt, -ca.mtimes(Rt, ca.skew(p))], [ca.DM.zeros(3, 3), Rt]])
-
-            parent = self._parents[i]
-            v_joint = S * v[i - 1]
-            v_s[i] = ca.mtimes(X[i], v_s[parent]) + v_joint
-            a_s[i] = ca.mtimes(X[i], a_s[parent]) + S * a[i - 1] + ca.mtimes(_crm(v_s[i]), v_joint)
-
-            inertia = ca.DM(self._inertias[i - 1])
-            momentum = ca.mtimes(inertia, v_s[i])
-            f_s[i] = ca.mtimes(inertia, a_s[i]) - ca.mtimes(_crm(v_s[i]).T, momentum)
-
-        tau = [None] * (n_j - 1)
-        for i in range(n_j - 1, 0, -1):
-            axis = self._axes[i - 1]
-            S = np.concatenate([axis, np.zeros(3)]) if self._prismatic[i - 1] else np.concatenate([np.zeros(3), axis])
-            tau[i - 1] = ca.dot(ca.DM(S), f_s[i])
-            parent = self._parents[i]
-            if parent > 0:
-                f_s[parent] = f_s[parent] + ca.mtimes(X[i].T, f_s[i])
-        return ca.vertcat(*tau)
-
-    def casadi_torque(self, x: Any, u: Any) -> Any:
-        """Joint torques needed to realise acceleration ``u`` in state ``x``."""
-        return self._rnea(x[: self.n], x[self.n :], u)
-
-    def casadi_dynamics(self, x: Any, u: Any) -> Any:
-        """Semi-implicit Euler step, matching ``predict_next_state``."""
-        q, v = x[: self.n], x[self.n :]
-        v_next = v + self.dt * u
-        q_next = q + self.dt * v_next
-        return ca.vertcat(q_next, v_next)
-
-        # --- numeric simulation ------------------------------------------------
-
-    def step(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
-        q, v = state[: self.n], state[self.n :]
-        tau = np.clip(pin.rnea(self.model, self.data, q, v, action), -self.max_torque, self.max_torque)
-        acc = pin.aba(self.model, self.data, q, v, tau)
-        v_next = v + self.dt * acc
-        return np.concatenate([q + self.dt * v_next, v_next])
-
-    def observe(self, state: np.ndarray) -> np.ndarray:
-        return state
+        # Goal = TCP pose as [position(3), rotation matrix row-major(9)]
+        self.goal = np.asarray(config["goal"], dtype=float) if "goal" in config else self.pose_to_goal(self.tcp_placement(Q_READY))
+        self.randomize_goal = config.get("randomize_goal", "goal" not in config)
+        self.workspace_bounds = np.asarray(config.get("workspace_bounds", FRANKA_DEFAULT_WORKSPACE_BOUNDS), dtype=float)
+        self.min_start_goal_distance = float(config.get("min_start_goal_distance", 0.25))
+        self.pos_tol = float(config.get("pos_tol", 2e-3))
+        self.rot_tol = float(config.get("rot_tol", 2e-2))
+        self.vel_tol = float(config.get("vel_tol", 2e-2))
+        self.floor_clearance = float(config.get("floor_clearance", FRANKA_DEFAULT_FLOOR_CLEARANCE))
 
     @property
-    def goal_state(self) -> np.ndarray:
-        """Reference joint state; the planner's Q_diag decides which entries matter."""
-        return np.concatenate([Q_READY, np.zeros(self.n)])
+    def rest_state_indices(self) -> tuple[int, ...]:
+        return tuple(range(self.n, self.nx))  # velocity and acceleration
 
-    def is_done(self, state: np.ndarray) -> bool:
-        """TCP at the goal pose (within tolerances) and the arm at rest."""
-        pose = self.tcp_placement(state[: self.n])
-        goal = pin.SE3(self.task_goal[3:].reshape(3, 3), self.task_goal[:3])
-        position_error = np.linalg.norm(pose.translation - goal.translation)
-        rotation_error = np.linalg.norm(pin.log3(pose.rotation.T @ goal.rotation))
-        return bool(
-            position_error < self.config.get("position_tolerance", 2e-3)
-            and rotation_error < self.config.get("rotation_tolerance", 2e-2)
-            and np.abs(state[self.n :]).max() < self.config.get("velocity_tolerance", 2e-2)
+    @property
+    def robot(self) -> RobotWrapper:
+        """Model with collision and visual geometry, built on first use (for Meshcat)."""
+        if self._robot is None:
+            self._robot = build_robot()
+        return self._robot
+
+    def casadi_dynamics(self, x: Any, u: Any) -> Any:
+        """Exact step under constant jerk, matching ``predict_next_state`` away from the limits."""
+        return ca.vertcat(*constant_jerk_step(x[: self.n], x[self.n : 2 * self.n], x[2 * self.n :], u, self.dt))
+
+    # --- numeric simulation ------------------------------------------------
+
+    def predict_next_state(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
+        state_array = self.validate_state(state) if validate else np.asarray(state, dtype=float)
+        action_array = self.validate_action(action) if validate else np.asarray(action, dtype=float)
+        return saturated_step(
+            state_array, action_array, self.dt, self.state_lower_bounds, self.state_upper_bounds, self.max_action
         )
 
-    # --- kinematics and dataset
+    def step(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
+        return self.predict_next_state(state, action, validate=validate)
 
-    def set_task_goal(self, pose: pin.SE3) -> None:
-        self.task_goal = np.concatenate([pose.translation, pose.rotation.ravel()])
+    def goal_errors(self, state: np.ndarray) -> tuple[float, float]:
+        """TCP position error [m] and orientation error [rad] of ``state`` with respect to the goal pose."""
+        pose = self.tcp_placement(np.asarray(state, dtype=float)[: self.n])
+        goal = self.goal_pose
+        return float(np.linalg.norm(pose.translation - goal.translation)), float(np.linalg.norm(pin.log3(pose.rotation.T @ goal.rotation)))
+
+    def is_done(self, state: np.ndarray, validate: bool = True) -> bool:
+        """TCP at the goal pose (within tolerances) and the arm at rest."""
+        state_array = self.validate_state(state) if validate else np.asarray(state, dtype=float)
+        position_error, rotation_error = self.goal_errors(state_array)
+        return bool(
+            position_error < self.pos_tol
+            and rotation_error < self.rot_tol
+            and np.abs(state_array[self.n : 2 * self.n]).max() < self.vel_tol
+        )
+
+    def clearance(self, state: np.ndarray) -> float:
+        """Height above the floor of the lowest joint frame or the TCP, for a state or just the joint positions."""
+        q = np.asarray(state, dtype=float)[: self.n]
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        heights = [placement.translation[2] for placement in self.data.oMi[1:]]
+        return float(min(heights + [self.data.oMf[self.tcp_id].translation[2]]))
+
+    def is_collision(self, state: np.ndarray) -> bool:
+        return self.clearance(state) < self.floor_clearance
+
+    # --- kinematics, goal and dataset -----------------------------------------
+
+    @staticmethod
+    def pose_to_goal(pose: pin.SE3) -> np.ndarray:
+        return np.concatenate([pose.translation, pose.rotation.ravel()])
+
+    @staticmethod
+    def goal_to_pose(goal: np.ndarray) -> pin.SE3:
+        goal = np.asarray(goal, dtype=float)
+        return pin.SE3(goal[3:].reshape(3, 3), goal[:3])
+
+    @property
+    def goal_pose(self) -> pin.SE3:
+        return self.goal_to_pose(self.goal)
+
+    def tcp_placement(self, q: np.ndarray) -> pin.SE3:
+        pin.forwardKinematics(self.model, self.data, q)
+        pin.updateFramePlacements(self.model, self.data)
+        return self.data.oMf[self.tcp_id].copy()
+
+    def tcp_position(self, q: np.ndarray) -> np.ndarray:
+        """The 3-D position of the TCP in configuration ``q`` (what the viewers draw)."""
+        return self.tcp_placement(q).translation
 
     def inverse_kinematics(self, pose: pin.SE3, q_init: np.ndarray, iters: int = 500) -> np.ndarray:
-        """Damped least-squares IK for the TCP, used to get a joint-space start state."""
+        """Damped least-squares IK for the TCP."""
         q = q_init.copy()
         lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
         for _ in range(iters):
@@ -240,56 +222,77 @@ class FrankaDynamics(DynamicsSimulator):
             q = np.clip(pin.integrate(self.model, q, dq), lower, upper)
         raise RuntimeError("IK did not converge; pose may be unreachable.")
 
-    def sample_start_goal(self, rng: np.random.Generator) -> tuple[np.ndarray, pin.SE3]:
-        """Random rest state and goal TCP pose; both come from FK of sampled joint
-        configurations, so the goal is reachable by construction.
+    def nearest_inverse_kinematics(
+        self, pose: pin.SE3, q_reference: np.ndarray, attempts: int = 30, solutions: int = 5
+    ) -> np.ndarray:
+        """The joint configuration of ``pose`` nearest to ``q_reference``: the solution from ``q_reference`` itself if
+        it converges, else the nearest of the first few solutions from random configurations within the limits.
+        Raises ``RuntimeError`` if none converges."""
+        try:
+            return self.inverse_kinematics(pose, q_reference)
+        except RuntimeError:
+            pass
+        rng = np.random.default_rng(0)
+        found: list[np.ndarray] = []
+        for _ in range(attempts):
+            try:
+                found.append(self.inverse_kinematics(pose, rng.uniform(self.model.lowerPositionLimit, self.model.upperPositionLimit)))
+            except RuntimeError:
+                continue
+            if len(found) == solutions:
+                break
+        if not found:
+            raise RuntimeError("IK did not converge from any start; pose may be unreachable.")
+        return min(found, key=lambda q: float(np.linalg.norm(q - q_reference)))
 
-        Poses must be in front of the base, above the table plane and at least
-        ``min_start_goal_distance`` apart. Fingers start at the open width.
-        """
-        lower, upper = self.model.lowerPositionLimit[:7], self.model.upperPositionLimit[:7]
-        margin = 0.1 * (upper - lower)
-        min_distance = self.config.get("min_start_goal_distance", 0.25)
-
-        def sample_config() -> tuple[np.ndarray, pin.SE3]:
-            while True:
-                q = np.concatenate([rng.uniform(lower + margin, upper - margin), Q_READY[7:]])
-                pose = self.tcp_placement(q)
-                if pose.translation[0] > 0.2 and 0.1 < pose.translation[2] < 0.8:
-                    return q, pose
-
-        q_start, start_pose = sample_config()
-        while True:
-            _, goal_pose = sample_config()
-            if np.linalg.norm(goal_pose.translation - start_pose.translation) > min_distance:
-                return np.concatenate([q_start, np.zeros(self.n)]), goal_pose
-
-    def tcp_placement(self, q: np.ndarray) -> pin.SE3:
-        pin.forwardKinematics(self.model, self.data, q)
-        pin.updateFramePlacements(self.model, self.data)
-        return self.data.oMf[self.tcp_id].copy()
-
-    def get_dataset_features(self) -> dict[str, Any]:
-        """LeRobot features: state [q, v], goal TCP pose as environment state, acceleration action."""
+    def get_dataset_features(self, prediction_horizon: int) -> dict[str, Any]:
+        """LeRobot features: state [q, v, a], goal TCP pose as environment state, the expert's planned jerks as action
+        (its next ``prediction_horizon`` jerks, flattened row by row)."""
         joints = list(self.model.names[1:])
         return {
+            "observation.environment_state": {
+                "dtype": "float32",
+                "shape": (FRANKA_GOAL_DIM,),
+                "names": ["goal.x", "goal.y", "goal.z"] + [f"goal.R{i}{j}" for i in range(3) for j in range(3)],
+            },
             "observation.state": {
                 "dtype": "float32",
                 "shape": (self.nx,),
-                "names": [f"{j}.pos" for j in joints] + [f"{j}.vel" for j in joints],
+                "names": [f"{j}.{kind}" for kind in ("pos", "vel", "acc") for j in joints],
             },
-            "observation.environment_state": {
+            "action": {
                 "dtype": "float32",
-                "shape": (12,),
-                "names": ["goal.x", "goal.y", "goal.z"] + [f"goal.R{i}{j}" for i in range(3) for j in range(3)],
+                "shape": (prediction_horizon * self.nu,),
+                "names": [f"{j}.jerk[t+{k}]" for k in range(prediction_horizon) for j in joints],
             },
-            "action": {"dtype": "float32", "shape": (self.nu,), "names": [f"{j}.acc" for j in joints]},
         }
 
-    def format_dataset_frame(self, obs: np.ndarray, action: np.ndarray) -> dict[str, Any]:
-        """One frame without ``task``, which LeRobot's add_frame requires from the caller."""
-        return {
-            "observation.state": np.asarray(obs, dtype=np.float32),
-            "observation.environment_state": self.task_goal.astype(np.float32),
-            "action": np.asarray(action, dtype=np.float32),
-        }
+    def _sample_configuration(self, rng: np.random.Generator) -> tuple[np.ndarray, pin.SE3]:
+        """Random arm configuration inside the joint limits (by ``JOINT_SAMPLING_MARGIN``), with its TCP in the
+        workspace box and clear of the floor."""
+        lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
+        margin = JOINT_SAMPLING_MARGIN * (upper - lower)
+        for _ in range(SAMPLING_ATTEMPTS):
+            q = rng.uniform(lower + margin, upper - margin)
+            pose = self.tcp_placement(q)
+            inside = np.all(self.workspace_bounds[:, 0] <= pose.translation) and np.all(pose.translation <= self.workspace_bounds[:, 1])
+            if inside and not self.is_collision(q):
+                return q, pose
+        raise RuntimeError(f"Unable to sample an arm configuration in the workspace in {SAMPLING_ATTEMPTS} attempts.")
+
+    def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
+        """Rest state from a random configuration at least ``min_start_goal_distance`` from the goal."""
+        for _ in range(SAMPLING_ATTEMPTS):
+            q, pose = self._sample_configuration(rng)
+            if np.linalg.norm(pose.translation - self.goal[:3]) > self.min_start_goal_distance:
+                return np.concatenate([q, np.zeros(2 * self.n)])
+        raise RuntimeError(
+            f"Unable to sample a start configuration {self.min_start_goal_distance} m away from the goal "
+            f"in {SAMPLING_ATTEMPTS} attempts."
+        )
+
+    def randomize_goal_for_reset(self, rng: np.random.Generator) -> None:
+        """Goal TCP pose from the forward kinematics of a random configuration, so it is reachable by construction."""
+        if self.randomize_goal:
+            _, pose = self._sample_configuration(rng)
+            self.set_goal(self.pose_to_goal(pose))
