@@ -12,11 +12,7 @@ DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
     "trajectories_per_iteration": [20],
     "steps_per_trajectory": 150,
     "action_noise_std": 0.0,
-    "expert_mix_beta_start": 0.8,
-    "expert_mix_beta_end": 0.0,
-    "expert_mix_beta_decay_rate": None,
-    "expert_mix_decay_after_eval_success": None,
-    "adaptive_beta_recovery": False,
+    "expert_beta_per_iteration": [0.8],
     "target_epochs_per_round": [30.0],
     "eval_episodes": 10,
     "eval_steps": None,
@@ -37,7 +33,15 @@ DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
 }
 
 
-DEFAULT_HIDDEN_DIMS = (256, 256, 256)
+@dataclass(frozen=True)
+class UnetConfig:
+    """The size of the flow network, SafeFlowMPC's temporal U-Net: the base channel count and the channel
+    multipliers of its levels (every level but the first halves the horizon)."""
+
+    dim: int = 32
+    dim_mults: tuple[int, ...] = (1, 2, 4, 8)
+
+
 DEFAULT_PREDICTION_HORIZON = 16
 
 
@@ -77,14 +81,17 @@ def load_dagger_training_config(policy_config_path: Path | None) -> dict[str, ob
     return config
 
 
-def load_mlp_hidden_dims(policy_config_path: Path) -> tuple[int, ...]:
-    """The ``model.hidden_dims`` widths of the flow network's MLP; the default if the config omits them."""
+def load_unet_config(policy_config_path: Path) -> UnetConfig:
+    """The ``model.unet`` section (``dim``, ``dim_mults``); what it omits keeps the SafeFlowMPC defaults."""
     raw_config = _cached_yaml_config(policy_config_path)
     model_section = raw_config.get("model", raw_config)
-    hidden_dims = model_section.get("hidden_dims", DEFAULT_HIDDEN_DIMS) if isinstance(model_section, Mapping) else DEFAULT_HIDDEN_DIMS
-    if not isinstance(hidden_dims, (list, tuple)) or not hidden_dims or any(int(width) <= 0 for width in hidden_dims):
-        raise ValueError("'model.hidden_dims' must be a non-empty list of positive integers.")
-    return tuple(int(width) for width in hidden_dims)
+    unet_section = model_section.get("unet", {}) if isinstance(model_section, Mapping) else {}
+    if not isinstance(unet_section, Mapping):
+        raise ValueError("Model config 'model.unet' must be a mapping.")
+    dim_mults = unet_section.get("dim_mults", UnetConfig.dim_mults)
+    if not isinstance(dim_mults, (list, tuple)) or not dim_mults:
+        raise ValueError("'model.unet.dim_mults' must be a non-empty list of integers.")
+    return UnetConfig(dim=int(unet_section.get("dim", UnetConfig.dim)), dim_mults=tuple(int(m) for m in dim_mults))
 
 
 def load_prediction_horizon(policy_config_path: Path | None) -> int:

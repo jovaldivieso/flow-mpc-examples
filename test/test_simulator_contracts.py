@@ -30,9 +30,7 @@ PINNED_EXPERT_SETTINGS = {
     "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
     "R_diag": [4.4e-3] * 7,
     "terminal_cost_multiplier": 10.0,
-    "floor_clearance": 0.05,
     "pos_tol": 0.002,
-    "rot_tol": 0.02,
     "vel_tol": 0.02,
 }
 
@@ -60,7 +58,7 @@ class SimulatorContractTests(unittest.TestCase):
 
     def test_dimensions_and_rest_state_indices(self) -> None:
         simulator = self.simulator
-        self.assertEqual((simulator.nx, simulator.nu, simulator.obs_dim, simulator.goal_dim), (21, 7, 33, 12))
+        self.assertEqual((simulator.nx, simulator.nu, simulator.obs_dim, simulator.goal_dim), (21, 7, 28, 7))
         self.assertEqual(simulator.max_action.shape, (simulator.nu,))
         self.assertEqual(simulator.state_lower_bounds.shape, (simulator.nx,))
         # state = [q, v, a]: the projector's terminal come-to-rest cost reads the velocities and accelerations
@@ -136,7 +134,7 @@ class SimulatorContractTests(unittest.TestCase):
     def test_set_goal_rejects_a_wrong_shape_and_copies_its_input(self) -> None:
         simulator = _build_simulator()
         with self.assertRaises(ValueError):
-            simulator.set_goal(np.zeros(7))
+            simulator.set_goal(np.zeros(12))
         goal = simulator.goal.copy()
         goal[0] += 0.1
         simulator.set_goal(goal)
@@ -146,40 +144,13 @@ class SimulatorContractTests(unittest.TestCase):
     def test_randomize_goal_contract(self) -> None:
         self.assertIsInstance(self.simulator.randomize_goal, bool)
         self.assertTrue(callable(getattr(self.simulator, "randomize_goal_for_reset", None)))
-        self.assertFalse(_build_simulator(goal=[0.4, 0.0, 0.4, 1, 0, 0, 0, -1, 0, 0, 0, -1]).randomize_goal)
+        self.assertFalse(_build_simulator(goal=list(Q_READY)).randomize_goal)
 
 
 class DynamicsModelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.simulator = _build_simulator()
-
-    def test_nearest_inverse_kinematics_reaches_the_pose_and_stays_near_the_reference(self) -> None:
-        simulator = self.simulator
-        q_reference = _rest_state(simulator)[: simulator.n]
-        q_goal = q_reference + 0.1
-        pose = simulator.tcp_placement(q_goal)
-
-        q = simulator.nearest_inverse_kinematics(pose, q_reference)
-
-        self.assertLess(np.linalg.norm(simulator.tcp_placement(q).translation - pose.translation), 1e-5)
-        self.assertLess(np.linalg.norm(q - q_reference), 1.0)
-
-    def test_nearest_inverse_kinematics_falls_back_to_random_starts(self) -> None:
-        simulator = self.simulator
-        pose = simulator.tcp_placement(_rest_state(simulator)[: simulator.n])
-
-        solution = np.full(simulator.n, 0.1)
-        with mock.patch.object(simulator, "inverse_kinematics", side_effect=[RuntimeError("no")] + [solution] * 10):
-            q = simulator.nearest_inverse_kinematics(pose, np.zeros(simulator.n))
-
-        np.testing.assert_array_equal(q, solution)
-
-    def test_nearest_inverse_kinematics_raises_for_an_unreachable_pose(self) -> None:
-        simulator = self.simulator
-        with mock.patch.object(simulator, "inverse_kinematics", side_effect=RuntimeError("no")):
-            with self.assertRaises(RuntimeError):
-                simulator.nearest_inverse_kinematics(simulator.goal_pose, np.zeros(simulator.n))
 
     def test_casadi_dynamics_matches_the_plant_inside_all_limits(self) -> None:
         simulator = self.simulator
@@ -235,10 +206,10 @@ class DynamicsModelTests(unittest.TestCase):
         next_state = simulator.predict_next_state(state, np.full(simulator.nu, simulator.max_action.max()))
         self.assertTrue(np.all(next_state[simulator.n :] <= simulator.state_upper_bounds[simulator.n :] + 1e-12))
 
-    def test_goal_errors_and_is_done_need_the_pose_and_rest(self) -> None:
+    def test_goal_errors_and_is_done_need_the_goal_and_rest(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(state[: simulator.n])))
+        simulator.set_goal(state[: simulator.n])
 
         position_error, rotation_error = simulator.goal_errors(state)
         self.assertAlmostEqual(position_error, 0.0, places=9)
@@ -263,8 +234,8 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_rollout_termination_state_resets_and_honors_hold_steps(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(state[: simulator.n])))
-        self.assertTrue(simulator.is_done(state), "a rest state at the goal pose must satisfy is_done()")
+        simulator.set_goal(state[: simulator.n])
+        self.assertTrue(simulator.is_done(state), "a rest state at the goal must satisfy is_done()")
 
         hold_steps = int(simulator.config.get("done_hold_steps", 5))
         self.assertGreaterEqual(hold_steps, 1)
@@ -287,7 +258,7 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_disabling_early_termination_never_terminates(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(state[: simulator.n])))
+        simulator.set_goal(state[: simulator.n])
         simulator.set_early_rollout_termination(False)
         for _ in range(20):
             self.assertFalse(simulator.should_terminate_rollout(state))
@@ -295,7 +266,7 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_simulate_stops_after_the_hold_steps_and_returns_matching_arrays(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(state[: simulator.n])))
+        simulator.set_goal(state[: simulator.n])
         observations = []
 
         def policy(observation: np.ndarray) -> np.ndarray:
@@ -311,7 +282,7 @@ class RolloutTerminationTests(unittest.TestCase):
 
 
 class SamplingTests(unittest.TestCase):
-    def test_seeded_reset_random_is_deterministic_and_inside_the_workspace(self) -> None:
+    def test_seeded_reset_random_is_deterministic_and_inside_joint_limits(self) -> None:
         simulator_a = _build_simulator(initial_state_seed=13)
         simulator_b = _build_simulator(initial_state_seed=13)
 
@@ -320,10 +291,9 @@ class SamplingTests(unittest.TestCase):
 
         np.testing.assert_allclose(state_a, state_b, atol=1e-12)
         np.testing.assert_allclose(simulator_a.goal, simulator_b.goal, atol=1e-12)
-        bounds = simulator_a.workspace_bounds
-        tcp = simulator_a.tcp_placement(state_a[: simulator_a.n]).translation
-        self.assertTrue(np.all(tcp >= bounds[:, 0]) and np.all(tcp <= bounds[:, 1]))
-        self.assertTrue(np.all(simulator_a.goal[:3] >= bounds[:, 0]) and np.all(simulator_a.goal[:3] <= bounds[:, 1]))
+        lower, upper = simulator_a.model.lowerPositionLimit, simulator_a.model.upperPositionLimit
+        self.assertTrue(np.all(state_a[: simulator_a.n] >= lower) and np.all(state_a[: simulator_a.n] <= upper))
+        self.assertTrue(np.all(simulator_a.goal >= lower) and np.all(simulator_a.goal <= upper))
 
     def test_random_initial_state_does_not_change_the_goal(self) -> None:
         simulator = _build_simulator()
@@ -332,7 +302,7 @@ class SamplingTests(unittest.TestCase):
         np.testing.assert_array_equal(simulator.goal, goal_before)
 
     def test_fixed_goal_is_kept_by_randomize_goal_for_reset(self) -> None:
-        simulator = _build_simulator(goal=[0.4, 0.1, 0.4, 1, 0, 0, 0, -1, 0, 0, 0, -1])
+        simulator = _build_simulator(goal=list(Q_READY))
         goal_before = simulator.goal.copy()
         simulator.randomize_goal_for_reset(np.random.default_rng(3))
         np.testing.assert_array_equal(simulator.goal, goal_before)
@@ -348,51 +318,23 @@ class SamplingTests(unittest.TestCase):
             self.assertTrue(np.all(state >= simulator.state_lower_bounds - 1e-12))
             self.assertTrue(np.all(state <= simulator.state_upper_bounds + 1e-12))
             self.assertFalse(simulator.is_collision(state))
-            distance = np.linalg.norm(simulator.tcp_placement(state[: simulator.n]).translation - simulator.goal[:3])
+            distance = np.linalg.norm(state[: simulator.n] - simulator.goal)
             self.assertGreater(distance, simulator.min_start_goal_distance)
 
-    def test_randomized_goal_is_a_valid_rotation_of_a_safe_configuration(self) -> None:
-        simulator = _build_simulator()
-        for seed in range(10):
-            simulator.randomize_goal_for_reset(np.random.default_rng(seed))
-            rotation = simulator.goal_pose.rotation
-            np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-9)
-            self.assertAlmostEqual(np.linalg.det(rotation), 1.0, places=9)
-
-    def test_infeasible_workspace_raises_instead_of_looping_forever(self) -> None:
-        simulator = _build_simulator(workspace_bounds=[[5.0, 6.0], [5.0, 6.0], [5.0, 6.0]])
+    def test_infeasible_min_start_goal_distance_raises_instead_of_looping_forever(self) -> None:
+        simulator = _build_simulator(min_start_goal_distance=100.0)
         with self.assertRaises(RuntimeError):
             simulator.random_initial_state(np.random.default_rng(0))
 
 
-class CollisionTests(unittest.TestCase):
-    def _configuration(self, simulator: FrankaDynamics, accept) -> np.ndarray:
-        rng = np.random.default_rng(0)
-        for _ in range(20000):
-            q = rng.uniform(simulator.model.lowerPositionLimit, simulator.model.upperPositionLimit)
-            if accept(simulator.clearance(q)):
-                return q
-        self.fail("no configuration with the wanted floor clearance found")
-
-    def test_ready_pose_is_collision_free(self) -> None:
-        simulator = _build_simulator()
-        self.assertFalse(simulator.is_collision(_rest_state(simulator)))
-        self.assertGreater(simulator.clearance(_rest_state(simulator)), simulator.floor_clearance)
-
-    def test_an_arm_below_the_floor_is_in_collision(self) -> None:
-        simulator = _build_simulator()
-        q = self._configuration(simulator, lambda clearance: clearance < 0.0)
-        self.assertTrue(simulator.is_collision(np.concatenate([q, np.zeros(2 * simulator.n)])))
-        self.assertTrue(simulator.is_collision(q))  # the joint positions alone will do
-
-    def test_the_floor_clearance_is_the_collision_threshold(self) -> None:
-        loose, strict = _build_simulator(floor_clearance=0.0), _build_simulator(floor_clearance=0.1)
-        q = self._configuration(loose, lambda clearance: 0.01 < clearance < 0.09)
-        self.assertFalse(loose.is_collision(q))
-        self.assertTrue(strict.is_collision(q))
-
-
 POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_casadi_config.yaml")
+# The tests pin the dimension they assume, so scaling the shipped config up does not break them
+POINT_MASS_SETTINGS = {"dimension": 2, "Q_diag": [20.0, 20.0, 2.0, 2.0, 0.2, 0.2], "R_diag": [1.0e-2, 1.0e-2]}
+
+
+def _point_mass_config(**overrides) -> dict:
+    with open(POINT_MASS_CONFIG_PATH) as f:
+        return validate_system_config({**yaml.safe_load(f), **POINT_MASS_SETTINGS, **overrides})
 
 
 class TripleIntegratorTests(unittest.TestCase):
@@ -400,7 +342,7 @@ class TripleIntegratorTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.config = load_and_validate_system_config(POINT_MASS_CONFIG_PATH)
+        cls.config = _point_mass_config()
         cls.simulator = DynamicsFactory.create(cls.config["system"], cls.config)
 
     def test_the_factory_builds_it_from_the_config_and_it_satisfies_the_protocol(self) -> None:
@@ -480,7 +422,7 @@ class TripleIntegratorTests(unittest.TestCase):
             self.assertTrue(simulator.is_done(state), simulator.goal_errors(state))
 
     def test_the_ompl_casadi_expert_reaches_random_goals_too(self) -> None:
-        config = validate_system_config({**yaml.safe_load(open(POINT_MASS_CONFIG_PATH)), "expert": "ompl_casadi"})
+        config = _point_mass_config(expert="ompl_casadi")
         simulator = TripleIntegrator(config)
         planner = PlannerFactory.create("ompl_casadi", simulator, config)
         for _ in range(3):
@@ -501,7 +443,7 @@ class TripleIntegratorTests(unittest.TestCase):
         for policy_type, extra in (("flow", {}), ("safeflow", {"simulator": simulator, "planner_config": self.config})):
             with self.subTest(policy_type=policy_type):
                 policy = PolicyFactory.create(
-                    policy_type, action_dim=2, state_dim=simulator.obs_dim, hidden_dims=(16, 16),
+                    policy_type, action_dim=2, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
                     prediction_horizon=CHUNK, num_inference_steps=2, action_scale=[1.0, 1.0], **extra,
                 ).eval()
                 self.assertEqual(tuple(policy.select_action(batch).shape), (1, CHUNK, 2))
@@ -517,9 +459,7 @@ class TripleIntegratorTests(unittest.TestCase):
 class _TripleIntegratorFactory:
     @staticmethod
     def build(**overrides) -> TripleIntegrator:
-        with open(POINT_MASS_CONFIG_PATH) as f:
-            raw = yaml.safe_load(f)
-        return TripleIntegrator(validate_system_config({**raw, **overrides}))
+        return TripleIntegrator(_point_mass_config(**overrides))
 
 
 if __name__ == "__main__":

@@ -176,7 +176,8 @@ def finetune(
         action_dim=int(checkpoint["action_dim"]),
         state_dim=int(checkpoint["state_dim"]),
         prediction_horizon=horizon,
-        hidden_dims=tuple(checkpoint["hidden_dims"]),
+        unet_dim=int(checkpoint["unet"]["dim"]),
+        unet_dim_mults=tuple(checkpoint["unet"]["dim_mults"]),
         num_inference_steps=int(flow_config["num_inference_steps"]),
         action_scale=flow_config["action_scale"],
     )
@@ -187,7 +188,8 @@ def finetune(
             action_dim=policy.velocity_net.action_dim,
             state_dim=policy.velocity_net.obs_cond_dim,
             prediction_horizon=horizon,
-            hidden_dims=tuple(checkpoint["hidden_dims"]),
+            unet_dim=int(checkpoint["unet"]["dim"]),
+            unet_dim_mults=tuple(checkpoint["unet"]["dim_mults"]),
             action_scale=flow_config["action_scale"],
         )
         averaged.load_state_dict(checkpoint["ema_model_state_dict"])

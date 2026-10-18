@@ -1,19 +1,19 @@
 # Expert (CasADi MPC) config for the triple-integrator point mass (a toy system to calibrate the pipeline).
-# State x = [p (2), v (2), a (2)], action u = jerks (2), goal = target position.
+# State x = [p (7), v (7), a (7)], action u = jerks (7), goal = target position.
 system: triple_integrator
-dimension: 2
+dimension: 7
 dt: 0.1
 # The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
 # chunk length, at most this) of its planned jerks.
 horizon: 20
 # Cost of the MPC, on the state x = [p, v, a] relative to the goal state [goal, 0, 0]: Q_diag weights the squared
-# position (first 2), velocity and acceleration (last 4) error at every node, R_diag the squared jerk,
+# position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
 # terminal_cost_multiplier the terminal node's Q cost.
-Q_diag: [20.0, 20.0,
-         2.0, 2.0,
-         0.2, 0.2]
+Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
+         2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+         0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 # 1 / max_jerk^2
-R_diag: [1.0e-2, 1.0e-2]
+R_diag: [1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2, 1.0e-2]
 terminal_cost_multiplier: 10.0
 # Limits of the point mass [m/s, m/s^2, m/s^3]; the plant stops at +-position_limit [m]
 position_limit: 1.5
@@ -29,7 +29,6 @@ ompl_speed: 0.5                 # m/s the path is traversed at (its timing as th
 ompl_replan_distance: 0.5       # m from the MPC's last solution (the learner drove the point away): plan a new path
 ompl_timeout: 5.0               # s per RRT-Connect solve
 ompl_seed: 0
-ompl_ik_solutions: 1            # goal configurations RRT-Connect plans to
 
 # Success: within pos_tol [m] of the goal and at rest (vel_tol [m/s])
 pos_tol: 0.02

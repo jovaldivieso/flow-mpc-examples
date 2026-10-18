@@ -21,7 +21,6 @@ from learning.models.ema import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy, PolicyFactory
 from planning.factory import DynamicsFactory, PlannerFactory
 
-from .beta_controller import ExpertMixBetaController
 from .dagger_config import DaggerConfig
 from .metrics import DaggerEvalMetrics
 from .rollouts import build_policy_action, collect_dagger_rollouts, evaluate_policy_rollouts
@@ -38,6 +37,7 @@ from .utils import (
 # learning rate over twice the round's steps (half a cosine period) down to MIN_LEARNING_RATE
 WEIGHT_DECAY = 1e-7
 MIN_LEARNING_RATE = 1e-7
+ROLLOUT_DEVICE = torch.device("cpu")
 
 
 def _validate_resumable_dataset_schema(
@@ -77,6 +77,7 @@ class DaggerTrainer:
         self.simulator: DynamicsProtocol | None = None
         self.seeded_config: Mapping[str, Any] | None = None
         self.policy: ActionPolicy | None = None
+        self.rollout_policy: ActionPolicy | None = None
         self.optimizer: torch.optim.Optimizer | None = None
         self.ema: ExponentialMovingAverage | None = None
         self.action_noise_seed = 0
@@ -88,10 +89,11 @@ class DaggerTrainer:
     def schedules(
         trajectories: list[int],
         epochs: list[float],
+        betas: list[float],
         rounds: int,
         training_curriculum: list[str] | None = None,
         round_seeds: list[int] | None = None,
-    ) -> tuple[list[int], list[float], list[str] | None, list[int] | None]:
+    ) -> tuple[list[int], list[float], list[float], list[str] | None, list[int] | None]:
         def expand(values: list[Any], name: str) -> list[Any]:
             if len(values) == 1:
                 return values if rounds == 0 else values * rounds
@@ -103,6 +105,7 @@ class DaggerTrainer:
         return (
             expand(trajectories, "trajectories-per-iteration"),
             expand(epochs, "target-epochs-per-round"),
+            expand(betas, "expert-beta-per-iteration"),
             expand(training_curriculum, "training-curriculum") if training_curriculum is not None else None,
             expand(round_seeds, "round-seeds") if round_seeds is not None else None,
         )
@@ -157,46 +160,40 @@ class DaggerTrainer:
             if self.cfg.policy_type == "safeflow"
             else {}
         )
-        self.policy = PolicyFactory.create(
-            self.cfg.policy_type,
-            action_dim=self.action_dim,
-            state_dim=self.state_dim,
-            hidden_dims=self.cfg.hidden_dims,
-            prediction_horizon=self.prediction_horizon,
-            **flow,
-            **safeflow,
-        ).to(self.device).eval()
+        def build_policy(device: torch.device) -> ActionPolicy:
+            return PolicyFactory.create(
+                self.cfg.policy_type,
+                action_dim=self.action_dim,
+                state_dim=self.state_dim,
+                unet_dim=self.cfg.unet.dim,
+                unet_dim_mults=self.cfg.unet.dim_mults,
+                prediction_horizon=self.prediction_horizon,
+                **flow,
+                **safeflow,
+            ).to(device).eval()
+
+        self.policy = build_policy(self.device)
+        # Single-sample inference is faster on the CPU than on an accelerator, so rollouts use a CPU copy
+        self.rollout_policy = build_policy(ROLLOUT_DEVICE)
         self.optimizer = torch.optim.AdamW(
             self.policy.parameters(), lr=self.cfg.learning_rate, weight_decay=WEIGHT_DECAY
         )
-        # The policy runs (collection, evaluation, checkpoints for inference) with the averaged weights
+        # The rollouts and checkpoints for inference use the averaged weights
         self.ema = ExponentialMovingAverage(self.policy)
 
         self.cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Keep startup logs brief and non-redundant; the full config summary is already printed above.
         print(f"Starting DAgger training for franka ({self.cfg.policy_type})")
-        print(f"Device: {self.device}; dataset_root={self.cfg.dataset_root}")
+        print(f"Device: {self.device} (rollouts on {ROLLOUT_DEVICE}); dataset_root={self.cfg.dataset_root}")
         print(
             "Schedule: "
             f"rounds={self.cfg.dagger_iterations}, "
             f"trajectories_per_round={self.cfg.trajectories_per_iteration}, "
             f"steps_per_trajectory={self.cfg.steps_per_trajectory}, "
-            f"target_epochs={self.cfg.target_epochs_per_round}"
+            f"target_epochs={self.cfg.target_epochs_per_round}, "
+            f"expert_beta={self.cfg.expert_beta_per_iteration}"
         )
-        if self.cfg.expert_mix_beta_decay_rate is not None:
-            print(
-                "Expert beta: "
-                f"start={self.cfg.expert_mix_beta_start:.3f}, "
-                f"decay_rate={self.cfg.expert_mix_beta_decay_rate:.3f}/round, "
-                f"floor=0.000"
-            )
-        else:
-            print(
-                "Expert beta: "
-                f"start={self.cfg.expert_mix_beta_start:.3f}, "
-                f"end={self.cfg.expert_mix_beta_end:.3f}"
-            )
         print(
             "Noise: "
             f"aggregation_std={self.cfg.action_noise_std:.6f}, "
@@ -323,9 +320,13 @@ class DaggerTrainer:
         merged_config = apply_config_overrides(config, overrides)
         return validate_system_config(merged_config)
 
+    def _sync_rollout_policy(self) -> None:
+        """Give the CPU rollout policy the averaged weights of the policy being trained."""
+        assert self.rollout_policy is not None and self.ema is not None
+        self.rollout_policy.load_state_dict({name: tensor.cpu() for name, tensor in self.ema.state_dict().items()})
+
     def evaluate_current_policy(self, label: str) -> DaggerEvalMetrics | None:
-        assert self.policy is not None
-        assert self.device is not None
+        assert self.rollout_policy is not None
         assert self.seeded_config is not None
         if self.cfg.eval_episodes == 0:
             return None
@@ -336,24 +337,21 @@ class DaggerTrainer:
         simulator = DynamicsFactory.create(eval_config["system"], eval_config)
 
         def action_fn(obs: np.ndarray) -> np.ndarray:
-            return build_policy_action(simulator, self.policy, obs, self.device)
+            return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
 
-        def reset_policy_state() -> None:
-            self.policy.reset()
-
-        with self.ema.averaged_weights(self.policy):
-            metrics = evaluate_policy_rollouts(
-                simulator,
-                self.cfg.eval_episodes,
-                self.cfg.eval_steps or self.cfg.steps_per_trajectory,
-                self.cfg.eval_seed_start,
-                action_fn,
-                reset_fn=reset_policy_state,
-                action_noise_std=self.cfg.eval_action_noise_std,
-                action_noise_seed=self.action_noise_seed,
-                initial_states=self.cfg.initial_states,
-                goal_states=self.cfg.goal_states,
-            )
+        self._sync_rollout_policy()
+        metrics = evaluate_policy_rollouts(
+            simulator,
+            self.cfg.eval_episodes,
+            self.cfg.eval_steps or self.cfg.steps_per_trajectory,
+            self.cfg.eval_seed_start,
+            action_fn,
+            reset_fn=self.rollout_policy.reset,
+            action_noise_std=self.cfg.eval_action_noise_std,
+            action_noise_seed=self.action_noise_seed,
+            initial_states=self.cfg.initial_states,
+            goal_states=self.cfg.goal_states,
+        )
         if metrics is not None:
             print_rollout_metrics(label, "eval", metrics)
         return metrics
@@ -542,7 +540,7 @@ class DaggerTrainer:
             "state_dim": self.state_dim,
             "action_dim": self.action_dim,
             "prediction_horizon": self.prediction_horizon,
-            "hidden_dims": list(self.cfg.hidden_dims),
+            "unet": {"dim": self.cfg.unet.dim, "dim_mults": list(self.cfg.unet.dim_mults)},
             "obs_feature_names": self.obs_feature_names,
             "policy_type": self.cfg.policy_type,
         }
@@ -567,16 +565,6 @@ class DaggerTrainer:
         assert self.device is not None
         assert self.seeded_config is not None
 
-        beta = ExpertMixBetaController(
-            beta_start=self.cfg.expert_mix_beta_start,
-            beta_end=self.cfg.expert_mix_beta_end,
-            decay_rounds=max(1, self.cfg.dagger_iterations),
-            beta_decay_rate=self.cfg.expert_mix_beta_decay_rate,
-            decay_after_success_rate=self.cfg.expert_mix_decay_after_eval_success,
-            adaptive_recovery=self.cfg.adaptive_beta_recovery,
-        )
-
-        initial = None
         if not self.cfg.start_with_aggregation:
             self.train_on_aggregate(
                 "Initial offline training pass",
@@ -598,8 +586,6 @@ class DaggerTrainer:
                 print("No DAgger refinements requested (--dagger-iterations 0).")
                 return
             rounds = range(1, self.cfg.dagger_iterations + 1)
-            if initial is not None:
-                beta.prime_from_evaluation(initial.success_rate)
         else:
             if self.cfg.dagger_iterations == 0:
                 raise ValueError(
@@ -641,12 +627,8 @@ class DaggerTrainer:
             simulator = DynamicsFactory.create(collection_config["system"], collection_config)
             planner = PlannerFactory.create(collection_config["expert"], simulator, collection_config)
 
-            round_beta = beta.current_beta
-            print(
-                "Aggregation execution policy: "
-                f"expert_beta={round_beta:.3f}, "
-                f"decay_active={'yes' if beta.decay_active else 'no'}"
-            )
+            round_beta = self.cfg.expert_beta_per_iteration[schedule]
+            print(f"Aggregation execution policy: expert_beta={round_beta:.3f}")
 
             if self.cfg.start_with_aggregation and not self.cfg.dataset_root.exists():
                 features = simulator.get_dataset_features(self.prediction_horizon)
@@ -666,32 +648,29 @@ class DaggerTrainer:
 
             try:
                 def action_fn(obs: np.ndarray) -> np.ndarray:
-                    return build_policy_action(simulator, self.policy, obs, self.device)
-
-                def reset_policy_state() -> None:
-                    self.policy.reset()
+                    return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
 
                 frames = simulator.format_dataset_frame
-                with self.ema.averaged_weights(self.policy):
-                    metrics = collect_dagger_rollouts(
-                        simulator=simulator,
-                        expert_planner=planner,
-                        dataset_writer=writer,
-                        trajectories_per_iteration=self.cfg.trajectories_per_iteration[schedule],
-                        steps_per_trajectory=self.cfg.steps_per_trajectory,
-                        action_noise_std=self.cfg.action_noise_std,
-                        action_noise_seed=self.action_noise_seed,
-                        initial_state_seed=round_initial_state_seed,
-                        initial_states=round_initial_states,
-                        goal_states=round_goal_states,
-                        expert_mixing_beta=round_beta,
-                        prediction_horizon=self.prediction_horizon,
-                        round_index=schedule,
-                        restart_initial_state_round=self.cfg.restart_round_seed,
-                        policy_action_fn=action_fn,
-                        policy_reset_fn=reset_policy_state,
-                        frame_builder=frames,
-                    )
+                self._sync_rollout_policy()
+                metrics = collect_dagger_rollouts(
+                    simulator=simulator,
+                    expert_planner=planner,
+                    dataset_writer=writer,
+                    trajectories_per_iteration=self.cfg.trajectories_per_iteration[schedule],
+                    steps_per_trajectory=self.cfg.steps_per_trajectory,
+                    action_noise_std=self.cfg.action_noise_std,
+                    action_noise_seed=self.action_noise_seed,
+                    initial_state_seed=round_initial_state_seed,
+                    initial_states=round_initial_states,
+                    goal_states=round_goal_states,
+                    expert_mixing_beta=round_beta,
+                    prediction_horizon=self.prediction_horizon,
+                    round_index=schedule,
+                    restart_initial_state_round=self.cfg.restart_round_seed,
+                    policy_action_fn=action_fn,
+                    policy_reset_fn=self.rollout_policy.reset,
+                    frame_builder=frames,
+                )
                 if metrics.num_episodes == 0:
                     raise RuntimeError(
                         "DAgger aggregation produced no valid episodes; skipping retraining."
@@ -723,9 +702,6 @@ class DaggerTrainer:
                 else f"Refinement {display} evaluation"
             )
 
-            beta.update_after_evaluation(
-                eval_metrics.success_rate if eval_metrics is not None else None
-            )
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / f"flow_dagger_iter_{index:03d}.pt"
             self.save_checkpoints(training_round=index)

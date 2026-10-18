@@ -868,7 +868,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         cls.initial_state = np.concatenate([q, np.zeros(2 * cls.simulator.n)])
         goal_q = q.copy()
         goal_q += 0.1
-        cls.goal = cls.simulator.pose_to_goal(cls.simulator.tcp_placement(goal_q))
+        cls.goal = goal_q
 
     def test_collect_dagger_rollouts_writes_frames_matching_the_dataset_schema(self) -> None:
         simulator = self.simulator
@@ -916,7 +916,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
     def test_evaluate_policy_rollouts_queries_the_policy_through_build_policy_action(self) -> None:
         simulator = self.simulator
         policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, hidden_dims=(16, 16),
+            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=4, num_inference_steps=2,
         ).eval()
         actions: list[np.ndarray] = []

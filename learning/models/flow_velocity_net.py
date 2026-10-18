@@ -1,31 +1,15 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
+from learning.models.temporal_unet import TemporalUnet
+
 TIME_BETA_ALPHA = 1.5
 TIME_BETA_BETA = 1.0
-
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """Standard transformer-style sinusoidal embedding for continuous flow time."""
-
-    def __init__(self, embed_dim: int) -> None:
-        super().__init__()
-        if embed_dim <= 0 or embed_dim % 2 != 0:
-            raise ValueError(f"'embed_dim' must be a positive even integer, got {embed_dim}.")
-        half_dim = embed_dim // 2
-        exponent = -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32) / half_dim
-        # Non-persistent: a pure function of embed_dim, so it stays out of state_dict()
-        self.register_buffer("freqs", torch.exp(exponent), persistent=False)
-
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        args = timesteps.float().unsqueeze(-1) * self.freqs.unsqueeze(0)
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
 class FlowVelocityNet(nn.Module):
@@ -33,8 +17,9 @@ class FlowVelocityNet(nn.Module):
     and a flow time in [0, 1], predicts the denoising velocity -- trained via rectified flow matching
     (``compute_loss``) and sampled via Euler integration (``integrate``).
 
-    The network is an MLP (``hidden_dims``, Mish) on the concatenation of the flattened chunk, the flat ``obs_cond``
-    vector (here the goal and the state) and a sinusoidal embedding of the flow time.
+    The network is SafeFlowMPC's temporal U-Net (``TemporalUnet``), conditioned on the flat ``obs_cond`` vector (here the
+    goal and the state) and on the flow time passed as it is, in [0, 1]. The horizon of the chunk has to be divisible by
+    ``2 ** (len(unet_dim_mults) - 1)``.
     """
 
     def __init__(
@@ -42,9 +27,9 @@ class FlowVelocityNet(nn.Module):
         action_dim: int,
         obs_cond_dim: int,
         prediction_horizon: int = 16,
-        hidden_dims: tuple[int, ...] = (256, 256, 256),
+        unet_dim: int = 32,
+        unet_dim_mults: tuple[int, ...] = (1, 2, 4, 8),
         num_inference_steps: int = 10,
-        time_embed_dim: int = 64,
         action_scale: Sequence[float] | torch.Tensor | None = None,
     ) -> None:
         super().__init__()
@@ -55,8 +40,10 @@ class FlowVelocityNet(nn.Module):
             raise ValueError(f"'obs_cond_dim' must be positive, got {obs_cond_dim}.")
         if prediction_horizon <= 0:
             raise ValueError(f"'prediction_horizon' must be positive, got {prediction_horizon}.")
-        if len(hidden_dims) < 1 or any(width <= 0 for width in hidden_dims):
-            raise ValueError(f"'hidden_dims' must be a non-empty tuple of positive widths, got {hidden_dims}.")
+        if unet_dim <= 0 or unet_dim % 8 != 0:
+            raise ValueError(f"'unet_dim' must be a positive multiple of 8 (the group norm has 8 groups), got {unet_dim}.")
+        if len(unet_dim_mults) < 1 or any(m <= 0 for m in unet_dim_mults):
+            raise ValueError(f"'unet_dim_mults' must be a non-empty tuple of positive integers, got {unet_dim_mults}.")
         if num_inference_steps <= 0:
             raise ValueError(f"'num_inference_steps' must be positive, got {num_inference_steps}.")
 
@@ -102,15 +89,13 @@ class FlowVelocityNet(nn.Module):
         # gaining an unexpected key.
         self.register_buffer("action_scale", action_scale_tensor, persistent=False)
 
-        self.action_flat_dim = self.action_dim * self.prediction_horizon
-        self.time_embed = SinusoidalTimeEmbedding(time_embed_dim)
-        layers: list[nn.Module] = []
-        in_dim = self.action_flat_dim + self.obs_cond_dim + time_embed_dim
-        for width in hidden_dims:
-            layers += [nn.Linear(in_dim, int(width)), nn.Mish()]
-            in_dim = int(width)
-        layers.append(nn.Linear(in_dim, self.action_flat_dim))
-        self.net = nn.Sequential(*layers)
+        self.unet = TemporalUnet(
+            horizon=self.prediction_horizon,
+            transition_dim=self.action_dim,
+            cond_dim=self.obs_cond_dim,
+            dim=unet_dim,
+            dim_mults=tuple(int(m) for m in unet_dim_mults),
+        )
 
     def predict_velocity(
         self,
@@ -118,9 +103,8 @@ class FlowVelocityNet(nn.Module):
         obs_cond: torch.Tensor,
         timesteps: torch.Tensor,
     ) -> torch.Tensor:
-        # Scale t from [0, 1] to [0, 1000] for a stable sinusoidal embedding
-        time_embedding = self.time_embed(timesteps * 1000.0)
-        return self.net(torch.cat([action_state_flat, obs_cond, time_embedding], dim=-1))
+        chunk = action_state_flat.view(-1, self.prediction_horizon, self.action_dim)
+        return self.unet(chunk, timesteps.float(), obs_cond).flatten(1)
 
     def compute_loss(self, obs_cond: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
         batch_size = actions.shape[0]

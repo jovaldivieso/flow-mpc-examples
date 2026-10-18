@@ -24,9 +24,7 @@ PINNED_EXPERT_SETTINGS = {
     "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
     "R_diag": [4.4e-3] * 7,
     "terminal_cost_multiplier": 10.0,
-    "floor_clearance": 0.05,
     "pos_tol": 0.002,
-    "rot_tol": 0.02,
     "vel_tol": 0.02,
 }
 HORIZON = 10
@@ -264,7 +262,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_a_feasible_plan_of_the_expert_is_tracked_closely(self) -> None:
         # The projector only corrects what is unsafe: an action chunk the expert planned stays almost untouched
         simulator = self.simulator
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(Q_READY)))
+        simulator.set_goal(Q_READY)
         state = _rest_state(simulator)
         reference = CasadiPlanner(simulator, self.config).plan(simulator.observe(state)).actions[:HORIZON]
         self.projector.reset()

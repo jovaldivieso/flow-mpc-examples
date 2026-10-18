@@ -27,15 +27,13 @@ PINNED_EXPERT_SETTINGS = {
     "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
     "R_diag": [4.4e-3] * 7,
     "terminal_cost_multiplier": 10.0,
-    "floor_clearance": 0.05,
     "pos_tol": 0.002,
-    "rot_tol": 0.02,
     "vel_tol": 0.02,
 }
 HORIZON = 10
-# Two goal TCP poses [position(3), rotation matrix row-major(9)]: which one the arm holds must never matter to the projection.
-GOAL = [0.5, 0.2, 0.4, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
-OTHER_GOAL = [0.3, -0.3, 0.6, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+# Two goal configurations (7,): which one the arm holds must never matter to the projection.
+GOAL = [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.5]
+OTHER_GOAL = [0.2, -0.7, 0.1, -1.8, -0.2, 1.3, 0.8]
 
 
 def _validated_config(**overrides) -> dict:
@@ -81,7 +79,7 @@ def _build_safe_flow_policy(simulator, planner_config=None, **policy_options) ->
     # safeflow options (flow_init, use_guidance).
     policy = PolicyFactory.create(
         "safeflow",
-        action_dim=simulator.nu, state_dim=simulator.obs_dim, hidden_dims=(16, 16), prediction_horizon=HORIZON,
+        action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
         num_inference_steps=2, action_scale=simulator.max_action.tolist(),
         simulator=simulator, planner_config=_validated_config() if planner_config is None else planner_config,
         **policy_options,
@@ -99,7 +97,7 @@ def _zero_the_network(policy: SafeFlowMPCPolicy) -> None:
     """With every weight and bias zeroed the predicted velocity is identically 0: the Euler iterate never leaves
     its start, so what the projector is handed is exactly the integration's initial chunk."""
     with torch.no_grad():
-        for param in policy.inner_policy.velocity_net.net.parameters():
+        for param in policy.inner_policy.velocity_net.unet.parameters():
             param.zero_()
 
 
@@ -125,7 +123,7 @@ class GoalAnchorIndependenceTests(unittest.TestCase):
         simulator = _build_simulator(goal=GOAL)
         policy = _build_safe_flow_policy(simulator)
 
-        np.testing.assert_allclose(policy.local_sim.goal, np.zeros(12))
+        np.testing.assert_allclose(policy.local_sim.goal, np.zeros(7))
         # projector.sim and local_sim must still be the same object
         # (both are PolicyFactory.create's own copy) -- a projector never
         # needs a goal of its own, separate from local_sim's.
@@ -292,7 +290,7 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
     def test_requires_simulator_and_planner_config(self) -> None:
         simulator = _build_simulator()
         flow_kwargs = dict(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, hidden_dims=(16, 16),
+            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=HORIZON, num_inference_steps=2,
         )
         for given in ({}, {"simulator": simulator}, {"planner_config": {}}):
@@ -472,7 +470,7 @@ class StateDictInterchangeTests(unittest.TestCase):
         simulator = _build_simulator()
         safe_policy = _build_safe_flow_policy(simulator)
         flow_policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, hidden_dims=(16, 16),
+            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=HORIZON, num_inference_steps=2,
         )
         flow_state_dict = {name: value.clone() for name, value in flow_policy.state_dict().items()}

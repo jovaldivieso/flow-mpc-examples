@@ -17,8 +17,7 @@ class CasadiPlanner(Planner):
     -------
     State (nx = 21)          x = [q, v, a]: joint positions, velocities and accelerations.
     Action (nu = 7)          u: joint jerks.
-    Goal                     x_goal = [q_goal, 0, 0]: the joint configuration of the goal pose (inverse kinematics from
-                             the current configuration, once per goal) at rest.
+    Goal                     x_goal = [q_goal, 0, 0]: the goal configuration at rest.
     Optimization variables   X = [x_0 .. x_N] (nx, N + 1) and U = [u_0 .. u_{N-1}] (nu, N), horizon N.
     Parameters               x_init (the current state) and x_goal.
 
@@ -188,11 +187,8 @@ class CasadiPlanner(Planner):
         return None
 
     def _goal_configuration(self, x0: np.ndarray) -> np.ndarray:
-        """The joint configuration of the goal pose nearest to the current one."""
-        try:
-            return self.sim.nearest_inverse_kinematics(self.sim.goal_pose, x0[: self.n_joints])
-        except RuntimeError as exc:
-            raise PlannerSolveError("CasADi planner: no joint configuration reaches the goal pose.") from exc
+        """The goal configuration."""
+        return self._goal.copy()
 
     def _solve(self, x0: np.ndarray, initial_plan: Plan | None) -> None:
         """Solve the NLP from ``x0`` and keep the solution."""

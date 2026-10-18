@@ -16,7 +16,7 @@ from learning.models.policy import PolicyFactory, observation_features
 
 def _build_policy(action_scale=None) -> FlowPolicy:
     return FlowPolicy(
-        action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=4,
+        action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=4,
         num_inference_steps=4, action_scale=action_scale,
     )
 
@@ -76,39 +76,30 @@ class FlowTimeSamplingTests(unittest.TestCase):
 
 
 class VelocityNetworkTests(unittest.TestCase):
-    """The network is an MLP on the flattened chunk, the condition and a sinusoidal embedding of the flow time."""
+    """The network is SafeFlowMPC's temporal U-Net, with the flow time passed as it is."""
 
-    def test_the_velocity_is_predicted_by_the_mlp_on_the_chunk_the_condition_and_the_time_embedding(self) -> None:
+    def test_the_velocity_is_predicted_by_the_unet_on_the_chunk_the_condition_and_the_time(self) -> None:
         policy = _build_policy()
         net = policy.velocity_net
         chunk, condition, time = torch.randn(3, 4, 2), torch.randn(3, 6), torch.rand(3)
 
         velocity = net.predict_velocity(chunk.flatten(1), condition, time)
 
-        net_input = torch.cat([chunk.flatten(1), condition, net.time_embed(time * 1000.0)], dim=-1)
-        torch.testing.assert_close(velocity, net.net(net_input))
+        torch.testing.assert_close(velocity, net.unet(chunk, time, condition).flatten(1))
         self.assertEqual(tuple(velocity.shape), (3, 8))
 
-    def test_the_time_embedding_is_sinusoidal_and_needs_an_even_width(self) -> None:
-        from learning.models.flow_velocity_net import SinusoidalTimeEmbedding
-
-        embedding = SinusoidalTimeEmbedding(8)(torch.tensor([0.0, 3.0]))
-
-        self.assertEqual(tuple(embedding.shape), (2, 8))
-        torch.testing.assert_close(embedding[0], torch.tensor([0.0] * 4 + [1.0] * 4))  # sin(0), cos(0)
+    def test_the_horizon_must_survive_the_downsampling_of_the_unet(self) -> None:
         with self.assertRaises(ValueError):
-            SinusoidalTimeEmbedding(7)
+            FlowPolicy(action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2, 4), prediction_horizon=6)
 
-    def test_the_hidden_widths_must_be_positive_and_not_empty(self) -> None:
-        for hidden_dims in ((), (16, 0)):
-            with self.subTest(hidden_dims=hidden_dims), self.assertRaises(ValueError):
-                FlowPolicy(action_dim=2, state_dim=6, hidden_dims=hidden_dims, prediction_horizon=4)
+    def test_the_channel_count_must_suit_the_group_norm(self) -> None:
+        with self.assertRaises(ValueError):
+            FlowPolicy(action_dim=2, state_dim=6, unet_dim=12, prediction_horizon=8)
 
-    def test_the_default_network_has_three_hidden_layers_of_256(self) -> None:
-        net = FlowPolicy(action_dim=7, state_dim=33, prediction_horizon=16).velocity_net
+    def test_the_default_network_has_the_size_of_the_one_of_safeflowmpc(self) -> None:
+        net = FlowPolicy(action_dim=7, state_dim=26, prediction_horizon=16).velocity_net
 
-        widths = [layer.out_features for layer in net.net if isinstance(layer, torch.nn.Linear)]
-        self.assertEqual(widths, [256, 256, 256, 7 * 16])
+        self.assertEqual(sum(p.numel() for p in net.unet.parameters()), 3_962_311)  # dim 32, mults (1, 2, 4, 8)
 
 
 class PathLossTests(unittest.TestCase):
@@ -225,7 +216,7 @@ class SelectActionRescalesToPhysicalUnitsTests(unittest.TestCase):
         scale = [1.0, 100.0]
         policy = _build_policy(action_scale=scale)
         with torch.no_grad():
-            for param in policy.velocity_net.net.parameters():
+            for param in policy.velocity_net.unet.parameters():
                 param.zero_()
 
         torch.manual_seed(42)
@@ -290,7 +281,7 @@ class FlowPolicyLearnsAConditionalMappingTests(unittest.TestCase):
     def test_trained_policy_follows_the_mapping_and_depends_on_the_observation(self) -> None:
         torch.manual_seed(0)
         policy = FlowPolicy(
-            action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=2, num_inference_steps=8
+            action_dim=2, state_dim=6, unet_dim=16, unet_dim_mults=(1, 2), prediction_horizon=2, num_inference_steps=8
         )
         mixing = torch.randn(6, 4) * 0.5
 
@@ -329,7 +320,7 @@ class PolicyFactoryTests(unittest.TestCase):
     @staticmethod
     def _flow_kwargs() -> dict[str, object]:
         return dict(
-            action_dim=2, state_dim=6, hidden_dims=(16, 16), prediction_horizon=4,
+            action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=4,
             num_inference_steps=4, action_scale=[1.0, 2.0],
         )
 

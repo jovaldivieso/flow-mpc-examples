@@ -26,6 +26,7 @@ from dynamics.seed_utils import (
 )
 from planning.factory import DynamicsFactory, PlannerFactory
 from planning.planner import PlannerSolveError
+from learning.config_loaders import UnetConfig
 from learning.dagger import apply_config_overrides, build_policy_action
 from learning.models.policy import ActionPolicy, PolicyFactory
 from planning.planner import Planner, PlannerSolveError
@@ -352,12 +353,12 @@ def _load_checkpoint_policy_components(
     Mapping[str, torch.Tensor],
     int,
     int,
-    tuple[int, ...],
+    UnetConfig,
     int,
 ]:
     """Load a metadata checkpoint and resolve its state/action/network-size schema.
 
-    Returns (checkpoint, state_dict, state_dim, action_dim, hidden_dims,
+    Returns (checkpoint, state_dict, state_dim, action_dim, unet,
     prediction_horizon).
     """
     checkpoint = torch.load(model_dir, map_location=device, weights_only=True)
@@ -376,20 +377,20 @@ def _load_checkpoint_policy_components(
     state_dim, action_dim = resolve_checkpoint_observation_dimensions(
         checkpoint, simulator, policy_type
     )
-    hidden_dims_raw = checkpoint.get("hidden_dims")
-    if not isinstance(hidden_dims_raw, (list, tuple)):
+    unet_raw = checkpoint.get("unet")
+    if not isinstance(unet_raw, Mapping):
         raise ValueError(
-            f"'{policy_type}' checkpoint has no 'hidden_dims' entry: it was trained with a flow network that is no "
-            "longer supported (the MLP replaced the temporal U-Net)."
+            f"'{policy_type}' checkpoint has no 'unet' entry: it was trained with a flow network that is no longer "
+            "supported (the temporal U-Net replaced the MLP)."
         )
-    hidden_dims = tuple(int(width) for width in hidden_dims_raw)
+    unet = UnetConfig(dim=int(unet_raw["dim"]), dim_mults=tuple(int(m) for m in unet_raw["dim_mults"]))
 
     return (
         checkpoint,
         state_dict,
         state_dim,
         action_dim,
-        hidden_dims,
+        unet,
         prediction_horizon,
     )
 
@@ -405,13 +406,14 @@ def load_policy(
 
     ``planner_config`` is the validated expert config a ``safeflow`` policy builds its projector from.
     """
-    checkpoint, state_dict, state_dim, action_dim, hidden_dims, prediction_horizon = (
+    checkpoint, state_dict, state_dim, action_dim, unet, prediction_horizon = (
         _load_checkpoint_policy_components(model_dir, simulator, policy_type, device)
     )
     policy_kwargs: dict[str, object] = {
         "action_dim": action_dim,
         "state_dim": state_dim,
-        "hidden_dims": hidden_dims,
+        "unet_dim": unet.dim,
+        "unet_dim_mults": unet.dim_mults,
         "prediction_horizon": prediction_horizon,
     }
     if policy_type in {"flow", "safeflow"}:
@@ -858,7 +860,7 @@ def main():
         default=None,
         help=(
             "explicit goal state specs, independently indexed from --initial-states. "
-            "Examples: '[x, y, z, R00, R01, ..., R22]' (TCP pose) for one rollout or "
+            "Examples: '[q1, ..., q7]' for one rollout or "
             "'[[...], [...]]' for multiple rollouts. "
             "When exhausted, evaluation falls back to simulator RNG sampling."
         ),
@@ -869,8 +871,8 @@ def main():
         default=None,
         help=(
             "per-run override for the expert config's convergence tolerances, as a Python-literal "
-            "dict of the tolerance keys pos_tol, rot_tol and vel_tol, e.g. "
-            "'{\"pos_tol\": 0.02, \"rot_tol\": 0.2, \"vel_tol\": 0.1}'."
+            "dict of the tolerance keys pos_tol and vel_tol, e.g. "
+            "'{\"pos_tol\": 0.02, \"vel_tol\": 0.1}'."
         ),
     )
     parser.add_argument(

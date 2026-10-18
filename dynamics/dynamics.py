@@ -63,11 +63,8 @@ class DynamicsProtocol(Protocol):
     - ``format_dataset_frame()`` must return tensors matching that schema
         exactly (keys and dimensions).
 
-    Arm-specific members
-    --------------------
-    The planner and the projector additionally read the joint-space limits
-    (``state_lower_bounds``, ``state_upper_bounds``); the planner gets the
-    joint configuration of the goal pose from ``nearest_inverse_kinematics``.
+    The planner and the projector additionally read the state limits
+    (``state_lower_bounds``, ``state_upper_bounds``).
     """
 
     config: Mapping[str, Any]
@@ -102,12 +99,6 @@ class DynamicsProtocol(Protocol):
 
     def rollout_positions(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray: ...
 
-    def goal_to_pose(self, goal: np.ndarray) -> Any: ...
-
-    def inverse_kinematics(self, pose: Any, q_init: np.ndarray, iters: int = 500) -> np.ndarray: ...
-
-    def nearest_inverse_kinematics(self, pose: Any, q_reference: np.ndarray) -> np.ndarray: ...
-
     def get_dataset_features(self, prediction_horizon: int) -> dict[str, Any]: ...
 
     def reset_random(self) -> np.ndarray: ...
@@ -135,9 +126,6 @@ class DynamicsProtocol(Protocol):
 
     @property
     def goal(self) -> np.ndarray: ...
-
-    @property
-    def goal_pose(self) -> Any: ...
 
     def reset(self, initial_state: np.ndarray) -> np.ndarray: ...
 

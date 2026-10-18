@@ -98,7 +98,6 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
             ("ompl_speed", -1.0),
             ("ompl_replan_distance", 0.0),
             ("ompl_timeout", 0.0),
-            ("ompl_ik_solutions", 0),
         ):
             with self.subTest(key=key):
                 with self.assertRaises(ConfigurationError):
@@ -169,16 +168,6 @@ class ExpertConfigValidationTests(unittest.TestCase):
         raw_config["R_weight"] = 0.3
         self.assertEqual(validate_system_config(raw_config=raw_config)["R_diag"], [0.3] * 7)
 
-    def test_floor_clearance_is_numeric_and_not_negative(self) -> None:
-        raw_config = _load_raw_config()
-        del raw_config["floor_clearance"]
-        self.assertEqual(validate_system_config(raw_config=raw_config)["floor_clearance"], 0.05)
-
-        for invalid in (-0.01, "low"):
-            raw_config["floor_clearance"] = invalid
-            with self.assertRaises(ConfigurationError):
-                validate_system_config(raw_config=raw_config)
-
     def test_joint_limits_are_broadcast_from_a_scalar_and_their_list_length_is_checked(self) -> None:
         for key in ("max_acceleration", "max_jerk"):
             with self.subTest(key=key):
@@ -195,7 +184,7 @@ class ExpertConfigValidationTests(unittest.TestCase):
                     validate_system_config(raw_config=raw_config)
 
     def test_tolerances_must_be_positive(self) -> None:
-        for key in ("pos_tol", "rot_tol", "vel_tol"):
+        for key in ("pos_tol", "vel_tol"):
             with self.subTest(key=key):
                 raw_config = _load_raw_config()
                 raw_config[key] = 0.0
@@ -204,8 +193,8 @@ class ExpertConfigValidationTests(unittest.TestCase):
 
     def test_tolerance_overrides_merge_like_the_dagger_trainer_applies_them(self) -> None:
         validated = load_and_validate_system_config(CONFIG_PATH)
-        merged = validate_system_config({**validated, "pos_tol": 0.05, "rot_tol": 0.5, "vel_tol": 0.2})
-        self.assertEqual((merged["pos_tol"], merged["rot_tol"], merged["vel_tol"]), (0.05, 0.5, 0.2))
+        merged = validate_system_config({**validated, "pos_tol": 0.05, "vel_tol": 0.2})
+        self.assertEqual((merged["pos_tol"], merged["vel_tol"]), (0.05, 0.2))
 
     def test_workspace_bounds_are_three_ordered_finite_pairs(self) -> None:
         bad_bounds = (
@@ -223,15 +212,15 @@ class ExpertConfigValidationTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=raw_config)
 
-    def test_goal_is_a_twelve_vector_and_controls_the_randomize_goal_default(self) -> None:
+    def test_goal_is_a_seven_vector_and_controls_the_randomize_goal_default(self) -> None:
         raw_config = _load_raw_config()
         self.assertTrue(validate_system_config(raw_config=raw_config)["randomize_goal"])
         self.assertNotIn("goal", validate_system_config(raw_config=raw_config))
 
-        raw_config["goal"] = [0.4, 0.0, 0.4] + [1, 0, 0, 0, -1, 0, 0, 0, -1]
+        raw_config["goal"] = [0.0] * 7
         validated = validate_system_config(raw_config=raw_config)
         self.assertFalse(validated["randomize_goal"])
-        self.assertEqual(len(validated["goal"]), 12)
+        self.assertEqual(len(validated["goal"]), 7)
 
         raw_config["goal"] = [0.4, 0.0, 0.4]
         with self.assertRaises(ConfigurationError):

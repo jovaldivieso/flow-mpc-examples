@@ -18,7 +18,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import load_and_validate_system_config
 from dynamics.franka_dynamics import FrankaDynamics
-from learning.config_loaders import FlowConfig
+from learning.config_loaders import FlowConfig, UnetConfig
 from learning.dagger.dagger_trainer import MIN_LEARNING_RATE, WEIGHT_DECAY, _validate_resumable_dataset_schema
 from learning.dagger.metrics import DaggerEvalMetrics
 from learning.models.flow_policy import FlowPolicy
@@ -45,11 +45,7 @@ def _minimal_dagger_config(**overrides: object) -> DaggerConfig:
         trajectories_per_iteration=[10],
         steps_per_trajectory=50,
         action_noise_std=0.0,
-        expert_mix_beta_start=0.8,
-        expert_mix_beta_end=0.0,
-        expert_mix_beta_decay_rate=None,
-        expert_mix_decay_after_eval_success=None,
-        adaptive_beta_recovery=False,
+        expert_beta_per_iteration=[0.8],
         target_epochs_per_round=[10.0],
         eval_episodes=0,
         eval_steps=None,
@@ -57,7 +53,7 @@ def _minimal_dagger_config(**overrides: object) -> DaggerConfig:
         eval_action_noise_std=0.0,
         batch_size=64,
         learning_rate=1e-3,
-        hidden_dims=(16, 16),
+        unet=UnetConfig(dim=8, dim_mults=(1, 2)),
         prediction_horizon=6,
         policy_type="flow",
         flow_config=FlowConfig(),
@@ -84,6 +80,20 @@ class DaggerConfigRoundSeedsTests(unittest.TestCase):
         self.assertFalse(cfg.restart_round_seed)
 
 
+class DaggerConfigExpertBetaPerIterationTests(unittest.TestCase):
+    def test_single_or_matching_length_beta_list_is_accepted(self) -> None:
+        cfg_single = _minimal_dagger_config(dagger_iterations=3, expert_beta_per_iteration=[0.9])
+        self.assertEqual(cfg_single.expert_beta_per_iteration, [0.9])
+        cfg_multi = _minimal_dagger_config(dagger_iterations=3, expert_beta_per_iteration=[0.9, 0.6, 0.3])
+        self.assertEqual(cfg_multi.expert_beta_per_iteration, [0.9, 0.6, 0.3])
+
+    def test_mismatched_length_or_out_of_range_beta_is_rejected(self) -> None:
+        for bad_betas in ([], [0.9, 0.6], [-0.1], [1.1], [0.9, 1.2, 0.3]):
+            with self.subTest(bad_betas=bad_betas):
+                with self.assertRaises(ValueError):
+                    _minimal_dagger_config(dagger_iterations=3, expert_beta_per_iteration=bad_betas)
+
+
 class DaggerConfigEvalToleranceOverridesTests(unittest.TestCase):
     def test_defaults_to_none_and_is_independent_of_tolerance_overrides(self) -> None:
         cfg = _minimal_dagger_config(tolerance_overrides={"pos_tol": 0.1})
@@ -93,10 +103,10 @@ class DaggerConfigEvalToleranceOverridesTests(unittest.TestCase):
     def test_can_differ_from_tolerance_overrides(self) -> None:
         cfg = _minimal_dagger_config(
             tolerance_overrides={"pos_tol": 0.1},
-            eval_tolerance_overrides={"pos_tol": 0.2, "rot_tol": 1.1},
+            eval_tolerance_overrides={"pos_tol": 0.2, "vel_tol": 0.05},
         )
         self.assertEqual(cfg.tolerance_overrides, {"pos_tol": 0.1})
-        self.assertEqual(cfg.eval_tolerance_overrides, {"pos_tol": 0.2, "rot_tol": 1.1})
+        self.assertEqual(cfg.eval_tolerance_overrides, {"pos_tol": 0.2, "vel_tol": 0.05})
 
     def test_non_positive_values_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -107,21 +117,25 @@ class DaggerConfigEvalToleranceOverridesTests(unittest.TestCase):
 
 class DaggerTrainerSchedulesRoundSeedsTests(unittest.TestCase):
     def test_length_one_round_seeds_broadcasts_to_every_round(self) -> None:
-        _, _, _, round_seeds = DaggerTrainer.schedules(
+        _, _, betas, _, round_seeds = DaggerTrainer.schedules(
             trajectories=[10],
             epochs=[10.0],
+            betas=[0.8],
             rounds=3,
             round_seeds=[5],
         )
+        self.assertEqual(betas, [0.8, 0.8, 0.8])
         self.assertEqual(round_seeds, [5, 5, 5])
 
     def test_exact_length_round_seeds_is_preserved(self) -> None:
-        _, _, _, round_seeds = DaggerTrainer.schedules(
+        _, _, betas, _, round_seeds = DaggerTrainer.schedules(
             trajectories=[10],
             epochs=[10.0],
+            betas=[0.9, 0.6, 0.3],
             rounds=3,
             round_seeds=[0, 0, 1],
         )
+        self.assertEqual(betas, [0.9, 0.6, 0.3])
         self.assertEqual(round_seeds, [0, 0, 1])
 
     def test_mismatched_round_seeds_length_raises(self) -> None:
@@ -129,14 +143,16 @@ class DaggerTrainerSchedulesRoundSeedsTests(unittest.TestCase):
             DaggerTrainer.schedules(
                 trajectories=[10],
                 epochs=[10.0],
+                betas=[0.8],
                 rounds=3,
                 round_seeds=[0, 1],
             )
 
     def test_omitted_round_seeds_stays_none(self) -> None:
-        _, _, _, round_seeds = DaggerTrainer.schedules(
+        _, _, _, _, round_seeds = DaggerTrainer.schedules(
             trajectories=[10],
             epochs=[10.0],
+            betas=[0.8],
             rounds=3,
         )
         self.assertIsNone(round_seeds)
@@ -272,14 +288,13 @@ class DaggerTrainerRuntimeConfigOverridesTests(unittest.TestCase):
     def test_workspace_bounds_and_tolerances_are_injected(self) -> None:
         bounds = [[0.3, 0.7], [-0.4, 0.4], [0.2, 0.7]]
         trainer = DaggerTrainer(
-            _minimal_dagger_config(workspace_bounds=bounds, tolerance_overrides={"pos_tol": 0.01, "rot_tol": 0.1})
+            _minimal_dagger_config(workspace_bounds=bounds, tolerance_overrides={"pos_tol": 0.01})
         )
 
         config = trainer._apply_runtime_config_overrides(copy.deepcopy(self.expert_config))
 
         self.assertEqual(config["workspace_bounds"], bounds)
         self.assertEqual(config["pos_tol"], 0.01)
-        self.assertEqual(config["rot_tol"], 0.1)
         # Not overridden: stays whatever the expert config says.
         self.assertEqual(config["vel_tol"], self.expert_config["vel_tol"])
 
@@ -340,7 +355,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
     rebuilds a policy from (it loads it with weights_only=True).
     """
 
-    HIDDEN_DIMS = (16, 16)
+    UNET = UnetConfig(dim=8, dim_mults=(1, 2))
     PREDICTION_HORIZON = 6
     NUM_INFERENCE_STEPS = 2
 
@@ -360,7 +375,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 experiment_config=self._expert_config(),
                 dataset_root=tmpdir / "dataset",
                 checkpoint_dir=tmpdir / "checkpoints",
-                hidden_dims=self.HIDDEN_DIMS,
+                unet=self.UNET,
                 prediction_horizon=self.PREDICTION_HORIZON,
                 policy_type=policy_type,
                 flow_config=FlowConfig(num_inference_steps=self.NUM_INFERENCE_STEPS),
@@ -379,12 +394,12 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         trainer = self._setup_trainer("flow")
 
         self.assertIsInstance(trainer.simulator, FrankaDynamics)
-        self.assertEqual((trainer.state_dim, trainer.action_dim), (12 + 21, 7))
+        self.assertEqual((trainer.state_dim, trainer.action_dim), (7 + 21, 7))
         self.assertEqual(trainer.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(trainer.obs_feature_names, ["observation.environment_state", "observation.state"])
         self.assertIsInstance(trainer.policy, FlowPolicy)
         velocity_net = trainer.policy.velocity_net
-        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (33, 7))
+        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (28, 7))
         self.assertEqual(velocity_net.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(velocity_net.num_inference_steps, self.NUM_INFERENCE_STEPS)
         # The chunk is jerks, scaled by their limits
@@ -396,7 +411,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         self.assertIsInstance(trainer.optimizer, torch.optim.AdamW)
         self.assertEqual(trainer.optimizer.defaults["weight_decay"], WEIGHT_DECAY)
         batch = (
-            {"observation.environment_state": torch.zeros(2, 12), "observation.state": torch.zeros(2, 21)},
+            {"observation.environment_state": torch.zeros(2, 7), "observation.state": torch.zeros(2, 21)},
             torch.zeros(2, self.PREDICTION_HORIZON, 7),
         )
         base = trainer.cfg.learning_rate
@@ -406,6 +421,23 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 trainer.train_policy_steps([batch], 4)
             # half a cosine period (4 of 8 steps) leaves half the rate above the floor
             self.assertAlmostEqual(trainer.optimizer.param_groups[0]["lr"], (base + MIN_LEARNING_RATE) / 2, delta=1e-9)
+
+    def test_rollouts_use_a_cpu_copy_of_the_policy_that_holds_the_averaged_weights(self) -> None:
+        for policy_type in ("flow", "safeflow"):
+            with self.subTest(policy_type=policy_type):
+                trainer = self._setup_trainer(policy_type)
+                self.assertIsNot(trainer.rollout_policy, trainer.policy)
+                with torch.no_grad():
+                    for parameter in trainer.policy.parameters():
+                        parameter.add_(1.0)  # the training weights move on, the averaged ones do not
+                trainer.ema.shadow = {name: tensor + 0.5 for name, tensor in trainer.ema.shadow.items()}
+
+                trainer._sync_rollout_policy()
+
+                expected = trainer.ema.state_dict()
+                for name, value in trainer.rollout_policy.state_dict().items():
+                    self.assertEqual(value.device.type, "cpu")
+                    torch.testing.assert_close(value, expected[name].cpu())
 
     def test_setup_builds_the_safeflow_projector_on_a_goal_zeroed_copy_of_the_simulator(self) -> None:
         trainer = self._setup_trainer("safeflow")
@@ -430,14 +462,14 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     set(checkpoint),
                     {
                         "iteration", "model_state_dict", "ema_model_state_dict", "optimizer_state_dict",
-                        "state_dim", "action_dim", "prediction_horizon", "hidden_dims", "obs_feature_names",
+                        "state_dim", "action_dim", "prediction_horizon", "unet", "obs_feature_names",
                         "policy_type", "flow_config",
                     },
                 )
                 self.assertEqual(checkpoint["iteration"], 2)
-                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (33, 7))
+                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (28, 7))
                 self.assertEqual(checkpoint["prediction_horizon"], self.PREDICTION_HORIZON)
-                self.assertEqual(checkpoint["hidden_dims"], list(self.HIDDEN_DIMS))
+                self.assertEqual(checkpoint["unet"], {"dim": self.UNET.dim, "dim_mults": list(self.UNET.dim_mults)})
                 self.assertEqual(checkpoint["obs_feature_names"], ["observation.environment_state", "observation.state"])
                 self.assertEqual(checkpoint["policy_type"], policy_type)
                 self.assertEqual(
@@ -455,7 +487,8 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     "flow",
                     action_dim=checkpoint["action_dim"],
                     state_dim=checkpoint["state_dim"],
-                    hidden_dims=tuple(checkpoint["hidden_dims"]),
+                    unet_dim=checkpoint["unet"]["dim"],
+                    unet_dim_mults=tuple(checkpoint["unet"]["dim_mults"]),
                     prediction_horizon=checkpoint["prediction_horizon"],
                     num_inference_steps=checkpoint["flow_config"]["num_inference_steps"],
                     action_scale=checkpoint["flow_config"]["action_scale"],

@@ -8,11 +8,9 @@ from typing import Any, Mapping
 import yaml
 
 from dynamics.franka_dynamics import (
-    FRANKA_DEFAULT_FLOOR_CLEARANCE,
     FRANKA_DEFAULT_MAX_ACCELERATION,
     FRANKA_DEFAULT_MAX_JERK,
     FRANKA_DEFAULT_WORKSPACE_BOUNDS,
-    FRANKA_GOAL_DIM,
     FRANKA_NUM_JOINTS,
 )
 from planning.factory import DynamicsFactory, PlannerFactory
@@ -40,8 +38,7 @@ class PlannerConfig:
 
 @dataclass(frozen=True)
 class OmplConfig:
-    """Global path planning of the expert ``ompl_casadi``: an OMPL RRT-Connect path clear of the floor to an
-    inverse-kinematics solution of the goal pose (the goal configuration of the MPC).
+    """Global path planning of the expert ``ompl_casadi``: an OMPL RRT-Connect path to the goal configuration.
 
     The field names are the YAML keys (and the keys of the validated config).
     """
@@ -52,10 +49,9 @@ class OmplConfig:
     ompl_replan_distance: float = 0.5
     ompl_timeout: float = 5.0  # [s] per RRT-Connect solve
     ompl_seed: int = 0
-    ompl_ik_solutions: int = 12  # inverse-kinematics solutions of the goal pose RRT-Connect plans to
 
     def __post_init__(self) -> None:
-        positive = ("ompl_speed", "ompl_replan_distance", "ompl_timeout", "ompl_ik_solutions")
+        positive = ("ompl_speed", "ompl_replan_distance", "ompl_timeout")
         for name in positive:
             if getattr(self, name) <= 0:
                 raise ConfigurationError(f"'{name}' must be positive.")
@@ -74,7 +70,7 @@ class OmplConfig:
 
 @dataclass(frozen=True)
 class WorkspaceSamplingConfig:
-    """Cartesian TCP box [[x_min, x_max], [y_min, y_max], [z_min, z_max]] both random goals and random start poses are drawn from."""
+    """Cartesian TCP box [[x_min, x_max], [y_min, y_max], [z_min, z_max]]."""
 
     bounds: tuple[tuple[float, float], ...] = FRANKA_DEFAULT_WORKSPACE_BOUNDS
     seed: int | None = None
@@ -86,9 +82,7 @@ class FrankaSystemConfig:
     randomize_goal: bool = True
     max_acceleration: tuple[float, ...] = FRANKA_DEFAULT_MAX_ACCELERATION
     max_jerk: tuple[float, ...] = FRANKA_DEFAULT_MAX_JERK
-    floor_clearance: float = FRANKA_DEFAULT_FLOOR_CLEARANCE
     min_start_goal_distance: float = 0.25
-    rot_tol: float = 2e-2
     workspace_sampling: WorkspaceSamplingConfig = WorkspaceSamplingConfig()
 
 
@@ -256,7 +250,7 @@ COMMON_KEYS = OmplConfig.keys() | {
     "workspace_bounds",
 }
 SYSTEM_KEYS = {
-    "franka": {"floor_clearance", "rot_tol"},
+    "franka": set(),
     "triple_integrator": {"dimension", "position_limit", "max_velocity"},
 }
 
@@ -326,26 +320,18 @@ def _tolerances(raw_config: Mapping[str, Any], pos_tol: float, vel_tol: float) -
 
 
 def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
-    """The fields of the arm: limits, collision, tolerances, sampling and goal."""
-    rot_tol = _float(raw_config, "rot_tol", 2e-2)
-    if rot_tol <= 0:
-        raise ConfigurationError("'rot_tol' must be positive.")
-    floor_clearance = _float(raw_config, "floor_clearance", FRANKA_DEFAULT_FLOOR_CLEARANCE)
-    if floor_clearance < 0:
-        raise ConfigurationError("'floor_clearance' must be non-negative.")
+    """The fields of the arm: limits, tolerances, sampling and goal."""
     min_start_goal_distance = _float(raw_config, "min_start_goal_distance", 0.25)
     if min_start_goal_distance < 0:
         raise ConfigurationError("'min_start_goal_distance' must be non-negative.")
 
     workspace_sampling = _workspace_sampling(raw_config)
     system_cfg = FrankaSystemConfig(
-        goal=_vector(raw_config, "goal", FRANKA_GOAL_DIM, ()) if "goal" in raw_config else None,
+        goal=_vector(raw_config, "goal", FRANKA_NUM_JOINTS, ()) if "goal" in raw_config else None,
         randomize_goal=_bool(raw_config, "randomize_goal", "goal" not in raw_config),
         max_acceleration=_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS),
         max_jerk=_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS),
-        floor_clearance=floor_clearance,
         min_start_goal_distance=min_start_goal_distance,
-        rot_tol=rot_tol,
         workspace_sampling=workspace_sampling,
     )
     fields: dict[str, Any] = {
@@ -354,8 +340,6 @@ def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "min_start_goal_distance": system_cfg.min_start_goal_distance,
         "max_acceleration": list(system_cfg.max_acceleration),
         "max_jerk": list(system_cfg.max_jerk),
-        "floor_clearance": system_cfg.floor_clearance,
-        "rot_tol": system_cfg.rot_tol,
         **_tolerances(raw_config, 2e-3, 2e-2),
     }
     if system_cfg.goal is not None:

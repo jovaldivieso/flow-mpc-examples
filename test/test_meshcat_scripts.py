@@ -66,7 +66,7 @@ class DatasetViewerTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.simulator = FrankaDynamics(_config())
         cls.q = _rest_state(cls.simulator)[:N]
-        cls.goal = cls.simulator.pose_to_goal(cls.simulator.tcp_placement(cls.q + 0.1))
+        cls.goal = cls.q + 0.1
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
@@ -108,7 +108,7 @@ class DatasetViewerTests(unittest.TestCase):
         self.assertEqual(episode.positions.shape, (5, N))
         self.assertEqual(episode.actions.shape, (5, PLAN_HORIZON, N))
         self.assertEqual(episode.velocities.shape, (5, N))
-        self.assertEqual(episode.goal.shape, (12,))
+        self.assertEqual(episode.goal.shape, (7,))
         plans = plan_positions(self.simulator, episode)
         self.assertEqual(plans.shape, (5, PLAN_HORIZON + 1, N))
         np.testing.assert_allclose(plans[0, 0], episode.positions[0], atol=1e-6)  # row 0 is the frame's own q
@@ -154,11 +154,11 @@ class PolicyRolloutTests(unittest.TestCase):
         cls.config = _config()
         cls.simulator = FrankaDynamics(cls.config)
         cls.state = _rest_state(cls.simulator)
-        cls.simulator.set_goal(cls.simulator.pose_to_goal(cls.simulator.tcp_placement(cls.state[:N] + 0.3)))
+        cls.simulator.set_goal(cls.state[:N] + 0.3)
         torch.manual_seed(0)
         cls.policy = FlowPolicy(
             action_dim=N, state_dim=cls.simulator.obs_dim, prediction_horizon=CHUNK,
-            hidden_dims=(16, 16), num_inference_steps=2,
+            unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
         ).eval()
 
     def test_a_rollout_records_the_visited_states_and_the_chunk_planned_at_each(self) -> None:
@@ -187,7 +187,7 @@ class PolicyRolloutTests(unittest.TestCase):
 
     def test_a_rollout_that_starts_at_the_goal_is_reached_without_steps(self) -> None:
         simulator = FrankaDynamics(_config(done_hold_steps=1))  # one check at the goal and at rest is enough
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(self.state[:N])))
+        simulator.set_goal(self.state[:N])
 
         rollout = rollout_policy(simulator, self.policy, self.state, 5, torch.device("cpu"))
 
@@ -199,7 +199,7 @@ class LoadPolicyTests(unittest.TestCase):
         simulator = FrankaDynamics(_config())
         template = FlowPolicy(
             action_dim=N, state_dim=simulator.obs_dim, prediction_horizon=CHUNK,
-            hidden_dims=(16, 16), num_inference_steps=2,
+            unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
         )
         averaged = {name: torch.full_like(tensor, 0.25) for name, tensor in template.state_dict().items()}
         checkpoint = {
@@ -208,7 +208,7 @@ class LoadPolicyTests(unittest.TestCase):
             "state_dim": simulator.obs_dim,
             "action_dim": N,
             "prediction_horizon": CHUNK,
-            "hidden_dims": [16, 16],
+            "unet": {"dim": 8, "dim_mults": [1, 2]},
             "policy_type": "flow",
             "flow_config": {"num_inference_steps": 2, "action_scale": [1.0] * N},
         }

@@ -20,16 +20,13 @@ PINNED_EXPERT_SETTINGS = {
     "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
     "R_diag": [4.4e-3] * 7,
     "terminal_cost_multiplier": 10.0,
-    "floor_clearance": 0.05,
     "expert": "ompl_casadi",
     "horizon": 20,
     "ompl_speed": 2.0,
     "ompl_replan_distance": 0.5,
     "ompl_timeout": 5.0,
     "ompl_seed": 0,
-    "ompl_ik_solutions": 12,
     "pos_tol": 0.005,
-    "rot_tol": 0.05,
     "vel_tol": 0.05,
 }
 

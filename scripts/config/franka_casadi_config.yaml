@@ -1,49 +1,37 @@
 # Expert (CasADi MPC) config for the Franka FR3 arm (7 joints, the gripper is fixed geometry).
-# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = TCP pose.
+# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target configuration.
+system: franka
 dt: 0.1
 # The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
 # chunk length, at most this) of its planned jerks.
 horizon: 20
-# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0] (q_goal: the joint
-# configuration of the goal pose): Q_diag weights the squared position (first 7), velocity and acceleration (last 7)
-# error at every node, R_diag the squared jerk, terminal_cost_multiplier the terminal node's Q cost.
+# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0]: Q_diag weights the squared
+# position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
+# terminal_cost_multiplier the terminal node's Q cost.
 Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
          2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
          0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
 # 1 / max_jerk^2
 R_diag: [4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3]
 terminal_cost_multiplier: 10.0
-# Joint acceleration [rad/s^2] and jerk [rad/s^3] limits (SafeFlowMPC's; the description only has position and velocity
-# limits, which are narrowed to 3 degrees inside and 92 %)
+# Limits of the arm [rad/s^2, rad/s^3]; joint position and velocity limits come from the URDF
 max_acceleration: 5.0
 max_jerk: 15.0
 
-# Only the floor is checked, by the OMPL path planner and the simulator: the arm's joint frames and its TCP keep
-# floor_clearance [m] from the plane z = 0 the base stands on. Self-collision is not checked: start and goal
-# configurations are sampled well inside the joint limits.
-floor_clearance: 0.05
-
-# The expert planner (planning/factory.py):
-#   casadi       the CasADi MPC, heading for the joint configuration of the goal pose nearest to the start. It can come
-#                to rest short of the goal.
-#   ompl_casadi  the same MPC with the goal configuration and the first guess of an OMPL RRT-Connect path clear of the
-#                floor to an inverse-kinematics solution of the goal pose
-expert: ompl_casadi
+# The expert planner (planning/factory.py): casadi, or ompl_casadi (the MPC with an OMPL RRT-Connect path as goal and first guess)
+expert: casadi
 
 # Settings of the OMPL path (ompl_casadi)
-ompl_speed: 2.0                 # rad/s the path is traversed at in joint space (its timing as the initial guess)
-ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner drove the arm away): plan a new path (ompl_casadi)
+ompl_speed: 0.5                 # rad/s the path is traversed at (its timing as the initial guess)
+ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner drove the arm away): plan a new path
 ompl_timeout: 5.0               # s per RRT-Connect solve
 ompl_seed: 0
-ompl_ik_solutions: 12           # inverse-kinematics solutions of the goal pose RRT-Connect plans to
 
-# Success: TCP within pos_tol [m] / rot_tol [rad] of the goal pose and the arm at rest (vel_tol [rad/s])
-pos_tol: 0.1
-rot_tol: 0.3
+# Success: within pos_tol [rad] of the goal and at rest (vel_tol [rad/s])
+pos_tol: 0.02
 vel_tol: 0.01
 
-# Random start/goal poses: TCP position box [[x], [y], [z]] in the robot base frame, minimum start-goal distance
-workspace_bounds: [[-1.0, 1.0], [-1.0, 1.0], [0.1, 0.8]]
+# Random start/goal configurations: minimum start-goal distance [rad]
 min_start_goal_distance: 0.5
 
 initial_state_seed: 0

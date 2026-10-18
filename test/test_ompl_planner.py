@@ -54,11 +54,11 @@ class OmplPlannerTests(unittest.TestCase):
 
         self.assertGreater(len(slow), len(self.path))
 
-    def test_the_path_runs_from_the_start_to_a_configuration_that_reaches_the_goal_pose(self) -> None:
+    def test_the_path_runs_from_the_start_to_the_goal_configuration(self) -> None:
         np.testing.assert_array_equal(self.path[0], self.start[:N])
         self.assertLess(max(self.simulator.goal_errors(self.path[-1])), 1e-4)
 
-    def test_every_waypoint_is_inside_the_joint_limits_and_clear_of_the_floor(self) -> None:
+    def test_every_waypoint_is_inside_the_joint_limits_and_collision_free(self) -> None:
         lower = self.simulator.state_lower_bounds[:N]
         upper = self.simulator.state_upper_bounds[:N]
         self.assertTrue(np.all(self.path >= lower - 1e-9) and np.all(self.path <= upper + 1e-9))
@@ -88,14 +88,12 @@ class OmplPlannerTests(unittest.TestCase):
         self.planner.reset()
 
     def test_a_start_in_collision_raises(self) -> None:
-        start = IN_COLLISION.copy()
-        self.assertTrue(self.simulator.is_collision(start))
-        with self.assertRaises(PlannerSolveError):
-            self.planner.plan(_observation(start, self.simulator.goal))
+        with mock.patch.object(self.simulator, "is_collision", return_value=True):
+            with self.assertRaises(PlannerSolveError):
+                self.planner.plan(self.observation)
 
-    def test_a_goal_pose_out_of_reach_raises(self) -> None:
-        goal = self.simulator.goal.copy()
-        goal[:3] = [5.0, 5.0, 5.0]
+    def test_a_goal_out_of_bounds_raises(self) -> None:
+        goal = self.simulator.state_upper_bounds[:N] + 1.0
         with self.assertRaises(PlannerSolveError):
             self.planner.plan(_observation(self.start[:N], goal))
 

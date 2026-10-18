@@ -7,18 +7,18 @@ model:
 
   # The policy predicts a chunk of prediction_horizon jerks per state (DAgger labels it with the expert's plan)
   prediction_horizon: 10
-  hidden_dims: [256, 256, 256]  # widths of the hidden layers
+  unet:
+    dim: 32                     # base channel count (a multiple of 8)
+    dim_mults: [1, 2]           # channel multipliers of the levels; every level but the first halves the horizon
 
 # Optional DAgger defaults. Explicit command-line arguments override these values.
 training:
   dagger_iterations: 4        # one round at beta 1: the expert's rollouts only, like SafeFlowMPC's pretraining
-  trajectories_per_iteration: [500, 500, 500, 500]
+  trajectories_per_iteration: [1000, 1000, 1000, 1000]
   steps_per_trajectory: 100
   target_epochs_per_round: [50, 50, 50, 50]
   action_noise_std: 0.0         # m/s^3, Gaussian noise on the executed jerk
-  expert_mix_beta_start: 0.8
-  expert_mix_beta_decay_rate: 0.2
-  expert_mix_decay_after_eval_success: 0.5
+  expert_beta_per_iteration: [0.9, 0.75, 0.6, 0.45]
   eval_episodes: 100
   tolerance_overrides:
     pos_tol: 0.05

@@ -178,7 +178,7 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         observation = self._first_observation()
         self.planner.plan(observation)
 
-        self.simulator.set_goal(self.simulator.pose_to_goal(self.simulator.tcp_placement(self.start[:N] + 0.2)))
+        self.simulator.set_goal(self.start[:N] + 0.2)
         self.planner.plan(self.simulator.observe(self.start))
 
         self.assertEqual(self.planner.path_plans, 2)

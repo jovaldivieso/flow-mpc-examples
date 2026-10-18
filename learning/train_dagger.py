@@ -21,7 +21,7 @@ from learning.config_loaders import (
     default_checkpoint_dir,
     default_dataset_root, default_repo_id,
     load_dagger_training_config,
-    load_flow_config, load_mlp_hidden_dims, load_prediction_horizon,
+    load_flow_config, load_prediction_horizon, load_unet_config,
     load_policy_type,
 )
 from learning.dagger import DaggerConfig, DaggerTrainer
@@ -64,6 +64,7 @@ def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
         "trajectories_per_iteration": args.trajectories_per_iteration,
         "steps_per_trajectory": args.steps_per_trajectory,
         "action_noise_std": args.action_noise_std,
+        "expert_beta_per_iteration": args.expert_beta_per_iteration,
         "training_curriculum": args.training_curriculum,
         "round_seeds": args.round_seeds,
         "restart_round_seed": args.restart_round_seed,
@@ -85,10 +86,7 @@ def _summarize_dagger_config(cfg: Any) -> dict[str, Any]:
         "trajectories_per_iteration": cfg.trajectories_per_iteration,
         "steps_per_trajectory": cfg.steps_per_trajectory,
         "action_noise_std": cfg.action_noise_std,
-        "expert_mix_beta_start": cfg.expert_mix_beta_start,
-        "expert_mix_beta_end": cfg.expert_mix_beta_end,
-        "expert_mix_beta_decay_rate": cfg.expert_mix_beta_decay_rate,
-        "adaptive_beta_recovery": cfg.adaptive_beta_recovery,
+        "expert_beta_per_iteration": cfg.expert_beta_per_iteration,
         "training_curriculum": cfg.training_curriculum,
         "initial_states_count": len(cfg.initial_states) if cfg.initial_states is not None else 0,
         "goal_states_count": len(cfg.goal_states) if cfg.goal_states is not None else 0,
@@ -179,8 +177,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "per-experiment override for the expert config's convergence tolerances, as a Python-literal "
-            "dict of the tolerance keys pos_tol, rot_tol and vel_tol, e.g. "
-            "'{\"pos_tol\": 0.01, \"rot_tol\": 0.1, \"vel_tol\": 0.05}'."
+            "dict of the tolerance keys pos_tol and vel_tol, e.g. "
+            "'{\"pos_tol\": 0.01, \"vel_tol\": 0.05}'."
         ),
     )
     p.add_argument(
@@ -194,11 +192,7 @@ def parse_args() -> argparse.Namespace:
             "without changing what collection/training demonstrates against."
         ),
     )
-    p.add_argument("--expert-mix-beta-start", type=float)
-    p.add_argument("--expert-mix-beta-end", type=float)
-    p.add_argument("--expert-mix-beta-decay-rate", type=float)
-    p.add_argument("--expert-mix-decay-after-eval-success", type=float)
-    p.add_argument("--adaptive-beta-recovery", action=argparse.BooleanOptionalAction)
+    p.add_argument("--expert-beta-per-iteration", nargs="+", type=float)
     p.add_argument("--target-epochs-per-round", nargs="+", type=float)
     p.add_argument("--eval-episodes", type=int)
     p.add_argument("--eval-steps", type=int)
@@ -257,6 +251,9 @@ def main() -> None:
     target_epochs_per_round = [
         float(value) for value in option("target_epochs_per_round", [30.0])
     ]
+    expert_beta_per_iteration = [
+        float(value) for value in option("expert_beta_per_iteration", [0.8])
+    ]
     initial_states_config = option("initial_states", None)
     initial_states = (
         parse_initial_states_argument(initial_states_config)
@@ -296,7 +293,7 @@ def main() -> None:
         except (SyntaxError, ValueError) as exc:
             raise ValueError(
                 "Unable to parse --tolerance-overrides. Use Python-literal dict syntax like "
-                "'{\"pos_tol\": 0.01, \"rot_tol\": 0.1}'."
+                "'{\"pos_tol\": 0.01, \"vel_tol\": 0.05}'."
             ) from exc
         if not isinstance(tolerance_overrides, dict):
             raise ValueError("--tolerance-overrides must evaluate to a dict.")
@@ -309,7 +306,7 @@ def main() -> None:
         except (SyntaxError, ValueError) as exc:
             raise ValueError(
                 "Unable to parse --eval-tolerance-overrides. Use Python-literal dict syntax like "
-                "'{\"pos_tol\": 0.02, \"rot_tol\": 0.2}'."
+                "'{\"pos_tol\": 0.02, \"vel_tol\": 0.05}'."
             ) from exc
         if not isinstance(eval_tolerance_overrides, dict):
             raise ValueError("--eval-tolerance-overrides must evaluate to a dict.")
@@ -329,9 +326,10 @@ def main() -> None:
         if fresh
         else Path(args.dataset_root)
     )
-    trajectories, epochs, training_curriculum, round_seeds = DaggerTrainer.schedules(
+    trajectories, epochs, betas, training_curriculum, round_seeds = DaggerTrainer.schedules(
         trajectories_per_iteration,
         target_epochs_per_round,
+        expert_beta_per_iteration,
         dagger_iterations,
         training_curriculum_config,
         round_seeds_config,
@@ -370,11 +368,7 @@ def main() -> None:
         workspace_bounds=workspace_bounds,
         tolerance_overrides=tolerance_overrides,
         eval_tolerance_overrides=eval_tolerance_overrides,
-        expert_mix_beta_start=float(option("expert_mix_beta_start", 0.8)),
-        expert_mix_beta_end=float(option("expert_mix_beta_end", 0.0)),
-        expert_mix_beta_decay_rate=option("expert_mix_beta_decay_rate", None),
-        expert_mix_decay_after_eval_success=option("expert_mix_decay_after_eval_success", None),
-        adaptive_beta_recovery=bool(option("adaptive_beta_recovery", False)),
+        expert_beta_per_iteration=betas,
         target_epochs_per_round=epochs,
         eval_episodes=int(option("eval_episodes", 10)),
         eval_steps=option("eval_steps", None),
@@ -382,7 +376,7 @@ def main() -> None:
         eval_action_noise_std=float(option("eval_action_noise_std", 0.0)),
         batch_size=int(option("batch_size", 1024)),
         learning_rate=float(option("learning_rate", 1e-4)),
-        hidden_dims=load_mlp_hidden_dims(args.policy_config),
+        unet=load_unet_config(args.policy_config),
         prediction_horizon=load_prediction_horizon(args.policy_config),
         policy_type=load_policy_type(args.policy_config),
         flow_config=load_flow_config(args.policy_config),

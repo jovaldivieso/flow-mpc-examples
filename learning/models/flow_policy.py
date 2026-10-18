@@ -22,7 +22,8 @@ class FlowPolicy(ActionPolicy):
         action_dim: int,
         state_dim: int,
         prediction_horizon: int = 16,
-        hidden_dims: tuple[int, ...] = (256, 256, 256),
+        unet_dim: int = 32,
+        unet_dim_mults: tuple[int, ...] = (1, 2, 4, 8),
         num_inference_steps: int = 10,
         action_scale: Sequence[float] | torch.Tensor | None = None,
     ):
@@ -32,7 +33,8 @@ class FlowPolicy(ActionPolicy):
             action_dim=action_dim,
             obs_cond_dim=int(state_dim),
             prediction_horizon=prediction_horizon,
-            hidden_dims=hidden_dims,
+            unet_dim=unet_dim,
+            unet_dim_mults=unet_dim_mults,
             num_inference_steps=num_inference_steps,
             action_scale=action_scale,
         )

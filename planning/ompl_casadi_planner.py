@@ -13,10 +13,8 @@ from planning.planner import Plan, PlannerSolveError
 class OmplCasadiPlanner(CasadiPlanner):
     """The CasADi MPC with the goal configuration and the first guess of a global planner (OMPL RRT-Connect).
 
-    The MPC alone heads straight for the joint configuration of the goal pose and can come to rest short of it. Here
-    the global planner finds a path clear of the floor to an inverse-kinematics solution of the goal pose
-    (``OmplPlanner``): the end of that path is the goal configuration of the MPC (instead of the
-    solution nearest to the current configuration), and the path is where the first solve starts from. Later solves
+    Here the global planner finds a collision-free path to the goal configuration (``OmplPlanner``): the end of that
+    path is the goal configuration of the MPC, and the path is where the first solve starts from. Later solves
     start from the previous solution as they do without a path, unless the arm is further than
     ``ompl_replan_distance`` (rad) from it (the learner drove it away): then a new path is planned from where the arm
     is. If no path can be found the MPC runs as it does alone (counted in ``path_failures``) until the arm has moved

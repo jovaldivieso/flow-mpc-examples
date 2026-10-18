@@ -7,8 +7,7 @@ Observation o = [g, x]; the LeRobot frame stores g as ``observation.environment_
 
 The same plant as the arm's joints (``constant_jerk_step`` and ``saturated_step``): every axis is a triple integrator
 with piecewise constant jerk, limited in velocity, acceleration and jerk, with a box on the position. There is no
-collision. The task space is the position itself, so the arm-style hook the planner calls (inverse kinematics) is
-the identity here.
+collision.
 """
 
 from typing import Any, Mapping
@@ -81,25 +80,9 @@ class TripleIntegrator(DynamicsSimulator):
             self.goal_errors(state_array)[0] < self.pos_tol and np.abs(state_array[self.n : 2 * self.n]).max() < self.vel_tol
         )
 
-    # --- the task space is the position: the planner's goal configuration is the goal itself ----------------
-
-    @staticmethod
-    def goal_to_pose(goal: np.ndarray) -> np.ndarray:
-        return np.asarray(goal, dtype=float)
-
-    @property
-    def goal_pose(self) -> np.ndarray:
-        return self.goal_to_pose(self.goal)
-
-    def inverse_kinematics(self, pose: np.ndarray, q_init: np.ndarray, iters: int = 500) -> np.ndarray:
-        return self.goal_to_pose(pose).copy()
-
     def tcp_position(self, q: np.ndarray) -> np.ndarray:
         """The 3-D position the viewers draw for the position ``q``: padded with zeros (or cut) to three axes."""
         return np.pad(np.asarray(q, dtype=float)[:3], (0, max(0, 3 - self.n)))
-
-    def nearest_inverse_kinematics(self, pose: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
-        return np.asarray(pose, dtype=float)
 
     # --- dataset and sampling --------------------------------------------------
 

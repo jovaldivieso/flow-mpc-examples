@@ -1,11 +1,11 @@
 """Check the CasADi MPC expert before running DAgger: random start/goal rollouts, statistics, Meshcat playback.
 
     venv/bin/python -m scripts.meshcat_expert --num-traj 10
-    venv/bin/python -m scripts.meshcat_expert --seeds "[0, 3, 7]" --tolerance-overrides '{"pos_tol": 0.01, "rot_tol": 0.1, "vel_tol": 0.05}'
+    venv/bin/python -m scripts.meshcat_expert --seeds "[0, 3, 7]" --tolerance-overrides '{"pos_tol": 0.01, "vel_tol": 0.05}'
 
 Every rollout samples its start and goal from the expert config exactly like the DAgger collection and the evaluation do
-(seeded), runs the expert for --num-steps and prints per trajectory: reached the goal, final TCP error, minimum
-floor clearance, and how smooth the commanded jerks are and how much the arm detours (joint and TCP path length relative to the straight line). Then all TCP paths are drawn (green = reached the goal,
+(seeded), runs the expert for --num-steps and prints per trajectory: reached the goal, final error,
+and how smooth the commanded jerks are and how much the arm detours (joint and TCP path length relative to the straight line). Then all TCP paths are drawn (green = reached the goal,
 orange = did not) and the trajectories are played back with the moving arm. --no-viewer prints the statistics only.
 """
 
@@ -67,7 +67,6 @@ def summarize(dyn: FrankaDynamics, rollout: dict) -> dict:
         "steps": len(actions),
         "position_error": position_error,
         "rotation_error": rotation_error,
-        "min_clearance": min(dyn.clearance(s) for s in states),
         "max_joint_speed": float(np.abs(states[:, dyn.n : 2 * dyn.n]).max()),
         "ms_per_step": 1000.0 * float(np.mean(rollout["solve_times"])) if rollout["solve_times"] else 0.0,
     }
@@ -92,7 +91,7 @@ def main() -> None:
     parser.add_argument("--num-traj", type=int, default=10, help="number of random rollouts, seeds 0..N-1 (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default=None, help="explicit seeds instead of 0..N-1, e.g. '[0, 3, 7]'")
     parser.add_argument("--num-steps", type=int, default=250, help="maximum steps per rollout (default: %(default)s)")
-    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / rot_tol / vel_tol overriding the config's")
+    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
     parser.add_argument("--action-noise-std", type=float, default=0.0, help="execution noise on the expert's action [rad/s^3], like DAgger collection (default: %(default)s)")
     parser.add_argument("--no-viewer", action="store_true", help="print the statistics only")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
@@ -105,7 +104,7 @@ def main() -> None:
     dyn = FrankaDynamics(config)
     planner = PlannerFactory.create(config["expert"], dyn, config)
     noise_seed = default_action_noise_seed_for_config(config)
-    print(f"expert: horizon={config['horizon']} dt={config['dt']} | tolerances pos={config['pos_tol']} rot={config['rot_tol']} vel={config['vel_tol']} | floor_clearance={config['floor_clearance']}")
+    print(f"expert: horizon={config['horizon']} dt={config['dt']} | tolerances pos={config['pos_tol']} vel={config['vel_tol']}")
 
     baseline_goal = dyn.goal.copy()
     results = []
@@ -116,8 +115,8 @@ def main() -> None:
         stats = summarize(dyn, rollout)
         results.append((seed, dyn.goal.copy(), rollout, stats))
         print(
-            f"[{number}/{len(seeds)}] seed {seed:3d}: {rollout['outcome']:10s} steps {stats['steps']:3d} | final TCP error {1000 * stats['position_error']:6.1f} mm, {stats['rotation_error']:.3f} rad"
-            f" | min clearance {1000 * stats['min_clearance']:6.1f} mm | max |v| {stats['max_joint_speed']:.2f} rad/s"
+            f"[{number}/{len(seeds)}] seed {seed:3d}: {rollout['outcome']:10s} steps {stats['steps']:3d} | final error {stats['position_error']:.4f} rad"
+            f" | max |v| {stats['max_joint_speed']:.2f} rad/s"
             f" | at jerk limit {100 * stats['at_jerk_limit']:4.1f}% | jerkiness {stats['jerkiness']:.3f}"
             f" | joint path {stats['joint_path']:.1f} rad (x{stats['joint_ratio']:.1f} straight) | TCP path x{stats['tcp_ratio']:.1f} straight | {stats['ms_per_step']:.0f} ms/step",
             flush=True,
@@ -129,7 +128,7 @@ def main() -> None:
         count = sum(r[2]["outcome"].startswith(kind) for r in results)
         if count:
             print(f"  {kind}: {count}")
-    print(f"  mean steps {np.mean([r[3]['steps'] for r in results]):.0f}, min clearance over all rollouts {1000 * min(r[3]['min_clearance'] for r in results):.1f} mm, "
+    print(f"  mean steps {np.mean([r[3]['steps'] for r in results]):.0f}, "
           f"mean jerkiness {np.mean([r[3]['jerkiness'] for r in results]):.3f}, mean at-limit fraction {100 * np.mean([r[3]['at_jerk_limit'] for r in results]):.1f}%,"
           f" mean joint path x{np.mean([r[3]['joint_ratio'] for r in results]):.1f} / TCP path x{np.mean([r[3]['tcp_ratio'] for r in results]):.1f} the straight line")
     if args.no_viewer:
@@ -140,14 +139,14 @@ def main() -> None:
     viz.initViewer(open=True)
     viz.loadViewerModel()
     tcp_paths = [np.array([dyn.tcp_placement(s[: dyn.n]).translation for s in r[2]["states"]]) for r in results]
-    draw_tcp_paths(viz, tcp_paths, [r[1][:3] for r in results], reached)
+    draw_tcp_paths(viz, tcp_paths, [dyn.tcp_position(r[1]) for r in results], reached)
     viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
     print("\nPlaying the rollouts in a loop (Ctrl+C to stop): green path = reached the goal, orange = did not")
     try:
         while True:
             for (seed, goal, rollout, stats), path in zip(results, tcp_paths):
                 print(f"seed {seed}: {rollout['outcome']}")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(goal[:3]))
+                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(goal)))
                 for state in rollout["states"]:
                     viz.display(state[: dyn.n])
                     time.sleep(dyn.dt / args.speed)

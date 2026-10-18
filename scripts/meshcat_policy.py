@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_casadi_config.yaml"), help="expert yaml config (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default="[10000]", help="seeds of the starts and goals, e.g. '[10000, 10001]' (default: %(default)s)")
     parser.add_argument("--num-steps", type=int, default=125, help="maximum steps per rollout (default: %(default)s)")
-    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / rot_tol / vel_tol overriding the config's")
+    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
     parser.add_argument("--show-expert", action="store_true", help="also plan with the expert from every visited state and draw its plan")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu", help="device of the policy (default: %(default)s)")
     parser.add_argument("--no-viewer", action="store_true", help="print the outcomes only")
@@ -128,8 +128,8 @@ def main() -> None:
         position_error, rotation_error = dyn.goal_errors(rollout.states[-1])
         print(
             f"seed {seed}: {rollout.outcome}{' (' + rollout.detail + ')' if rollout.detail else ''} after {len(rollout.chunks)} steps | "
-            f"final TCP error {1000 * position_error:.0f} mm, {rotation_error:.3f} rad | "
-            f"largest planned excursion of the policy {max([np.abs(np.diff(dyn.rollout_positions(s, c), axis=0)).sum(axis=0).max() for s, c in zip(rollout.states, rollout.chunks)], default=0.0):.2f} rad"
+            f"final error {position_error:.4f} | "
+            f"largest planned excursion of the policy {max([np.abs(np.diff(dyn.rollout_positions(s, c), axis=0)).sum(axis=0).max() for s, c in zip(rollout.states, rollout.chunks)], default=0.0):.2f}"
         )
         rollouts.append((seed, goal, rollout))
     if args.no_viewer:
@@ -153,7 +153,7 @@ def main() -> None:
         while True:
             for seed, goal, rollout in rollouts:
                 print(f"seed {seed}: {rollout.outcome} after {len(rollout.chunks)} steps")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(np.pad(goal[:3], (0, max(0, 3 - len(goal[:3]))))))
+                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(goal)))
                 for index, state in enumerate(rollout.states):
                     show(state)
                     if index < len(rollout.chunks):

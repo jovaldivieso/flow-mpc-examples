@@ -25,9 +25,7 @@ PINNED_EXPERT_SETTINGS = {
     "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
     "R_diag": [4.4e-3] * 7,
     "terminal_cost_multiplier": 10.0,
-    "floor_clearance": 0.05,
     "pos_tol": 0.002,
-    "rot_tol": 0.02,
     "vel_tol": 0.02,
 }
 
@@ -140,16 +138,16 @@ class PlannerBehaviorTests(unittest.TestCase):
             expected = np.array(simulator.casadi_dynamics(X[:, k], U[:, k])).ravel()
             np.testing.assert_allclose(X[:, k + 1], expected, atol=1e-6)
 
-    def test_closed_loop_mpc_reaches_a_nearby_goal_pose_and_comes_to_rest(self) -> None:
-        simulator, planner, _ = _build(pos_tol=0.005, rot_tol=0.05, vel_tol=0.05)
-        simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(Q_READY)))
+    def test_closed_loop_mpc_reaches_a_nearby_goal_and_comes_to_rest(self) -> None:
+        simulator, planner, _ = _build(pos_tol=0.005, vel_tol=0.05)
+        simulator.set_goal(Q_READY)
 
         def first_action(observation: np.ndarray) -> np.ndarray:
             return planner.plan(observation).actions[0]
 
         trajectory = simulator.simulate(_start_near_the_ready_pose(simulator), first_action, num_steps=80)
 
-        self.assertTrue(simulator.is_done(trajectory["states"][-1]), "MPC did not reach the goal pose")
+        self.assertTrue(simulator.is_done(trajectory["states"][-1]), "MPC did not reach the goal")
         self.assertLess(len(trajectory["actions"]), 80, "episode should terminate early on the goal")
 
     def test_the_plan_starts_at_the_state_and_its_first_step_is_the_optimal_action(self) -> None:
@@ -230,39 +228,19 @@ class PlannerBehaviorTests(unittest.TestCase):
 
 
 class GoalConfigurationTests(unittest.TestCase):
-    """The goal of the MPC is the joint configuration of the goal pose: found once per goal, nearest to the start."""
+    """The goal of the MPC is the goal configuration in the observation."""
 
-    def test_the_goal_configuration_reaches_the_goal_pose_and_is_the_one_nearest_to_the_start(self) -> None:
+    def test_the_goal_configuration_matches_the_goal_in_the_observation(self) -> None:
         simulator, planner, _ = _build()
         start = simulator.reset(_start_near_the_ready_pose(simulator))
 
         planner.plan(simulator.observe(start))
 
-        self.assertLess(max(simulator.goal_errors(planner.goal_configuration)), 1e-5)
-        self.assertLess(np.linalg.norm(planner.goal_configuration - start[: simulator.n]), 1.0)
+        np.testing.assert_allclose(planner.goal_configuration, simulator.goal, atol=1e-9)
 
-    def test_it_is_found_once_per_goal(self) -> None:
-        simulator, planner, _ = _build()
-        state = simulator.reset(_start_near_the_ready_pose(simulator))
-
-        with mock.patch.object(simulator, "nearest_inverse_kinematics", wraps=simulator.nearest_inverse_kinematics) as ik:
-            planner.plan(simulator.observe(state))
-            planner.plan(simulator.observe(state))
-            self.assertEqual(ik.call_count, 1)
-
-            simulator.set_goal(simulator.pose_to_goal(simulator.tcp_placement(state[: simulator.n])))
-            planner.plan(simulator.observe(state))
-            self.assertEqual(ik.call_count, 2)
-
-    def test_a_goal_pose_out_of_reach_raises_a_planner_error(self) -> None:
-        simulator, planner, _ = _build()
-        state = simulator.reset(_start_near_the_ready_pose(simulator))
-        goal = simulator.goal.copy()
-        goal[:3] = [5.0, 5.0, 5.0]
-        simulator.set_goal(goal)
-
-        with self.assertRaises(PlannerSolveError):
-            planner.plan(simulator.observe(state))
+        simulator.set_goal(start[: simulator.n])
+        planner.plan(simulator.observe(start))
+        np.testing.assert_allclose(planner.goal_configuration, start[: simulator.n], atol=1e-9)
 
 
 class InitialPlanTests(unittest.TestCase):

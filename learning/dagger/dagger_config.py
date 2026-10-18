@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from learning.config_loaders import FlowConfig
+from learning.config_loaders import FlowConfig, UnetConfig
 
 
 @dataclass(frozen=True)
@@ -19,11 +19,7 @@ class DaggerConfig:
     trajectories_per_iteration: list[int]
     steps_per_trajectory: int
     action_noise_std: float
-    expert_mix_beta_start: float
-    expert_mix_beta_end: float
-    expert_mix_beta_decay_rate: float | None
-    expert_mix_decay_after_eval_success: float | None
-    adaptive_beta_recovery: bool
+    expert_beta_per_iteration: list[float]
     target_epochs_per_round: list[float]
     eval_episodes: int
     eval_steps: int | None
@@ -31,7 +27,7 @@ class DaggerConfig:
     eval_action_noise_std: float
     batch_size: int
     learning_rate: float
-    hidden_dims: tuple[int, ...]
+    unet: UnetConfig
     prediction_horizon: int
     policy_type: str
     flow_config: FlowConfig
@@ -67,18 +63,12 @@ class DaggerConfig:
             raise ValueError("'steps_per_trajectory' must be positive.")
         if self.action_noise_std < 0 or self.eval_action_noise_std < 0:
             raise ValueError("Action noise must be non-negative.")
-        if not 0 <= self.expert_mix_beta_start <= 1 or not 0 <= self.expert_mix_beta_end <= 1:
+        if len(self.expert_beta_per_iteration) not in {1, self.dagger_iterations}:
+            raise ValueError(
+                "'expert_beta_per_iteration' must contain one or one value per round."
+            )
+        if any(not 0.0 <= v <= 1.0 for v in self.expert_beta_per_iteration):
             raise ValueError("Expert beta values must be in [0, 1].")
-        if (
-            self.expert_mix_beta_decay_rate is not None
-            and self.expert_mix_beta_decay_rate < 0
-        ):
-            raise ValueError("Beta decay rate must be non-negative.")
-        if (
-            self.expert_mix_decay_after_eval_success is not None
-            and not 0 <= self.expert_mix_decay_after_eval_success <= 1
-        ):
-            raise ValueError("Beta gate must be in [0, 1].")
         if len(self.target_epochs_per_round) not in {1, self.dagger_iterations}:
             raise ValueError(
                 "'target_epochs_per_round' must contain one or one value per round."

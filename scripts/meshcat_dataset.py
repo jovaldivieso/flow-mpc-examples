@@ -109,7 +109,6 @@ def episode_summary(dyn: FrankaDynamics, episode: Episode) -> dict[str, float]:
         "frames": len(episode.positions),
         "final_position_error": position_error,
         "final_rotation_error": rotation_error,
-        "clearance": dyn.clearance(episode.positions[-1]),
         "at_rest_fraction": float(np.mean(np.abs(episode.velocities).max(axis=1) < AT_REST_SPEED)),
         "stay_label_fraction": float(np.mean(excursion < STAY_THRESHOLD)),
         "plan_excursion": float(excursion.max()),
@@ -121,8 +120,8 @@ def print_table(dyn: FrankaDynamics, episodes: list[Episode], cap: int) -> None:
         s = episode_summary(dyn, episode)
         note = "  <- ran into the step cap" if s["frames"] >= cap else ""
         print(
-            f"episode {episode.index:5d}: {s['frames']:3d} frames | final TCP error {1000 * s['final_position_error']:6.1f} mm, "
-            f"{s['final_rotation_error']:.3f} rad | final clearance {1000 * s['clearance']:5.1f} mm | at rest {s['at_rest_fraction']:4.0%} "
+            f"episode {episode.index:5d}: {s['frames']:3d} frames | final error {s['final_position_error']:.4f} rad"
+            f" | at rest {s['at_rest_fraction']:4.0%} "
             f"| 'stay' labels {s['stay_label_fraction']:4.0%} | largest plan excursion {s['plan_excursion']:.2f} rad{note}"
         )
 
@@ -130,11 +129,11 @@ def print_table(dyn: FrankaDynamics, episodes: list[Episode], cap: int) -> None:
 def show_overview(viz, dyn: FrankaDynamics, episodes: list[Episode], success_tol: float) -> None:
     """Draw the TCP path of every episode at once."""
     paths = [np.array([dyn.tcp_placement(q).translation for q in episode.positions]) for episode in episodes]
-    goals = [episode.goal[:3] for episode in episodes]
-    reached = [bool(np.linalg.norm(path[-1] - goal) < success_tol) for path, goal in zip(paths, goals)]
+    goals = [dyn.tcp_position(episode.goal) for episode in episodes]
+    reached = [bool(np.linalg.norm(episode.positions[-1] - episode.goal) < success_tol) for episode in episodes]
     draw_tcp_paths(viz, paths, goals, reached)
     print(
-        f"Drawn {len(episodes)} episodes: {sum(reached)} ended within {success_tol} m of the goal (green), "
+        f"Drawn {len(episodes)} episodes: {sum(reached)} ended within {success_tol} rad of the goal (green), "
         f"{len(episodes) - sum(reached)} did not (orange); blue = starts, red = goals"
     )
 
@@ -157,7 +156,7 @@ def main() -> None:
     parser.add_argument("--no-viewer", action="store_true", help="print the per-episode table only")
     parser.add_argument("--overview", action="store_true", help="additionally draw the TCP paths of all episodes at once")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
-    parser.add_argument("--success-tol", type=float, default=0.01, help="goal distance [m] for a green path in --overview (default: %(default)s)")
+    parser.add_argument("--success-tol", type=float, default=0.02, help="goal distance [rad] for a green path in --overview (default: %(default)s)")
     args = parser.parse_args()
 
     dyn = FrankaDynamics(load_and_validate_system_config(args.config))
@@ -185,7 +184,7 @@ def main() -> None:
         while True:
             for number, episode in enumerate(episodes, 1):
                 print(f"episode {episode.index} ({number}/{len(episodes)}): {len(episode.positions)} frames")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(episode.goal[:3]))
+                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(episode.goal)))
                 start = dyn.tcp_placement(episode.positions[0]).translation
                 viz.viewer["start"].set_transform(tf.translation_matrix(start))
                 for q, plan in zip(episode.positions, plan_positions(dyn, episode)):
