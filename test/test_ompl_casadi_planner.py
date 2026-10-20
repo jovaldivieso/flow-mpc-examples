@@ -26,17 +26,15 @@ def _step_along(simulator: FrankaDynamics, planner: Planner, state: np.ndarray) 
     return simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
 
 
-def _closed_loop(simulator: FrankaDynamics, planner: Planner, start: np.ndarray, steps: int) -> tuple[bool, bool]:
-    """(reached the goal, collided) of the planner in closed loop on the plant."""
+def _closed_loop(simulator: FrankaDynamics, planner: Planner, start: np.ndarray, steps: int) -> bool:
+    """Whether the planner in closed loop on the plant reaches the goal."""
     state = simulator.reset(start)
     planner.reset()
     for _ in range(steps):
         state = _step_along(simulator, planner, state)
-        if simulator.is_collision(state):
-            return False, True
         if simulator.should_terminate_rollout(state):
-            return True, False
-    return False, False
+            return True
+    return False
 
 
 class OmplCasadiPlannerTests(unittest.TestCase):
@@ -67,10 +65,9 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         self.assertIsInstance(self.planner, CasadiPlanner)
 
     def test_it_reaches_the_goal_pose_and_comes_to_rest(self) -> None:
-        reached, collided = _closed_loop(self.simulator, self.planner, self.start, 80)
+        reached = _closed_loop(self.simulator, self.planner, self.start, 80)
 
         self.assertTrue(reached)
-        self.assertFalse(collided)
         self.assertEqual((self.planner.path_plans, self.planner.path_failures), (1, 0))
 
     def test_the_goal_configuration_is_the_end_of_the_path_and_the_first_solve_starts_from_the_path(self) -> None:

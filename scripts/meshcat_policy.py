@@ -23,11 +23,12 @@ import numpy as np
 import torch
 from pinocchio.visualize import MeshcatVisualizer
 
+from dynamics.dynamics_factory import DynamicsFactory
 from dynamics.franka_dynamics import FrankaDynamics
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
-from planning.factory import DynamicsFactory, PlannerFactory
 from planning.planner import Planner, PlannerSolveError
+from planning.planner_factory import PlannerFactory
 
 from .evaluate_policy import load_policy
 from .meshcat_utils import action_tcp_points, draw_plan
@@ -78,9 +79,6 @@ def rollout_policy(
         chunks.append(chunk)
         state = dyn.step(state, chunk[0])
         states.append(state.copy())
-        if dyn.is_collision(state):
-            outcome = "collision"
-            break
         if dyn.should_terminate_rollout(state):
             outcome = "reached"
             break

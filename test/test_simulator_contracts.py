@@ -16,11 +16,12 @@ sys.path.insert(0, PROJECT_ROOT)
 import torch
 
 from planning.config import ConfigurationError, load_and_validate_system_config, validate_system_config
-from dynamics.dynamics import DynamicsProtocol, VectorValidationError
+from dynamics.dynamics import DynamicsSimulator
+from dynamics.dynamics_factory import DynamicsFactory
 from dynamics.franka_dynamics import Q_READY, FrankaDynamics
 from dynamics.triple_integrator import TripleIntegrator
 from learning.models.policy import PolicyFactory
-from planning.factory import DynamicsFactory, PlannerFactory
+from planning.planner_factory import PlannerFactory
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 CHUNK = 16  # actions per state the policy predicts
@@ -53,8 +54,9 @@ class SimulatorContractTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.simulator = _build_simulator()
 
-    def test_satisfies_the_dynamics_protocol(self) -> None:
-        self.assertIsInstance(self.simulator, DynamicsProtocol)
+    def test_satisfies_the_dynamics_hierarchy(self) -> None:
+        self.assertIsInstance(self.simulator, DynamicsSimulator)
+        self.assertIsInstance(self.simulator, TripleIntegrator)
 
     def test_dimensions_and_rest_state_indices(self) -> None:
         simulator = self.simulator
@@ -119,17 +121,6 @@ class SimulatorContractTests(unittest.TestCase):
         np.testing.assert_array_equal(observation[: simulator.goal_dim], simulator.goal)
         np.testing.assert_array_equal(observation[simulator.goal_dim :], state)
         np.testing.assert_array_equal(simulator.invert_obs(observation), state)
-
-    def test_validation_rejects_wrong_dimensions(self) -> None:
-        simulator = self.simulator
-        with self.assertRaises(VectorValidationError):
-            simulator.validate_state(np.zeros(simulator.nx + 1))
-        with self.assertRaises(VectorValidationError):
-            simulator.validate_action(np.zeros((simulator.nu, 1)))
-        with self.assertRaises(VectorValidationError):
-            simulator.validate_observation(np.zeros(simulator.nx))
-        with self.assertRaises(VectorValidationError):
-            simulator.predict_next_state(np.zeros(simulator.nx - 1), np.zeros(simulator.nu))
 
     def test_set_goal_rejects_a_wrong_shape_and_copies_its_input(self) -> None:
         simulator = _build_simulator()
@@ -317,7 +308,6 @@ class SamplingTests(unittest.TestCase):
             np.testing.assert_array_equal(state[simulator.n :], 0.0)
             self.assertTrue(np.all(state >= simulator.state_lower_bounds - 1e-12))
             self.assertTrue(np.all(state <= simulator.state_upper_bounds + 1e-12))
-            self.assertFalse(simulator.is_collision(state))
             distance = np.linalg.norm(state[: simulator.n] - simulator.goal)
             self.assertGreater(distance, simulator.min_start_goal_distance)
 
@@ -345,9 +335,9 @@ class TripleIntegratorTests(unittest.TestCase):
         cls.config = _point_mass_config()
         cls.simulator = DynamicsFactory.create(cls.config["system"], cls.config)
 
-    def test_the_factory_builds_it_from_the_config_and_it_satisfies_the_protocol(self) -> None:
+    def test_the_factory_builds_it_from_the_config_and_it_satisfies_the_base_class(self) -> None:
         self.assertIsInstance(self.simulator, TripleIntegrator)
-        self.assertIsInstance(self.simulator, DynamicsProtocol)
+        self.assertIsInstance(self.simulator, DynamicsSimulator)
         self.assertEqual(
             (self.simulator.nx, self.simulator.nu, self.simulator.obs_dim, self.simulator.goal_dim), (6, 2, 8, 2)
         )

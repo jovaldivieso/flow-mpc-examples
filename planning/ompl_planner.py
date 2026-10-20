@@ -7,23 +7,23 @@ from ompl import base as ob
 from ompl import geometric as og
 from ompl import util as ou
 
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 from planning.planner import Plan, Planner, PlannerSolveError
 
 ou.setLogLevel(ou.LogLevel.LOG_ERROR)
 
-# Fraction of the largest joint range between two collision checks along a motion
+# Fraction of the largest joint range between two validity checks along a motion
 VALIDITY_RESOLUTION = 0.01
 # Points the simplified path is first resampled to (evenly spaced in joint space), before it is timed
 SIMPLIFIED_PATH_POINTS = 200
 
 
 class OmplPlanner(Planner):
-    """Global joint-space planner: a collision-free path from a configuration to the goal configuration (OMPL RRT-Connect).
+    """Global joint-space planner: a path from a configuration to the goal configuration (OMPL RRT-Connect).
 
-    A configuration is valid if the simulator reports no collision (``sim.is_collision``) and it is within the joint
-    limits. The path is shortcut and smoothed with OMPL's path simplifier and traversed at the constant joint-space
-    speed ``ompl_speed`` (rad/s), one configuration per control period.
+    A configuration is valid if it is within the joint limits. The path is shortcut and smoothed with OMPL's path
+    simplifier and traversed at the constant joint-space speed ``ompl_speed`` (rad/s), one configuration per control
+    period.
 
     OMPL's random generator is process-wide and accepts its seed only before it is first used, so ``ompl_seed`` is
     applied once, when the first planner of the process is built.
@@ -31,7 +31,7 @@ class OmplPlanner(Planner):
 
     _rng_is_seeded = False
 
-    def __init__(self, simulator: DynamicsProtocol, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]) -> None:
         self.sim = simulator
         self.n_joints = simulator.n
         self.timeout = float(config["ompl_timeout"])
@@ -47,16 +47,16 @@ class OmplPlanner(Planner):
 
     def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
         """A path, timed at ``ompl_speed``, from the configuration in ``observation`` (the first row) to its goal
-        configuration. ``initial_plan`` is ignored. Raises ``PlannerSolveError`` when the start or goal is invalid or
-        when no exact path is found within ``ompl_timeout`` seconds."""
+        configuration. ``initial_plan`` is ignored. Raises ``PlannerSolveError`` when the start or goal is out of
+        bounds or when no exact path is found within ``ompl_timeout`` seconds."""
         q_start = np.asarray(self.sim.invert_obs(observation), dtype=float)[: self.n_joints]
-        if self.sim.is_collision(q_start):
-            raise PlannerSolveError("OMPL: the start configuration is in collision.")
         lower = self.sim.state_lower_bounds[: self.n_joints]
         upper = self.sim.state_upper_bounds[: self.n_joints]
+        if np.any(q_start < lower) or np.any(q_start > upper):
+            raise PlannerSolveError("OMPL: the start configuration is out of bounds.")
         q_goal = np.asarray(observation[: self.sim.goal_dim], dtype=float)
-        if np.any(q_goal < lower) or np.any(q_goal > upper) or self.sim.is_collision(q_goal):
-            raise PlannerSolveError("OMPL: the goal configuration is out of bounds or in collision.")
+        if np.any(q_goal < lower) or np.any(q_goal > upper):
+            raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
         path = self._connect(q_start, [q_goal], lower, upper)
         path[0] = q_start
         return Plan(positions=self._timed(path))
@@ -84,9 +84,7 @@ class OmplPlanner(Planner):
             bounds.setHigh(joint, float(upper[joint]))
         space.setBounds(bounds)
         space_information = ob.SpaceInformation(space)
-        space_information.setStateValidityChecker(
-            lambda state: not self.sim.is_collision(np.array([state[joint] for joint in range(self.n_joints)]))
-        )
+        space_information.setStateValidityChecker(lambda state: space_information.satisfiesBounds(state))
         space_information.setStateValidityCheckingResolution(VALIDITY_RESOLUTION)
         space_information.setup()
 

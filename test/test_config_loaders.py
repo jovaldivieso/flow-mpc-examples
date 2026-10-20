@@ -66,7 +66,7 @@ class LoadDaggerTrainingConfigTests(unittest.TestCase):
             "dagger_iterations", "trajectories_per_iteration",
             "steps_per_trajectory", "action_noise_std", "training_curriculum",
             "round_seeds", "restart_round_seed", "initial_states", "goal_states",
-            "workspace_bounds", "tolerance_overrides", "eval_tolerance_overrides",
+            "tolerance_overrides", "eval_tolerance_overrides",
             "expert_beta_per_iteration",
             "target_epochs_per_round", "eval_episodes", "eval_steps",
             "eval_seed_start", "eval_action_noise_std", "batch_size",

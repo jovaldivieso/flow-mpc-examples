@@ -14,12 +14,13 @@ from tqdm.auto import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 from planning.config import validate_system_config
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
+from dynamics.dynamics_factory import DynamicsFactory
 from dynamics.seed_utils import default_action_noise_seed_for_config
 from learning.data_utils import create_collate_fn
 from learning.models.ema import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy, PolicyFactory
-from planning.factory import DynamicsFactory, PlannerFactory
+from planning.planner_factory import PlannerFactory
 
 from .dagger_config import DaggerConfig
 from .metrics import DaggerEvalMetrics
@@ -74,7 +75,7 @@ class DaggerTrainer:
     def __init__(self, cfg: DaggerConfig) -> None:
         self.cfg = cfg
         self.device: torch.device | None = None
-        self.simulator: DynamicsProtocol | None = None
+        self.simulator: DynamicsSimulator | None = None
         self.seeded_config: Mapping[str, Any] | None = None
         self.policy: ActionPolicy | None = None
         self.rollout_policy: ActionPolicy | None = None
@@ -301,7 +302,7 @@ class DaggerTrainer:
     def _apply_runtime_config_overrides(
         self, config: dict[str, Any], *, tolerance_overrides: Mapping[str, float] | None = None
     ) -> dict[str, Any]:
-        """Inject the training config's solver/dynamics tuning knobs (sampling bounds, tolerances), if set.
+        """Inject the training config's solver/dynamics tuning knobs (tolerances), if set.
 
         tolerance_overrides defaults to self.cfg.tolerance_overrides (the
         collection/training value) when not given -- evaluate_current_policy
@@ -309,15 +310,10 @@ class DaggerTrainer:
         use a more relaxed pass/fail standard without touching what
         collection/training actually demonstrates against.
         """
-        overrides: dict[str, Any] = {}
-        if self.cfg.workspace_bounds is not None:
-            overrides["workspace_bounds"] = list(self.cfg.workspace_bounds)
         effective_tolerance_overrides = (
             tolerance_overrides if tolerance_overrides is not None else self.cfg.tolerance_overrides
         )
-        if effective_tolerance_overrides:
-            overrides.update(effective_tolerance_overrides)
-        merged_config = apply_config_overrides(config, overrides)
+        merged_config = apply_config_overrides(config, effective_tolerance_overrides or {})
         return validate_system_config(merged_config)
 
     def _sync_rollout_policy(self) -> None:
@@ -464,11 +460,6 @@ class DaggerTrainer:
                 },
             },
             "eval_failure_breakdown": {
-                "collision": (
-                    eval_metrics.collision_failures
-                    if eval_metrics is not None
-                    else 0
-                ),
                 "timeout": (
                     eval_metrics.timeout_failures
                     if eval_metrics is not None

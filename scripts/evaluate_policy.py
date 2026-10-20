@@ -24,13 +24,15 @@ from dynamics.seed_utils import (
     action_noise_seed_for_rollout,
     default_action_noise_seed_for_config,
 )
-from planning.factory import DynamicsFactory, PlannerFactory
-from planning.planner import PlannerSolveError
+from dynamics.dynamics import DynamicsSimulator
+from dynamics.dynamics_factory import DynamicsFactory
 from learning.config_loaders import UnetConfig
 from learning.dagger import apply_config_overrides, build_policy_action
+from learning.dagger.rollouts import apply_execution_noise
+from learning.dagger.utils import rng_for_seed_spec as _rng_for_seed_spec, sample_initial_state
 from learning.models.policy import ActionPolicy, PolicyFactory
 from planning.planner import Planner, PlannerSolveError
-from dynamics.dynamics import DynamicsProtocol
+from planning.planner_factory import PlannerFactory
 
 
 def is_observation_feature(feature_name: str) -> bool:
@@ -39,16 +41,11 @@ def is_observation_feature(feature_name: str) -> bool:
 
 def resolve_checkpoint_observation_dimensions(
     checkpoint: Mapping[str, Any],
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     requested_policy_type: str,
 ) -> tuple[int, int]:
     """Resolve and validate checkpoint dimensions against the evaluation simulator."""
     features = simulator.get_dataset_features(int(checkpoint.get("prediction_horizon", 1)))
-    runtime_state_dim = sum(
-        int(feature_info["shape"][0])
-        for feature_name, feature_info in features.items()
-        if is_observation_feature(feature_name)
-    )
 
     # 'flow' and 'safeflow' share the exact same underlying network (safeflow
     # only wraps it with a CasADi projection at inference time), so a checkpoint
@@ -64,10 +61,6 @@ def resolve_checkpoint_observation_dimensions(
                 f"'{requested_policy_type}'."
             )
 
-    # observation.environment_state (the goal TCP pose) and
-    # observation.state (proprioception) are both single-frame. Must match
-    # learning/dagger/dagger_trainer.py's identical split exactly, or a
-    # correctly-trained checkpoint gets rejected here.
     environment_state_dim = int(features["observation.environment_state"]["shape"][0])
     proprioception_dim = int(features["observation.state"]["shape"][0])
     expected_state_dim = environment_state_dim + proprioception_dim
@@ -130,25 +123,8 @@ def normalize_seed_specs(
     return [int(seed) for seed in seeds]
 
 
-def _rng_for_seed_spec(
-    seed_spec: int,
-) -> np.random.Generator:
-    return np.random.default_rng(seed_spec)
-
-
-def sample_initial_state(
-    simulator: DynamicsProtocol,
-    seed_spec: int,
-) -> np.ndarray:
-    rng = _rng_for_seed_spec(seed_spec)
-    simulator.randomize_goal_for_reset(rng)
-    return simulator.random_initial_state(rng)
-
-
 def get_inference_device():
-    """
-    returns the best available device for policy inference
-    """
+    """Return the best available device for policy inference."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -170,32 +146,8 @@ def _synchronize_device(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
-def apply_execution_noise(
-    simulator: DynamicsProtocol,
-    action: np.ndarray,
-    action_noise_std: float,
-    rng: np.random.Generator | None = None,
-) -> np.ndarray:
-    if action_noise_std <= 0.0:
-        return action
-
-    if rng is None:
-        rng = np.random.default_rng()
-
-    noise = rng.normal(
-        loc=0.0,
-        scale=action_noise_std,
-        size=action.shape,
-    ).astype(action.dtype, copy=False)
-    return np.clip(
-        action + noise,
-        -simulator.max_action,
-        simulator.max_action,
-    )
-
-
 def rollout_planner(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     planner: Planner,
     initial_state: np.ndarray,
     num_steps: int,
@@ -217,9 +169,6 @@ def rollout_planner(
     trajectory = [state.copy()]
     solve_times: list[float] = []
 
-    if simulator.is_collision(state):
-        print(f"Expert rollout starts in collision (rollout={rollout_id}).")
-        return np.asarray(trajectory), solve_times
     if simulator.should_terminate_rollout(state):
         return np.asarray(trajectory), solve_times
 
@@ -251,10 +200,6 @@ def rollout_planner(
         state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.is_collision(state):
-            print(f"Expert rollout collision (rollout={rollout_id}, step={len(trajectory) - 1}).")
-            break
-
         if simulator.should_terminate_rollout(state):
             break
 
@@ -262,14 +207,14 @@ def rollout_planner(
 
 
 def rollout_policy(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     policy: ActionPolicy,
     device: torch.device,
     initial_state: np.ndarray,
     num_steps: int,
     action_noise_std: float = 0.0,
     action_noise_rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, bool, int, bool, bool, list[float]]:
+) -> tuple[np.ndarray, bool, int, bool, list[float]]:
     """
     Rolls out the neural policy from a given initial state.
 
@@ -277,12 +222,10 @@ def rollout_policy(
         trajectory: array containing visited simulator states
         reached_goal: whether simulator reached goal state
         steps_taken: number of executed simulation steps
-        collided: whether the arm hit the floor during the rollout
         solve_failed: whether the policy's own forward pass raised
-            (e.g. a SafeFlow projector solve failure) instead of the
-            rollout ending in a collision or running out of steps --
-            distinct from both, so callers can report it as its own
-            failure mode instead of folding it into "timeout"
+            (e.g. a SafeFlow projector solve failure) instead of running
+            out of steps -- distinct from timeout so callers can report it
+            as its own failure mode
         solve_times: one wall-clock duration (seconds) per step, for the
             single call that produces the action
     """
@@ -290,12 +233,8 @@ def rollout_policy(
     trajectory = [state.copy()]
     policy.reset()
     solve_times: list[float] = []
-    collided = False
-    if simulator.is_collision(state):
-        print("Policy rollout starts in collision.")
-        return np.asarray(trajectory), False, 0, True, False, solve_times
     if simulator.should_terminate_rollout(state):
-        return np.asarray(trajectory), True, 0, False, False, solve_times
+        return np.asarray(trajectory), True, 0, False, solve_times
 
     for step in range(1, num_steps + 1):
         observation = simulator.observe(state)
@@ -310,15 +249,8 @@ def rollout_policy(
                 device=device,
             )
         except PlannerSolveError as exc:
-            # No expert running alongside a policy-only rollout to fall back
-            # to -- end the rollout rather than crashing the whole
-            # evaluation run over one solver hiccup with no safe trajectory
-            # yet to lean on. Reported as its own solve_failed outcome
-            # (never collided=True), so a caller doesn't misclassify a
-            # solver hiccup as either a collision or (via collided=False,
-            # reached_goal=False) a timeout.
             print(f"Policy rollout solve failed (step={step}): {exc}")
-            return np.asarray(trajectory), False, len(trajectory) - 1, False, True, solve_times
+            return np.asarray(trajectory), False, len(trajectory) - 1, True, solve_times
         _synchronize_device(device)
         solve_times.append(time.perf_counter() - solve_start)
 
@@ -332,20 +264,15 @@ def rollout_policy(
         state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.is_collision(state):
-            collided = True
-            print(f"Policy rollout collision (step={step}).")
-            break
-
         if simulator.should_terminate_rollout(state):
-            return np.asarray(trajectory), True, step, collided, False, solve_times
+            return np.asarray(trajectory), True, step, False, solve_times
 
-    return np.asarray(trajectory), False, len(trajectory) - 1, collided, False, solve_times
+    return np.asarray(trajectory), False, len(trajectory) - 1, False, solve_times
 
 
 def _load_checkpoint_policy_components(
     model_dir: str,
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     policy_type: str,
     device: torch.device,
 ) -> tuple[
@@ -398,7 +325,7 @@ def _load_checkpoint_policy_components(
 def load_policy(
     policy_type: str,
     model_dir: str,
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     planner_config: Mapping[str, Any],
     device: torch.device,
 ):
@@ -421,13 +348,6 @@ def load_policy(
         flow_config_raw = checkpoint.get("flow_config")
         if isinstance(flow_config_raw, Mapping):
             num_inference_steps = int(flow_config_raw.get("num_inference_steps", 10))
-            # Absent on a checkpoint saved before per-dimension action
-            # normalization existed -- FlowPolicy's own default (all-ones,
-            # a no-op) is exactly what such a checkpoint was actually
-            # trained against, so leaving the kwarg unset there (rather
-            # than substituting today's live simulator's max_action) is
-            # what keeps it loadable and correct, not a fallback that
-            # happens to be convenient.
             action_scale_raw = flow_config_raw.get("action_scale")
             if action_scale_raw is not None:
                 policy_kwargs["action_scale"] = list(action_scale_raw)
@@ -502,7 +422,7 @@ def run_evaluation(
         rollout_plan: list[tuple[Any, str, int, Any, int | None]] = []
         for rollout_idx in range(total_rollouts):
             if rollout_idx < len(initial_state_specs):
-                initial_state_spec: Any = simulator.validate_state(initial_state_specs[rollout_idx]).copy()
+                initial_state_spec: Any = np.asarray(initial_state_specs[rollout_idx], dtype=float).copy()
                 initial_state_source = "provided"
                 seed_value: Any = None
                 noise_seed_spec: int | None = None
@@ -547,11 +467,6 @@ def run_evaluation(
         if explicit_goal:
             simulator.set_goal(goal_state_specs[rollout_idx - 1])
         else:
-            # A prior rollout's explicit goal mutates the simulator; restore the
-            # config's baseline goal before any fallback sampling, since
-            # randomize_goal_for_reset() is a no-op under `randomize_goal: false`
-            # and would otherwise silently leak that leftover explicit goal into
-            # this rollout instead of the configured/default one.
             simulator.set_goal(baseline_goal)
 
         if initial_state_source == "seeded":
@@ -567,7 +482,7 @@ def run_evaluation(
                     if noise_seed_spec is not None
                     else np.random.default_rng(torch_seed)
                 )
-            initial_state = simulator.validate_state(rollout_spec).copy()
+            initial_state = np.asarray(rollout_spec, dtype=float).copy()
         else:
             if explicit_goal:
                 initial_state = simulator.reset_random_state_only().copy()
@@ -588,7 +503,6 @@ def run_evaluation(
         expert_action_noise_rng = np.random.default_rng(rollout_noise_seed)
         policy_action_noise_rng = np.random.default_rng(rollout_noise_seed)
 
-        # The goal TCP pose (what --goal-states/set_goal take)
         goal_state = simulator.goal.copy()
 
         expert_trajectory, expert_solve_times = rollout_planner(
@@ -603,7 +517,7 @@ def run_evaluation(
             action_noise_rng=expert_action_noise_rng,
         )
 
-        policy_trajectory, reached_goal, steps_taken, policy_collided, policy_solve_failed, policy_solve_times = rollout_policy(
+        policy_trajectory, reached_goal, steps_taken, policy_solve_failed, policy_solve_times = rollout_policy(
             simulator=simulator,
             policy=policy,
             device=device,
@@ -612,13 +526,10 @@ def run_evaluation(
             action_noise_std=action_noise_std,
             action_noise_rng=policy_action_noise_rng,
         )
-        expert_collided = simulator.is_collision(expert_trajectory[-1])
 
         expert_solve_time_mean = float(np.mean(expert_solve_times)) if expert_solve_times else None
         policy_solve_time_mean = float(np.mean(policy_solve_times)) if policy_solve_times else None
 
-        # TCP pose error of the final state to this rollout's goal pose
-        # (simulator.goal is still this rollout's goal here).
         policy_final_state = policy_trajectory[-1]
         expert_final_state = expert_trajectory[-1]
         policy_goal_position_error, policy_goal_rotation_error = simulator.goal_errors(policy_final_state)
@@ -634,9 +545,7 @@ def run_evaluation(
                 "goal_state": goal_state,
                 "initial_state": initial_state,
                 "policy_reached_goal": reached_goal,
-                "policy_collided": policy_collided,
                 "policy_solve_failed": policy_solve_failed,
-                "expert_collided": expert_collided,
                 "policy_steps": max(len(policy_trajectory) - 1, 0),
                 "expert_steps": max(len(expert_trajectory) - 1, 0),
                 "policy_goal_position_error": policy_goal_position_error,
@@ -645,11 +554,6 @@ def run_evaluation(
                 "expert_goal_rotation_error": expert_goal_rotation_error,
                 "expert_solve_time_mean_s": expert_solve_time_mean,
                 "policy_solve_time_mean_s": policy_solve_time_mean,
-                # Raw per-step samples, kept alongside the per-rollout means
-                # above so the aggregate below can be a true per-step mean
-                # (weighted by each rollout's own step count) rather than an
-                # unweighted mean of per-rollout means, which would let a
-                # 1-step rollout outvote a 200-step one.
                 "expert_solve_times": expert_solve_times,
                 "policy_solve_times": policy_solve_times,
             }
@@ -659,7 +563,7 @@ def run_evaluation(
     total_successes = sum(
         1
         for metric in per_seed_metrics
-        if metric["policy_reached_goal"] and not metric["policy_collided"]
+        if metric["policy_reached_goal"]
     )
     success_rate = (total_successes / total_runs) if total_runs > 0 else 0.0
     mean_policy_position_error = float(
@@ -682,10 +586,6 @@ def run_evaluation(
     ) if total_runs > 0 else 0.0
 
     def _pooled_mean_or_none(key: str) -> float | None:
-        # Pools every rollout's raw per-step samples into one list before
-        # averaging, so each executed step counts once -- an unweighted
-        # mean of per-rollout means would give a 1-step rollout the same
-        # weight as a 200-step one.
         pooled = [t for metric in per_seed_metrics for t in metric[key]]
         return float(np.mean(pooled)) if pooled else None
 
@@ -711,19 +611,6 @@ def run_evaluation(
     print(f"num_trajectories: {total_runs}")
     print(f"policy_successes: {total_successes}/{total_runs}")
     print(f"success_rate: {success_rate:.4f}")
-    policy_collision_rate = (
-        np.mean([metric["policy_collided"] for metric in per_seed_metrics])
-        if total_runs > 0 else 0.0
-    )
-    expert_collision_rate = (
-        np.mean([metric["expert_collided"] for metric in per_seed_metrics])
-        if total_runs > 0 else 0.0
-    )
-    # A run that neither reached the goal nor collided nor hit a solve
-    # failure ran out of steps -- tracked separately since "timed out while
-    # still avoiding", "collided outright", and "the policy's own forward
-    # pass raised" are different (and not equally bad) failure modes that
-    # success_rate alone can't distinguish.
     policy_solve_failure_rate = (
         np.mean([metric["policy_solve_failed"] for metric in per_seed_metrics])
         if total_runs > 0 else 0.0
@@ -732,22 +619,19 @@ def run_evaluation(
         np.mean(
             [
                 (not metric["policy_reached_goal"])
-                and (not metric["policy_collided"])
                 and (not metric["policy_solve_failed"])
                 for metric in per_seed_metrics
             ]
         )
         if total_runs > 0 else 0.0
     )
-    print(f"policy_collision_rate: {policy_collision_rate:.4f}")
     print(f"policy_timeout_rate: {policy_timeout_rate:.4f}")
     print(f"policy_solve_failure_rate: {policy_solve_failure_rate:.4f}")
-    print(f"expert_collision_rate: {expert_collision_rate:.4f}")
     print(f"mean_policy_steps: {mean_policy_steps:.3f}")
     print(f"mean_expert_steps: {mean_expert_steps:.3f}")
-    print(f"mean_policy_goal_position_error: {mean_policy_position_error:.6f} m")
+    print(f"mean_policy_goal_position_error: {mean_policy_position_error:.6f} rad")
     print(f"mean_policy_goal_rotation_error: {mean_policy_rotation_error:.6f} rad")
-    print(f"mean_expert_goal_position_error: {mean_expert_position_error:.6f} m")
+    print(f"mean_expert_goal_position_error: {mean_expert_position_error:.6f} rad")
     print(f"mean_expert_goal_rotation_error: {mean_expert_rotation_error:.6f} rad")
 
     def _fmt_solve_time(value: float | None) -> str:
@@ -788,10 +672,8 @@ def run_evaluation(
         "num_trajectories": total_runs,
         "policy_successes": total_successes,
         "success_rate": success_rate,
-        "policy_collision_rate": float(policy_collision_rate),
         "policy_timeout_rate": float(policy_timeout_rate),
         "policy_solve_failure_rate": float(policy_solve_failure_rate),
-        "expert_collision_rate": float(expert_collision_rate),
         "mean_policy_steps": mean_policy_steps,
         "mean_expert_steps": mean_expert_steps,
         "mean_policy_goal_position_error": mean_policy_position_error,

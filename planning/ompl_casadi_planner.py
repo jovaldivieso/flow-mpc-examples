@@ -4,7 +4,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 from planning.casadi_planner import CasadiPlanner
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, PlannerSolveError
@@ -13,7 +13,7 @@ from planning.planner import Plan, PlannerSolveError
 class OmplCasadiPlanner(CasadiPlanner):
     """The CasADi MPC with the goal configuration and the first guess of a global planner (OMPL RRT-Connect).
 
-    Here the global planner finds a collision-free path to the goal configuration (``OmplPlanner``): the end of that
+    Here the global planner finds a path to the goal configuration (``OmplPlanner``): the end of that
     path is the goal configuration of the MPC, and the path is where the first solve starts from. Later solves
     start from the previous solution as they do without a path, unless the arm is further than
     ``ompl_replan_distance`` (rad) from it (the learner drove it away): then a new path is planned from where the arm
@@ -22,7 +22,7 @@ class OmplCasadiPlanner(CasadiPlanner):
     plan instead (``trajectory_fallbacks``).
     """
 
-    def __init__(self, simulator: DynamicsProtocol, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]) -> None:
         super().__init__(simulator, config)
         self.path_planner = OmplPlanner(simulator, config)
         self.replan_distance = float(config["ompl_replan_distance"])

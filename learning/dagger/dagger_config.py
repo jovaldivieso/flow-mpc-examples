@@ -39,15 +39,13 @@ class DaggerConfig:
     training_curriculum: list[str] | None = None
     round_seeds: list[int] | None = None
     restart_round_seed: bool = False
-    workspace_bounds: list[list[float]] | None = None
     tolerance_overrides: dict[str, float] | None = None
     # Independent of tolerance_overrides: that one shapes what gets
     # demonstrated/trained on (tight tolerances during collection encourage
     # precise demonstrations), while this one only affects whether an eval
-    # rollout counts as a success -- eval cares about "close enough and
-    # collision-free", not exact final-pose matching, so it's reasonable for
-    # this to be more relaxed without touching training dynamics or
-    # demonstration length. Falls back to tolerance_overrides when unset.
+    # rollout counts as a success, so it's reasonable for this to be more
+    # relaxed without touching training dynamics or demonstration length.
+    # Falls back to tolerance_overrides when unset.
     eval_tolerance_overrides: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
@@ -96,13 +94,6 @@ class DaggerConfig:
                 "'round_seeds' must contain exactly one entry per DAgger round "
                 f"({self.dagger_iterations}), got {len(self.round_seeds)}."
             )
-        if self.workspace_bounds is not None:
-            if len(self.workspace_bounds) != 3 or any(
-                len(bounds) != 2 for bounds in self.workspace_bounds
-            ):
-                raise ValueError("'workspace_bounds' must contain exactly three [min, max] pairs.")
-            if any(bounds[1] <= bounds[0] for bounds in self.workspace_bounds):
-                raise ValueError("Each 'workspace_bounds' pair must have max exceeding min.")
         if self.tolerance_overrides is not None and any(
             value <= 0 for value in self.tolerance_overrides.values()
         ):

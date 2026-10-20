@@ -23,22 +23,14 @@ class DaggerEvalMetrics:
     config_num_episodes: int = 0
     random_successes: int = 0
     random_num_episodes: int = 0
-    # Why a failed episode failed -- collision (self-collision of the arm),
-    # timeout (ran out of steps without colliding or reaching tolerance), or
-    # solve_failure (the policy/projector itself raised, e.g. SafeFlowMPC's
-    # CasADi projector) -- see rollout_policy_with_action_fn. Distinguishing
-    # these matters: a policy that times out while actively avoiding is a
-    # different (and better) failure mode than one that collides outright,
-    # which a bare success_rate can't tell apart. Left at the defaults (0)
-    # by callers that don't populate this breakdown, e.g. collect_dagger_
-    # rollouts' own aggregation accounting (discarded episodes are a
-    # different concept, already instrumented separately).
-    collision_failures: int = 0
+    # Why a failed episode failed -- timeout (ran out of steps without reaching
+    # tolerance) or solve_failure (the policy/projector itself raised, e.g.
+    # SafeFlowMPC's CasADi projector) -- see rollout_policy_with_action_fn.
     timeout_failures: int = 0
     solve_failures: int = 0
     # Collection bookkeeping, only populated by collect_dagger_rollouts: how many episode attempts it took,
-    # how many were dropped (expert solve failure, unsafe expert label or collision), how many expert
-    # solves failed, and how many times the policy's own solve failed and the expert action was used instead.
+    # how many were dropped (expert solve failure), how many expert solves failed, and how many times the
+    # policy's own solve failed and the expert action was used instead.
     attempted_episodes: int = 0
     discarded_episodes: int = 0
     planner_failures: int = 0

@@ -58,12 +58,10 @@ class OmplPlannerTests(unittest.TestCase):
         np.testing.assert_array_equal(self.path[0], self.start[:N])
         self.assertLess(max(self.simulator.goal_errors(self.path[-1])), 1e-4)
 
-    def test_every_waypoint_is_inside_the_joint_limits_and_collision_free(self) -> None:
+    def test_every_waypoint_is_inside_the_joint_limits(self) -> None:
         lower = self.simulator.state_lower_bounds[:N]
         upper = self.simulator.state_upper_bounds[:N]
         self.assertTrue(np.all(self.path >= lower - 1e-9) and np.all(self.path <= upper + 1e-9))
-        for waypoint in self.path:
-            self.assertFalse(self.simulator.is_collision(waypoint))
 
     def test_the_ompl_seed_is_applied_once_per_process(self) -> None:
         # OMPL accepts its seed only before the generator is first used; a later call prints an error and does nothing
@@ -86,11 +84,6 @@ class OmplPlannerTests(unittest.TestCase):
 
     def test_reset_is_a_no_op(self) -> None:
         self.planner.reset()
-
-    def test_a_start_in_collision_raises(self) -> None:
-        with mock.patch.object(self.simulator, "is_collision", return_value=True):
-            with self.assertRaises(PlannerSolveError):
-                self.planner.plan(self.observation)
 
     def test_a_goal_out_of_bounds_raises(self) -> None:
         goal = self.simulator.state_upper_bounds[:N] + 1.0

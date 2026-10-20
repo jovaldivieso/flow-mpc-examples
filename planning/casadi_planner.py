@@ -3,7 +3,25 @@ import numpy as np
 from typing import Any, Mapping
 
 from .planner import Plan, Planner, PlannerSolveError
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
+
+# The same problem is re-solved at every step with slightly perturbed parameters, so the multipliers are warm
+# started too: with the warm_start_init_point option alone IPOPT still pushes the iterates away from the bounds
+# and restarts the barrier parameter high, so the push/frac options and a small mu_init are part of the recipe.
+# The mapped dynamics expand to SX, which makes every solve faster.
+IPOPT_OPTIONS: dict[str, Any] = {
+    "expand": True,
+    "ipopt.print_level": 0,
+    "print_time": 0,
+    "ipopt.sb": "yes",
+    "ipopt.warm_start_init_point": "yes",
+    "ipopt.warm_start_bound_push": 1e-9,
+    "ipopt.warm_start_bound_frac": 1e-9,
+    "ipopt.warm_start_slack_bound_push": 1e-9,
+    "ipopt.warm_start_slack_bound_frac": 1e-9,
+    "ipopt.warm_start_mult_bound_push": 1e-9,
+    "ipopt.mu_init": 1e-6,
+}
 
 
 class CasadiPlanner(Planner):
@@ -29,40 +47,26 @@ class CasadiPlanner(Planner):
                              -j_max <= u_k <= j_max             joint jerk limits
                              x_lower <= x_k <= x_upper, k >= 1  joint position, velocity and acceleration limits
 
-    Collisions are not part of the problem: the global planner (``OmplPlanner``) is the only one that checks them.
-
     A solve starts from ``initial_plan`` (a joint-position plan, e.g. a path from a global planner), else from the
     previous solution shifted by one step, else from the current state held still.
     """
 
     def _resolve_r_diag(self, config: Mapping[str, Any]) -> np.ndarray:
         raw_r_diag = config.get("R_diag")
-
         if raw_r_diag is not None:
-            if not isinstance(raw_r_diag, list):
-                raise ValueError("'R_diag' must be a list.")
-            if len(raw_r_diag) != self.sim.nu:
-                raise ValueError(
-                    f"'R_diag' length must equal simulator action dimension nu={self.sim.nu}, got {len(raw_r_diag)}."
-                )
-            diag_values = []
+            if not isinstance(raw_r_diag, list) or len(raw_r_diag) != self.sim.nu:
+                raise ValueError(f"'R_diag' must be a list of length nu={self.sim.nu}.")
             for idx, value in enumerate(raw_r_diag):
-                if not isinstance(value, (int, float)):
-                    raise ValueError(f"'R_diag[{idx}]' must be numeric.")
-                value_f = float(value)
-                if value_f <= 0:
-                    raise ValueError(f"'R_diag[{idx}]' must be positive.")
-                diag_values.append(value_f)
-            return np.asarray(diag_values, dtype=float)
+                if not isinstance(value, (int, float)) or float(value) <= 0:
+                    raise ValueError(f"'R_diag[{idx}]' must be a positive number.")
+            return np.asarray(raw_r_diag, dtype=float)
 
         r_weight = config.get("R_weight", 0.1)
-        if not isinstance(r_weight, (int, float)):
-            raise ValueError("'R_weight' must be numeric.")
-        if float(r_weight) <= 0:
-            raise ValueError("'R_weight' must be positive.")
-        return np.asarray([float(r_weight)] * self.sim.nu, dtype=float)
+        if not isinstance(r_weight, (int, float)) or float(r_weight) <= 0:
+            raise ValueError("'R_weight' must be a positive number.")
+        return np.full(self.sim.nu, float(r_weight), dtype=float)
 
-    def __init__(self, simulator: DynamicsProtocol, config: Mapping[str, Any]):
+    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]):
         self.sim = simulator
         self.N = config.get("horizon", 20)
         self.n_joints = simulator.n
@@ -121,27 +125,7 @@ class CasadiPlanner(Planner):
         )
         terminal = ca.mtimes(error[:, -1].T, ca.mtimes(self.Q * self.terminal_cost_multiplier, error[:, -1]))
         self.opti.minimize(running + terminal)
-
-        # The same problem is re-solved at every step with slightly perturbed parameters, so the multipliers are warm
-        # started too: with the warm_start_init_point option alone IPOPT still pushes the iterates away from the bounds
-        # and restarts the barrier parameter high, so the push/frac options and a small mu_init are part of the recipe.
-        # The mapped dynamics expand to SX, which makes every solve faster.
-        self.opti.solver(
-            "ipopt",
-            {
-                "expand": True,
-                "ipopt.print_level": 0,
-                "print_time": 0,
-                "ipopt.sb": "yes",
-                "ipopt.warm_start_init_point": "yes",
-                "ipopt.warm_start_bound_push": 1e-9,
-                "ipopt.warm_start_bound_frac": 1e-9,
-                "ipopt.warm_start_slack_bound_push": 1e-9,
-                "ipopt.warm_start_slack_bound_frac": 1e-9,
-                "ipopt.warm_start_mult_bound_push": 1e-9,
-                "ipopt.mu_init": 1e-6,
-            },
-        )
+        self.opti.solver("ipopt", IPOPT_OPTIONS)
 
     def reset(self) -> None:
         """Signals the start of a new episode."""

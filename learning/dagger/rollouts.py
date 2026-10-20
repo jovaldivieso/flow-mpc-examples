@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 from planning.planner import Planner, PlannerSolveError
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 from dynamics.seed_utils import (
     action_noise_rng_for_rollout,
     action_noise_seed_for_rollout,
@@ -22,7 +22,7 @@ from dynamics.initial_state_utils import normalize_goal_state_specs, normalize_i
 
 
 def build_policy_action(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     policy,
     observation: np.ndarray,
     device: torch.device,
@@ -49,7 +49,7 @@ def build_policy_action(
 
 
 def apply_execution_noise(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     action: np.ndarray,
     action_noise_std: float,
     rng: np.random.Generator | None = None,
@@ -63,7 +63,7 @@ def apply_execution_noise(
 
 
 def collect_dagger_rollouts(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     expert_planner: Planner,
     dataset_writer,
     trajectories_per_iteration: int,
@@ -84,8 +84,8 @@ def collect_dagger_rollouts(
     """Collect DAgger trajectories with expert relabeling and mixed execution.
 
     Every visited state is labeled with the expert's plan from that state (its next ``prediction_horizon`` planned
-    actions, the length of the policy's chunk), whoever executes the step. An episode whose expert planner fails to solve, whose expert label is unsafe or whose
-    execution collides is dropped as a whole and retried from a fresh initial state and goal.
+    actions, the length of the policy's chunk), whoever executes the step. An episode whose expert planner fails to
+    solve is dropped as a whole and retried from a fresh initial state and goal.
     """
     # Scoped to initial-state/goal sampling only: action-noise and expert-mixing
     # randomness always keep varying by round_index, regardless of this flag.
@@ -115,6 +115,15 @@ def collect_dagger_rollouts(
             frame["task"] = getattr(simulator, "task_description", "reach target")
         return frame
 
+    provided_initial_states = normalize_initial_state_specs(simulator, initial_states)
+    provided_goal_states = normalize_goal_state_specs(simulator, goal_states)
+    have_goal_states = bool(goal_states)
+    usable_count = (
+        min(len(provided_initial_states), len(provided_goal_states))
+        if have_goal_states
+        else len(provided_initial_states)
+    )
+
     baseline_goal = simulator.goal.copy()
     while successful_episodes < trajectories_per_iteration:
         attempted_episodes += 1
@@ -123,14 +132,6 @@ def collect_dagger_rollouts(
                 "Too many failed DAgger rollout attempts. "
                 f"Collected {successful_episodes}/{trajectories_per_iteration} episodes."
             )
-        provided_initial_states = normalize_initial_state_specs(simulator, initial_states)
-        provided_goal_states = normalize_goal_state_specs(simulator, goal_states)
-        have_goal_states = bool(goal_states)
-        usable_count = (
-            min(len(provided_initial_states), len(provided_goal_states))
-            if have_goal_states
-            else len(provided_initial_states)
-        )
         if attempted_episodes <= usable_count:
             sampled_initial_state = provided_initial_states[attempted_episodes - 1]
             if have_goal_states:
@@ -160,9 +161,6 @@ def collect_dagger_rollouts(
             )
             sampled_initial_state = sample_initial_state(simulator, episode_initial_state_seed)
         state = simulator.reset(sampled_initial_state)
-        if simulator.is_collision(state):
-            print(f"Skipping DAgger episode due to colliding initial state (attempt={attempted_episodes}).")
-            continue
         episode_initial_state = state.copy()
         episode_noise_seed = action_noise_seed_for_rollout(
             action_noise_seed,
@@ -202,12 +200,6 @@ def collect_dagger_rollouts(
                 break
 
             expert_action = expert_plan.actions[0]
-            expert_next_state = simulator.predict_next_state(state, expert_action)
-            if simulator.is_collision(expert_next_state):
-                print(f"Unsafe expert corrective label (attempt={attempted_episodes}, step={step}).")
-                discard_reason = "the expert's corrective label is unsafe"
-                break
-
             use_expert_action = bool(episode_expert_mixing_rng.random() < expert_mixing_beta)
             policy_action = None
             if should_query_policy:
@@ -215,7 +207,7 @@ def collect_dagger_rollouts(
                     policy_action = policy_action_fn(observation)
                 except PlannerSolveError as exc:
                     # Unlike an expert-planner failure above, the episode survives this:
-                    # expert_action for this exact step is already computed and known-safe,
+                    # expert_action for this exact step is already computed,
                     # so falling back to it (below, via policy_action=None) keeps the episode
                     # going instead of discarding it. Recorded as an expert step since that's
                     # what actually gets executed.
@@ -235,13 +227,6 @@ def collect_dagger_rollouts(
                 state,
                 apply_execution_noise(simulator, base_action, action_noise_std, episode_action_noise_rng),
             )
-            if simulator.is_collision(state):
-                print(
-                    "DAgger rollout collision "
-                    f"(attempt={attempted_episodes}, step={step}, actor={'expert' if use_expert_action else 'policy'})."
-                )
-                discard_reason = "the rollout collided"
-                break
             if simulator.should_terminate_rollout(state):
                 reached_goal = True
                 rollout_steps = step
@@ -267,7 +252,7 @@ def collect_dagger_rollouts(
             dataset_writer.add_frame(frame_data)
 
         dataset_writer.save_episode()
-                 
+
         successful_episodes += 1
         reached_goal_count += int(reached_goal)
         steps_taken.append(int(rollout_steps))
@@ -298,7 +283,7 @@ def collect_dagger_rollouts(
 
 
 def rollout_policy_with_action_fn(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     initial_state: np.ndarray,
     num_steps: int,
     action_fn: Callable[[np.ndarray], np.ndarray],
@@ -308,17 +293,14 @@ def rollout_policy_with_action_fn(
 ) -> tuple[bool, int, str | None]:
     """Returns (reached_goal, steps_taken, failure_reason).
 
-    failure_reason is None on success, else one of "collision", "timeout"
-    (ran out of steps without colliding or reaching tolerance), or
-    "solve_failure" (action_fn itself raised) -- see DaggerEvalMetrics for
-    why these are tracked separately rather than folded into one failure
-    count.
+    failure_reason is None on success, else one of "timeout" (ran out of steps
+    without reaching tolerance) or "solve_failure" (action_fn itself raised)
+    -- see DaggerEvalMetrics for why these are tracked separately rather than
+    folded into one failure count.
     """
     state = simulator.reset(initial_state)
     if reset_fn is not None:
         reset_fn()
-    if simulator.is_collision(state):
-        return False, 0, "collision"
     if simulator.should_terminate_rollout(state):
         return True, 0, None
     for step in range(1, num_steps + 1):
@@ -327,7 +309,7 @@ def rollout_policy_with_action_fn(
         except PlannerSolveError as exc:
             # No expert running alongside evaluation to fall back to (unlike
             # collect_dagger_rollouts) -- treat like any other episode
-            # failure (a collision, a timeout) rather than crashing the
+            # failure (a timeout) rather than crashing the
             # whole evaluation/training run over one solver hiccup.
             # simulator.step() never ran this iteration, so `step` (a
             # 1-indexed loop counter) overcounts the actually-executed steps
@@ -336,8 +318,6 @@ def rollout_policy_with_action_fn(
             print(f"Policy solve failed during evaluation at step={step}: {exc}")
             return False, step - 1, "solve_failure"
         state = simulator.step(state, apply_execution_noise(simulator, action, action_noise_std, action_noise_rng))
-        if simulator.is_collision(state):
-            return False, step, "collision"
         if simulator.should_terminate_rollout(state):
             return True, step, None
     return False, num_steps, "timeout"
@@ -372,7 +352,7 @@ def _isolated_torch_rng_state():
 
 
 def evaluate_policy_rollouts(
-    simulator: DynamicsProtocol,
+    simulator: DynamicsSimulator,
     num_episodes: int,
     num_steps: int,
     seed_start: int,
@@ -406,7 +386,6 @@ def evaluate_policy_rollouts(
     config_episodes = 0
     random_successes = 0
     random_episodes = 0
-    collision_failures = 0
     timeout_failures = 0
     solve_failures = 0
     baseline_goal = simulator.goal.copy()
@@ -425,19 +404,6 @@ def evaluate_policy_rollouts(
         else:
             simulator.set_goal(baseline_goal)
             initial_state = sample_initial_state(simulator, seed_spec)
-        # A flow/safeflow policy's inference draws from an unseeded
-        # torch.randn(...) for its ODE initial noise (FlowPolicy.select_
-        # action) -- without pinning it here, the exact same checkpoint
-        # evaluated on the exact same scenario can succeed or fail from pure
-        # sampling luck, adding noise to round-to-round comparisons that has
-        # nothing to do with the policy actually changing. Its own stream ID
-        # (see torch_inference_seed_for_rollout) keeps it decorrelated from
-        # action_noise_rng below even though both derive from the same
-        # seed_spec -- the same pattern this module already uses to keep
-        # action noise, initial-state sampling, and expert-mixing
-        # independent of each other. _isolated_torch_rng_state() restores
-        # torch's global RNG(s) once this rollout is done, so this eval-only
-        # seeding never leaks into the next DAgger round's own training.
         with _isolated_torch_rng_state():
             torch.manual_seed(torch_inference_seed_for_rollout(action_noise_seed, seed_spec=seed_spec))
             reached_goal, rollout_steps, failure_reason = rollout_policy_with_action_fn(
@@ -451,9 +417,7 @@ def evaluate_policy_rollouts(
             )
         successes += int(reached_goal)
         steps_taken.append(int(rollout_steps))
-        if failure_reason == "collision":
-            collision_failures += 1
-        elif failure_reason == "timeout":
+        if failure_reason == "timeout":
             timeout_failures += 1
         elif failure_reason == "solve_failure":
             solve_failures += 1
@@ -473,7 +437,6 @@ def evaluate_policy_rollouts(
         config_num_episodes=config_episodes,
         random_successes=random_successes,
         random_num_episodes=random_episodes,
-        collision_failures=collision_failures,
         timeout_failures=timeout_failures,
         solve_failures=solve_failures,
     )

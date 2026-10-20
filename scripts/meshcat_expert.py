@@ -23,16 +23,15 @@ from dynamics.franka_dynamics import FrankaDynamics
 from dynamics.seed_utils import action_noise_rng_for_rollout, default_action_noise_seed_for_config
 from learning.dagger.rollouts import apply_execution_noise
 from learning.dagger.utils import sample_initial_state
-from planning.factory import PlannerFactory
-from planning.planner import Planner
 from planning.config import load_and_validate_system_config, validate_system_config
-from planning.planner import PlannerSolveError
+from planning.planner import Planner, PlannerSolveError
+from planning.planner_factory import PlannerFactory
 
 from .meshcat_utils import draw_tcp_paths
 
 
 def rollout_expert(dyn: FrankaDynamics, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
-    """One closed-loop expert rollout; stops at the goal, on a collision or when the planner fails."""
+    """One closed-loop expert rollout; stops at the goal or when the planner fails."""
     state = dyn.reset(initial_state)
     planner.reset()
     states, actions, solve_times = [state.copy()], [], []
@@ -51,9 +50,6 @@ def rollout_expert(dyn: FrankaDynamics, planner: Planner, initial_state: np.ndar
         state = dyn.step(state, executed)
         states.append(state.copy())
         actions.append(executed)
-        if dyn.is_collision(state):
-            outcome = "collision"
-            break
         if dyn.should_terminate_rollout(state):
             outcome = "reached"
             break
@@ -124,7 +120,7 @@ def main() -> None:
 
     reached = [r[2]["outcome"] == "reached" for r in results]
     print(f"\ngoal reached in {sum(reached)}/{len(results)} rollouts")
-    for kind in ("timeout", "collision", "planner failure"):
+    for kind in ("timeout", "planner failure"):
         count = sum(r[2]["outcome"].startswith(kind) for r in results)
         if count:
             print(f"  {kind}: {count}")

@@ -4,8 +4,9 @@ from typing import Any, Mapping
 import casadi as ca
 import numpy as np
 
+from planning.casadi_planner import IPOPT_OPTIONS
 from planning.planner import PlannerSolveError
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 
 
 class CasadiTrajectoryProjector:
@@ -34,10 +35,10 @@ class CasadiTrajectoryProjector:
                              -u_max <= u_k <= u_max             action limits
                              x_lower <= x_k <= x_upper, k >= 1  position, velocity and acceleration limits
 
-    The task goal and collisions are not part of the problem.
+    The task goal is not part of the problem.
     """
 
-    def __init__(self, local_sim: DynamicsProtocol, config: Mapping[str, Any], *, horizon: int):
+    def __init__(self, local_sim: DynamicsSimulator, config: Mapping[str, Any], *, horizon: int):
         self.sim = local_sim
         # The chunk length is the flow policy's prediction horizon, not the expert's ``horizon``
         self.tracked_horizon = self.N = int(horizon)
@@ -79,22 +80,7 @@ class CasadiTrajectoryProjector:
         self.opti.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(self.X[self.rest_idx, self.N]))
 
         # Consecutive solves differ little: the multipliers are warm started too (see CasadiPlanner)
-        self.opti.solver(
-            "ipopt",
-            {
-                "expand": True,
-                "ipopt.print_level": 0,
-                "print_time": 0,
-                "ipopt.sb": "yes",
-                "ipopt.warm_start_init_point": "yes",
-                "ipopt.warm_start_bound_push": 1e-9,
-                "ipopt.warm_start_bound_frac": 1e-9,
-                "ipopt.warm_start_slack_bound_push": 1e-9,
-                "ipopt.warm_start_slack_bound_frac": 1e-9,
-                "ipopt.warm_start_mult_bound_push": 1e-9,
-                "ipopt.mu_init": 1e-6,
-            },
-        )
+        self.opti.solver("ipopt", IPOPT_OPTIONS)
         self.reset()
 
     def reset(self) -> None:
@@ -128,7 +114,7 @@ class CasadiTrajectoryProjector:
         states = np.zeros((self.sim.nx, self.N + 1))
         states[:, 0] = x0
         for step in range(self.N):
-            states[:, step + 1] = self.sim.predict_next_state(states[:, step], u_guess[:, step], validate=False)
+            states[:, step + 1] = self.sim.predict_next_state(states[:, step], u_guess[:, step])
         tolerance = 1e-6
         within_limits = np.all(states[:, 1:] >= np.asarray(self.sim.state_lower_bounds)[:, None] - tolerance) and np.all(
             states[:, 1:] <= np.asarray(self.sim.state_upper_bounds)[:, None] + tolerance

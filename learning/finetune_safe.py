@@ -19,9 +19,9 @@ from learning.data_utils import format_sample_for_policy
 from learning.models.ema import ExponentialMovingAverage
 from learning.models.flow_policy import FlowPolicy
 from learning.models.flow_velocity_net import TIME_BETA_ALPHA, TIME_BETA_BETA
+from dynamics.dynamics_factory import DynamicsFactory
 from planning.casadi_projector import CasadiTrajectoryProjector
 from planning.config import load_and_validate_system_config
-from planning.factory import DynamicsFactory
 from planning.planner import PlannerSolveError
 
 """Safety fine-tuning of a flow policy on projected paths (second training stage of SafeFlowMPC, Oelerich et al., 2026).

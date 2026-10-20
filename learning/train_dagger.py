@@ -3,29 +3,31 @@ from __future__ import annotations
 import argparse
 import ast
 import os
+import shutil
 import sys
 import time
-import yaml
-import shutil
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.config import load_and_validate_system_config
+from dynamics.initial_state_utils import parse_goal_states_argument, parse_initial_states_argument
 from learning.config_loaders import (
     default_checkpoint_dir,
-    default_dataset_root, default_repo_id,
+    default_dataset_root,
+    default_repo_id,
     load_dagger_training_config,
-    load_flow_config, load_prediction_horizon, load_unet_config,
+    load_flow_config,
     load_policy_type,
+    load_prediction_horizon,
+    load_unet_config,
 )
 from learning.dagger import DaggerConfig, DaggerTrainer
-from dynamics.initial_state_utils import parse_goal_states_argument, parse_initial_states_argument
+from planning.config import load_and_validate_system_config
 
 """High-level CLI plumbing and orchestration for DAgger training.
 
@@ -56,6 +58,20 @@ def _print_yaml_block(title: str, data: dict[str, Any]) -> None:
         print(f"  {line}")
 
 
+def _parse_dict_override(raw_value: Any, flag_name: str, example: str) -> dict[str, float] | None:
+    if not isinstance(raw_value, str):
+        return raw_value
+    try:
+        parsed = ast.literal_eval(raw_value)
+    except (SyntaxError, ValueError) as exc:
+        raise ValueError(
+            f"Unable to parse {flag_name}. Use Python-literal dict syntax like '{example}'."
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{flag_name} must evaluate to a dict.")
+    return parsed
+
+
 def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "experiment_name": args.experiment_name,
@@ -70,7 +86,6 @@ def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
         "restart_round_seed": args.restart_round_seed,
         "initial_states_count": len(parse_initial_states_argument(args.initial_states)) if isinstance(args.initial_states, str) and args.initial_states else (len(args.initial_states) if args.initial_states is not None else 0),
         "goal_states_count": len(parse_goal_states_argument(args.goal_states)) if isinstance(args.goal_states, str) and args.goal_states else (len(args.goal_states) if args.goal_states is not None else 0),
-        "workspace_bounds": args.workspace_bounds,
         "eval_episodes": args.eval_episodes,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
@@ -90,7 +105,6 @@ def _summarize_dagger_config(cfg: Any) -> dict[str, Any]:
         "training_curriculum": cfg.training_curriculum,
         "initial_states_count": len(cfg.initial_states) if cfg.initial_states is not None else 0,
         "goal_states_count": len(cfg.goal_states) if cfg.goal_states is not None else 0,
-        "workspace_bounds": cfg.workspace_bounds,
         "eval_episodes": cfg.eval_episodes,
         "eval_seed_start": cfg.eval_seed_start,
         "batch_size": cfg.batch_size,
@@ -156,19 +170,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "explicit goal state specs, paired index-for-index with --initial-states. "
-            "Examples: '[x, y, z, R00, R01, ..., R22]' (TCP pose) for one rollout or "
-            "'[[...], [...]]' for multiple rollouts. "
+            "Examples: '[q1, ..., q7]' for one rollout or '[[...], [...]]' for multiple rollouts. "
             "When either list is exhausted, remaining rollouts in that round fall back to random."
-        ),
-    )
-    p.add_argument(
-        "--workspace-bounds",
-        type=str,
-        default=None,
-        help=(
-            "Python-literal '[[xmin, xmax], [ymin, ymax], [zmin, zmax]]' TCP box both random goals "
-            "and random initial TCP positions are drawn from (random-curriculum rounds and eval "
-            "fallback), with rejection sampling keeping every sampled configuration clear of the floor."
         ),
     )
     p.add_argument(
@@ -187,9 +190,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "same format as --tolerance-overrides, but applied only to evaluation rollouts, not "
-            "data collection/training. Falls back to --tolerance-overrides when omitted. Use this "
-            "to relax the pass/fail standard for eval (e.g. 'close enough and collision-free') "
-            "without changing what collection/training demonstrates against."
+            "data collection/training. Falls back to --tolerance-overrides when omitted."
         ),
     )
     p.add_argument("--expert-beta-per-iteration", nargs="+", type=float)
@@ -210,15 +211,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-train-steps", type=int)
     return p.parse_args()
 
-def save_experiment_configs(args: argparse.Namespace, experiment_dir: Path,  repo_id: str, dataset_root: Path) -> None:
-    """
-    saves experiment configs and run arguments to experiment directory
-    """
 
+def save_experiment_configs(args: argparse.Namespace, experiment_dir: Path, repo_id: str, dataset_root: Path) -> None:
+    """Save experiment configs and run arguments to experiment directory."""
     shutil.copy2(args.expert_config, experiment_dir / "expert_config.yaml")
     shutil.copy2(args.policy_config, experiment_dir / "policy_config.yaml")
 
-    # saves resolved run arguments:
     run_args = vars(args).copy()
     run_args["repo_id"] = repo_id
     run_args["dataset_root"] = dataset_root
@@ -230,6 +228,7 @@ def save_experiment_configs(args: argparse.Namespace, experiment_dir: Path,  rep
 
     with (experiment_dir / "run_args.yaml").open("w") as f:
         yaml.safe_dump(run_args, f, sort_keys=False)
+
 
 def main() -> None:
     args = parse_args()
@@ -269,63 +268,22 @@ def main() -> None:
     training_curriculum_config = option("training_curriculum", None)
     round_seeds_config = option("round_seeds", None)
     restart_round_seed = bool(option("restart_round_seed", False))
-    workspace_bounds_config = option("workspace_bounds", None)
-    if isinstance(workspace_bounds_config, str):
-        try:
-            workspace_bounds = ast.literal_eval(workspace_bounds_config)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(
-                "Unable to parse --workspace-bounds. Use Python-literal syntax like "
-                "'[[0.3, 0.7], [-0.4, 0.4], [0.2, 0.7]]'."
-            ) from exc
-    else:
-        workspace_bounds = workspace_bounds_config
-    if workspace_bounds is not None:
-        if not isinstance(workspace_bounds, (list, tuple)) or not all(
-            isinstance(bounds, (list, tuple)) for bounds in workspace_bounds
-        ):
-            raise ValueError("--workspace-bounds must evaluate to three [min, max] pairs.")
-        workspace_bounds = [[float(value) for value in bounds] for bounds in workspace_bounds]
-    tolerance_overrides_config = option("tolerance_overrides", None)
-    if isinstance(tolerance_overrides_config, str):
-        try:
-            tolerance_overrides = ast.literal_eval(tolerance_overrides_config)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(
-                "Unable to parse --tolerance-overrides. Use Python-literal dict syntax like "
-                "'{\"pos_tol\": 0.01, \"vel_tol\": 0.05}'."
-            ) from exc
-        if not isinstance(tolerance_overrides, dict):
-            raise ValueError("--tolerance-overrides must evaluate to a dict.")
-    else:
-        tolerance_overrides = tolerance_overrides_config
-    eval_tolerance_overrides_config = option("eval_tolerance_overrides", None)
-    if isinstance(eval_tolerance_overrides_config, str):
-        try:
-            eval_tolerance_overrides = ast.literal_eval(eval_tolerance_overrides_config)
-        except (SyntaxError, ValueError) as exc:
-            raise ValueError(
-                "Unable to parse --eval-tolerance-overrides. Use Python-literal dict syntax like "
-                "'{\"pos_tol\": 0.02, \"vel_tol\": 0.05}'."
-            ) from exc
-        if not isinstance(eval_tolerance_overrides, dict):
-            raise ValueError("--eval-tolerance-overrides must evaluate to a dict.")
-    else:
-        eval_tolerance_overrides = eval_tolerance_overrides_config
+    tolerance_overrides = _parse_dict_override(
+        option("tolerance_overrides", None),
+        "--tolerance-overrides",
+        '{"pos_tol": 0.01, "vel_tol": 0.05}',
+    )
+    eval_tolerance_overrides = _parse_dict_override(
+        option("eval_tolerance_overrides", None),
+        "--eval-tolerance-overrides",
+        '{"pos_tol": 0.02, "vel_tol": 0.05}',
+    )
     if (args.repo_id is None) != (args.dataset_root is None):
         raise ValueError("Provide both --repo-id and --dataset-root together, or omit both.")
     fresh = args.repo_id is None
     timestamp = time.time_ns()
-    repo_id = (
-        default_repo_id(timestamp)
-        if fresh
-        else str(args.repo_id)
-    )
-    dataset_root = (
-        default_dataset_root(timestamp)
-        if fresh
-        else Path(args.dataset_root)
-    )
+    repo_id = default_repo_id(timestamp) if fresh else str(args.repo_id)
+    dataset_root = default_dataset_root(timestamp) if fresh else Path(args.dataset_root)
     trajectories, epochs, betas, training_curriculum, round_seeds = DaggerTrainer.schedules(
         trajectories_per_iteration,
         target_epochs_per_round,
@@ -335,15 +293,8 @@ def main() -> None:
         round_seeds_config,
     )
 
-    # path to experiment directory where configs and checkpoints will be saved:
-    experiment_dir = (
-        args.checkpoint_dir or default_checkpoint_dir()
-    ) / args.experiment_name
-
-    # allows to override existing experiment directory:
+    experiment_dir = (args.checkpoint_dir or default_checkpoint_dir()) / args.experiment_name
     experiment_dir.mkdir(parents=True, exist_ok=True)
-
-    # saves configs before training (in case of failure):
     save_experiment_configs(
         args=args,
         experiment_dir=experiment_dir,
@@ -365,7 +316,6 @@ def main() -> None:
         training_curriculum=training_curriculum,
         round_seeds=round_seeds,
         restart_round_seed=restart_round_seed,
-        workspace_bounds=workspace_bounds,
         tolerance_overrides=tolerance_overrides,
         eval_tolerance_overrides=eval_tolerance_overrides,
         expert_beta_per_iteration=betas,
@@ -389,6 +339,7 @@ def main() -> None:
         _summarize_dagger_config(cfg),
     )
     DaggerTrainer(cfg).run()
+
 
 if __name__ == "__main__":
     main()

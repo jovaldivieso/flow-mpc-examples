@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
@@ -10,10 +9,10 @@ import yaml
 from dynamics.franka_dynamics import (
     FRANKA_DEFAULT_MAX_ACCELERATION,
     FRANKA_DEFAULT_MAX_JERK,
-    FRANKA_DEFAULT_WORKSPACE_BOUNDS,
     FRANKA_NUM_JOINTS,
 )
-from planning.factory import DynamicsFactory, PlannerFactory
+from dynamics.dynamics_factory import DynamicsFactory
+from planning.planner_factory import PlannerFactory
 
 
 class ConfigurationError(ValueError):
@@ -22,7 +21,7 @@ class ConfigurationError(ValueError):
 
 @dataclass(frozen=True)
 class PlannerConfig:
-    # The expert planner: a name of planning.factory.PLANNER_REGISTRY
+    # The expert planner: a name of planning.planner_factory.PLANNER_REGISTRY
     expert: str = "casadi"
     horizon: int = 20
     q_diag: tuple[float, ...] = ()
@@ -68,24 +67,6 @@ class OmplConfig:
         return {field.name for field in fields(cls)}
 
 
-@dataclass(frozen=True)
-class WorkspaceSamplingConfig:
-    """Cartesian TCP box [[x_min, x_max], [y_min, y_max], [z_min, z_max]]."""
-
-    bounds: tuple[tuple[float, float], ...] = FRANKA_DEFAULT_WORKSPACE_BOUNDS
-    seed: int | None = None
-
-
-@dataclass(frozen=True)
-class FrankaSystemConfig:
-    goal: tuple[float, ...] | None = None
-    randomize_goal: bool = True
-    max_acceleration: tuple[float, ...] = FRANKA_DEFAULT_MAX_ACCELERATION
-    max_jerk: tuple[float, ...] = FRANKA_DEFAULT_MAX_JERK
-    min_start_goal_distance: float = 0.25
-    workspace_sampling: WorkspaceSamplingConfig = WorkspaceSamplingConfig()
-
-
 def load_yaml_config(config_path: str | Path) -> dict[str, Any]:
     """Load YAML into a dictionary and fail with context when invalid."""
     path = Path(config_path)
@@ -107,14 +88,14 @@ def _not_numeric(key: str, idx: int, value: Any) -> ConfigurationError:
 
 def _float(config: Mapping[str, Any], key: str, default: float) -> float:
     value = config.get(key, default)
-    if not isinstance(value, (int, float)):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigurationError(f"'{key}' must be numeric, got {type(value).__name__}.")
     return float(value)
 
 
 def _int(config: Mapping[str, Any], key: str, default: int) -> int:
     value = config.get(key, default)
-    if not isinstance(value, int):
+    if isinstance(value, bool) or not isinstance(value, int):
         raise ConfigurationError(f"'{key}' must be int, got {type(value).__name__}.")
     return int(value)
 
@@ -173,7 +154,7 @@ def _vector(config: Mapping[str, Any], key: str, size: int, default: tuple[float
         raise ConfigurationError(f"'{key}' must have length {size}, got {len(raw)}.")
     out: list[float] = []
     for idx, value in enumerate(raw):
-        if not isinstance(value, (int, float)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise _not_numeric(key, idx, value)
         out.append(float(value))
     return tuple(out)
@@ -187,35 +168,13 @@ def _positive_vector(raw: Any, key: str, size: int) -> tuple[float, ...]:
 
     out: list[float] = []
     for idx, value in enumerate(raw):
-        if not isinstance(value, (int, float)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise _not_numeric(key, idx, value)
         value_f = float(value)
         if value_f <= 0:
             raise ConfigurationError(f"'{key}[{idx}]' must be positive.")
         out.append(value_f)
     return tuple(out)
-
-
-def _workspace_sampling(raw_config: Mapping[str, Any]) -> WorkspaceSamplingConfig:
-    raw_bounds = raw_config.get("workspace_bounds", [list(axis) for axis in WorkspaceSamplingConfig.bounds])
-    if not isinstance(raw_bounds, list) or len(raw_bounds) != 3:
-        raise ConfigurationError(
-            "'workspace_bounds' must be three [min, max] pairs: [[x_min, x_max], [y_min, y_max], [z_min, z_max]]."
-        )
-    bounds: list[tuple[float, float]] = []
-    for axis, axis_bounds in zip("xyz", raw_bounds):
-        lower, upper = _vector({"bounds": axis_bounds}, "bounds", 2, (0.0, 0.0))
-        if not math.isfinite(lower) or not math.isfinite(upper):
-            raise ConfigurationError(f"'workspace_bounds' entries must all be finite ({axis}).")
-        if lower >= upper:
-            raise ConfigurationError(
-                f"'workspace_bounds' {axis} minimum must be smaller than its maximum."
-            )
-        bounds.append((lower, upper))
-    return WorkspaceSamplingConfig(
-        bounds=tuple(bounds),
-        seed=_optional_non_negative_int(raw_config, "initial_state_seed"),
-    )
 
 
 def _require_only_known_keys(raw: Mapping[str, Any], allowed_keys: set[str], *, context: str) -> None:
@@ -247,11 +206,10 @@ COMMON_KEYS = OmplConfig.keys() | {
     "min_start_goal_distance",
     "pos_tol",
     "vel_tol",
-    "workspace_bounds",
 }
 SYSTEM_KEYS = {
     "franka": set(),
-    "triple_integrator": {"dimension", "position_limit", "max_velocity"},
+    "triple_integrator": {"dimension", "position_limit", "max_velocity", "workspace_bounds"},
 }
 
 
@@ -325,25 +283,15 @@ def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     if min_start_goal_distance < 0:
         raise ConfigurationError("'min_start_goal_distance' must be non-negative.")
 
-    workspace_sampling = _workspace_sampling(raw_config)
-    system_cfg = FrankaSystemConfig(
-        goal=_vector(raw_config, "goal", FRANKA_NUM_JOINTS, ()) if "goal" in raw_config else None,
-        randomize_goal=_bool(raw_config, "randomize_goal", "goal" not in raw_config),
-        max_acceleration=_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS),
-        max_jerk=_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS),
-        min_start_goal_distance=min_start_goal_distance,
-        workspace_sampling=workspace_sampling,
-    )
     fields: dict[str, Any] = {
-        "randomize_goal": system_cfg.randomize_goal,
-        "workspace_bounds": [list(axis) for axis in system_cfg.workspace_sampling.bounds],
-        "min_start_goal_distance": system_cfg.min_start_goal_distance,
-        "max_acceleration": list(system_cfg.max_acceleration),
-        "max_jerk": list(system_cfg.max_jerk),
+        "randomize_goal": _bool(raw_config, "randomize_goal", "goal" not in raw_config),
+        "min_start_goal_distance": min_start_goal_distance,
+        "max_acceleration": list(_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS)),
+        "max_jerk": list(_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS)),
         **_tolerances(raw_config, 2e-3, 2e-2),
     }
-    if system_cfg.goal is not None:
-        fields["goal"] = list(system_cfg.goal)
+    if "goal" in raw_config:
+        fields["goal"] = list(_vector(raw_config, "goal", FRANKA_NUM_JOINTS, ()))
     return fields
 
 

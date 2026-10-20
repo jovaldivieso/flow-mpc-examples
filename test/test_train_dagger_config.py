@@ -179,7 +179,6 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
                 config_num_episodes=4,
                 random_successes=11,
                 random_num_episodes=16,
-                collision_failures=2,
                 timeout_failures=4,
                 solve_failures=1,
             )
@@ -242,58 +241,21 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
         self.assertEqual(summary["total_expert_statistics"], {"ompl_paths": 24, "ompl_replans": 4})
 
 
-class DaggerConfigWorkspaceBoundsTests(unittest.TestCase):
-    """workspace_bounds is the TCP box [[x_min, x_max], [y_min, y_max], [z_min, z_max]]
-    random goals and start poses are drawn from: exactly three [min, max]
-    pairs, each with its max above its min.
-    """
-
-    def test_defaults_to_none(self) -> None:
-        self.assertIsNone(_minimal_dagger_config().workspace_bounds)
-
-    def test_three_valid_pairs_are_accepted(self) -> None:
-        bounds = [[0.3, 0.7], [-0.4, 0.4], [0.2, 0.7]]
-        cfg = _minimal_dagger_config(workspace_bounds=bounds)
-        self.assertEqual(cfg.workspace_bounds, bounds)
-
-    def test_wrong_number_of_pairs_is_rejected(self) -> None:
-        for bounds in ([0.3, 0.7], [[0.3, 0.7]], [[0.3, 0.7], [-0.4, 0.4]], [[0.3, 0.7]] * 4):
-            with self.subTest(bounds=bounds):
-                with self.assertRaises(ValueError):
-                    _minimal_dagger_config(workspace_bounds=bounds)
-
-    def test_a_pair_that_is_not_min_max_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            _minimal_dagger_config(workspace_bounds=[[0.3, 0.7], [-0.4, 0.4], [0.2, 0.5, 0.7]])
-
-    def test_a_pair_whose_max_does_not_exceed_its_min_is_rejected(self) -> None:
-        for bounds in (
-            [[0.3, 0.3], [-0.4, 0.4], [0.2, 0.7]],
-            [[0.3, 0.7], [0.4, -0.4], [0.2, 0.7]],
-        ):
-            with self.subTest(bounds=bounds):
-                with self.assertRaises(ValueError):
-                    _minimal_dagger_config(workspace_bounds=bounds)
-
-
 class DaggerTrainerRuntimeConfigOverridesTests(unittest.TestCase):
-    """_apply_runtime_config_overrides injects the training config's TCP box
-    and convergence tolerances into the (already validated) expert config and
-    validates the result again.
+    """_apply_runtime_config_overrides injects the training config's convergence
+    tolerances into the (already validated) expert config and validates the result again.
     """
 
     def setUp(self) -> None:
         self.expert_config = load_and_validate_system_config(EXPERT_CONFIG_PATH)
 
-    def test_workspace_bounds_and_tolerances_are_injected(self) -> None:
-        bounds = [[0.3, 0.7], [-0.4, 0.4], [0.2, 0.7]]
+    def test_tolerances_are_injected(self) -> None:
         trainer = DaggerTrainer(
-            _minimal_dagger_config(workspace_bounds=bounds, tolerance_overrides={"pos_tol": 0.01})
+            _minimal_dagger_config(tolerance_overrides={"pos_tol": 0.01})
         )
 
         config = trainer._apply_runtime_config_overrides(copy.deepcopy(self.expert_config))
 
-        self.assertEqual(config["workspace_bounds"], bounds)
         self.assertEqual(config["pos_tol"], 0.01)
         # Not overridden: stays whatever the expert config says.
         self.assertEqual(config["vel_tol"], self.expert_config["vel_tol"])

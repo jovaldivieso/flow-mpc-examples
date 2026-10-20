@@ -8,7 +8,7 @@ import torch
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy, observation_features
 from planning.casadi_projector import CasadiTrajectoryProjector
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 
 FLOW_INITIALIZATIONS = ("previous_safe", "gaussian")
 
@@ -31,7 +31,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
         self,
         inner_policy: FlowPolicy,
         projector: CasadiTrajectoryProjector,
-        local_sim: DynamicsProtocol,
+        local_sim: DynamicsSimulator,
         flow_init: str = "previous_safe",
     ) -> None:
         super().__init__()

@@ -12,7 +12,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from dynamics.franka_dynamics import FrankaDynamics
 from learning.dagger.utils import sample_initial_state
 from planning.casadi_planner import CasadiPlanner
-from planning.factory import PlannerFactory
+from planning.planner_factory import PlannerFactory
 from planning.ompl_casadi_planner import OmplCasadiPlanner
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, Planner

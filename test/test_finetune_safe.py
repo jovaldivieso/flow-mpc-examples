@@ -56,14 +56,16 @@ class ProjectedPathTests(unittest.TestCase):
         # while the first one (the projected noise) is far from it
         self.assertGreater(np.max(np.abs(path[0] - path[-1])), 1.0)
 
-    def test_every_point_of_the_path_is_collision_free(self) -> None:
+    def test_every_point_of_the_path_is_within_joint_limits(self) -> None:
         noise = np.random.default_rng(1).normal(size=self.plan.shape) * self.simulator.max_action
 
         path = projected_path(self.projector, self.observation, self.plan, noise, PATH_STEPS)
 
+        lower = self.simulator.state_lower_bounds[: self.simulator.n]
+        upper = self.simulator.state_upper_bounds[: self.simulator.n]
         for chunk in path:
             for q in self.simulator.rollout_positions(self.state, chunk):
-                self.assertFalse(self.simulator.is_collision(q))
+                self.assertTrue(np.all(q >= lower - 1e-6) and np.all(q <= upper + 1e-6))
 
     def test_generate_paths_returns_one_path_per_frame_and_noise_draw_deterministically(self) -> None:
         observations = np.stack([self.observation, self.observation])

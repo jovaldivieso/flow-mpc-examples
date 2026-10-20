@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .metrics import DaggerEvalMetrics
-from dynamics.dynamics import DynamicsProtocol
+from dynamics.dynamics import DynamicsSimulator
 
 
 def set_seed(seed: int) -> None:
@@ -100,12 +100,11 @@ def print_rollout_metrics(label: str, prefix: str, metrics: DaggerEvalMetrics) -
         print(
             f"  {prefix}_success_by_source: config={config_display} random={random_display}"
         )
-    total_failures = metrics.collision_failures + metrics.timeout_failures + metrics.solve_failures
+    total_failures = metrics.timeout_failures + metrics.solve_failures
     if total_failures > 0:
         print(
-            f"  {prefix}_failure_breakdown: collision={metrics.collision_failures} "
-            f"timeout={metrics.timeout_failures} solve_failure={metrics.solve_failures} "
-            f"(of {total_failures} failures)"
+            f"  {prefix}_failure_breakdown: timeout={metrics.timeout_failures} "
+            f"solve_failure={metrics.solve_failures} (of {total_failures} failures)"
         )
 
 
@@ -123,7 +122,7 @@ def rng_for_seed_spec(seed_spec: int) -> np.random.Generator:
     return np.random.default_rng(int(seed_spec))
 
 
-def sample_initial_state(simulator: DynamicsProtocol, seed_spec: int) -> np.ndarray:
+def sample_initial_state(simulator: DynamicsSimulator, seed_spec: int) -> np.ndarray:
     rng = rng_for_seed_spec(seed_spec)
     simulator.randomize_goal_for_reset(rng)
     return simulator.random_initial_state(rng)

@@ -6,7 +6,7 @@ Goal   g = target joint configuration q_goal
 Observation o = [g, x] (obs_dim = 28); the LeRobot frame stores g as ``observation.environment_state`` and x as
 ``observation.state``.
 
-Kinematic model: every joint is a triple integrator with piecewise constant jerk, with SafeFlowMPC's limits (the
+Kinematic model: inherits the triple-integrator plant from ``TripleIntegrator`` with SafeFlowMPC's FR3 limits (the
 joint position limits narrowed by ``JOINT_LIMIT_MARGIN``, the velocity limits scaled by ``VELOCITY_LIMIT_SCALE``,
 acceleration and jerk limits from the config). No masses or torques: a joint tracking controller is assumed to
 follow the motion.
@@ -19,26 +19,23 @@ import functools
 from pathlib import Path
 from typing import Any, Mapping
 
-import casadi as ca
 import numpy as np
 import pinocchio as pin
 import xacro
 from pinocchio.robot_wrapper import RobotWrapper
 from xacro import substitution_args
 
-from .dynamics import DynamicsSimulator, constant_jerk_step, saturated_step
+from .triple_integrator import TripleIntegrator
 
 FRANKA_NUM_JOINTS = 7
 FRANKA_DEFAULT_MAX_ACCELERATION = (5.0,) * 7
 FRANKA_DEFAULT_MAX_JERK = (15.0,) * 7
-FRANKA_DEFAULT_WORKSPACE_BOUNDS = ((0.2, 1.0), (-1.0, 1.0), (0.1, 0.8))
 
 # SafeFlowMPC's joint limits: positions 3 degrees inside the description's, velocities at 92 %
 JOINT_LIMIT_MARGIN = np.deg2rad(3.0)
 VELOCITY_LIMIT_SCALE = 0.92
 # Random start/goal configurations keep this fraction of every joint range away from the limits
 JOINT_SAMPLING_MARGIN = 0.1
-SAMPLING_ATTEMPTS = 256
 
 # Official franka_description, pinned as a git submodule
 FRANKA_DESCRIPTION = Path(__file__).resolve().parents[1] / "third_party" / "franka_description"
@@ -89,39 +86,35 @@ def build_robot() -> RobotWrapper:
     return RobotWrapper(model, collision, visual)
 
 
-class FrankaDynamics(DynamicsSimulator):
+class FrankaDynamics(TripleIntegrator):
     """Triple-integrator 7-joint FR3 with jerk as the action; the goal is a joint configuration."""
 
     task_description = "reach target configuration"
 
     def __init__(self, config: Mapping[str, Any]):
-        super().__init__(config)
+        # Call DynamicsSimulator.__init__ first, then configure the 7-DoF FR3 bounds on TripleIntegrator
+        super(TripleIntegrator, self).__init__(config)
         self.model = build_model()
         self.data = self.model.createData()
         self._robot: RobotWrapper | None = None
         self.tcp_id = self.model.getFrameId(TCP_FRAME)
-        self.n = self.model.nv
-        if self.n != FRANKA_NUM_JOINTS:
-            raise ValueError(f"Expected {FRANKA_NUM_JOINTS} joints, the reduced franka_description has {self.n}.")
+        n = self.model.nv
+        if n != FRANKA_NUM_JOINTS:
+            raise ValueError(f"Expected {FRANKA_NUM_JOINTS} joints, the reduced franka_description has {n}.")
 
-        self.nx = 3 * self.n
-        self.nu = self.n
-        self.obs_dim = self.n + self.nx
-        per_joint = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (self.n,)).copy()
-        self.max_acceleration = per_joint("max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION)
-        self.max_action = per_joint("max_jerk", FRANKA_DEFAULT_MAX_JERK)
-        self.state_lower_bounds = np.concatenate([self.model.lowerPositionLimit, -self.model.velocityLimit, -self.max_acceleration])
-        self.state_upper_bounds = np.concatenate([self.model.upperPositionLimit, self.model.velocityLimit, self.max_acceleration])
-
-        self.goal = np.asarray(config["goal"], dtype=float) if "goal" in config else Q_READY.copy()
-        self.randomize_goal = config.get("randomize_goal", "goal" not in config)
-        self.min_start_goal_distance = float(config.get("min_start_goal_distance", 0.25))
-        self.pos_tol = float(config.get("pos_tol", 2e-3))
-        self.vel_tol = float(config.get("vel_tol", 2e-2))
-
-    @property
-    def rest_state_indices(self) -> tuple[int, ...]:
-        return tuple(range(self.n, self.nx))  # velocity and acceleration
+        per_joint = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (n,)).copy()
+        self._init_triple_integrator(
+            n=n,
+            lower_position=self.model.lowerPositionLimit,
+            upper_position=self.model.upperPositionLimit,
+            max_velocity=self.model.velocityLimit,
+            max_acceleration=per_joint("max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION),
+            max_jerk=per_joint("max_jerk", FRANKA_DEFAULT_MAX_JERK),
+            default_goal=Q_READY,
+            default_min_distance=0.25,
+            default_pos_tol=2e-3,
+            default_vel_tol=2e-2,
+        )
 
     @property
     def robot(self) -> RobotWrapper:
@@ -129,35 +122,6 @@ class FrankaDynamics(DynamicsSimulator):
         if self._robot is None:
             self._robot = build_robot()
         return self._robot
-
-    def casadi_dynamics(self, x: Any, u: Any) -> Any:
-        """Exact step under constant jerk, matching ``predict_next_state`` away from the limits."""
-        return ca.vertcat(*constant_jerk_step(x[: self.n], x[self.n : 2 * self.n], x[2 * self.n :], u, self.dt))
-
-    # --- numeric simulation ------------------------------------------------
-
-    def predict_next_state(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
-        state_array = self.validate_state(state) if validate else np.asarray(state, dtype=float)
-        action_array = self.validate_action(action) if validate else np.asarray(action, dtype=float)
-        return saturated_step(
-            state_array, action_array, self.dt, self.state_lower_bounds, self.state_upper_bounds, self.max_action
-        )
-
-    def step(self, state: np.ndarray, action: np.ndarray, validate: bool = True) -> np.ndarray:
-        return self.predict_next_state(state, action, validate=validate)
-
-    def goal_errors(self, state: np.ndarray) -> tuple[float, float]:
-        """Joint-position error [rad] of ``state`` with respect to the goal, and orientation error (none: 0)."""
-        return float(np.linalg.norm(np.asarray(state, dtype=float)[: self.n] - self.goal)), 0.0
-
-    def is_done(self, state: np.ndarray, validate: bool = True) -> bool:
-        """At the goal (within ``pos_tol``) and at rest (every joint velocity within ``vel_tol``)."""
-        state_array = self.validate_state(state) if validate else np.asarray(state, dtype=float)
-        return bool(
-            self.goal_errors(state_array)[0] < self.pos_tol and np.abs(state_array[self.n : 2 * self.n]).max() < self.vel_tol
-        )
-
-    # --- kinematics, goal and dataset -----------------------------------------
 
     def tcp_placement(self, q: np.ndarray) -> pin.SE3:
         pin.forwardKinematics(self.model, self.data, q)
@@ -168,45 +132,11 @@ class FrankaDynamics(DynamicsSimulator):
         """The 3-D position of the TCP in configuration ``q`` (what the viewers draw)."""
         return self.tcp_placement(q).translation
 
-    def get_dataset_features(self, prediction_horizon: int) -> dict[str, Any]:
-        """LeRobot features: state [q, v, a], the goal joint configuration as environment state, the expert's planned
-        jerks as action (its next ``prediction_horizon`` jerks, flattened row by row)."""
-        joints = list(self.model.names[1:])
-        return {
-            "observation.environment_state": {
-                "dtype": "float32",
-                "shape": (self.n,),
-                "names": [f"goal.{j}" for j in joints],
-            },
-            "observation.state": {
-                "dtype": "float32",
-                "shape": (self.nx,),
-                "names": [f"{j}.{kind}" for kind in ("pos", "vel", "acc") for j in joints],
-            },
-            "action": {
-                "dtype": "float32",
-                "shape": (prediction_horizon * self.nu,),
-                "names": [f"{j}.jerk[t+{k}]" for k in range(prediction_horizon) for j in joints],
-            },
-        }
+    def _coordinate_names(self) -> list[str]:
+        return list(self.model.names[1:])
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
         """Random arm configuration inside the joint limits (by ``JOINT_SAMPLING_MARGIN``)."""
         lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
         margin = JOINT_SAMPLING_MARGIN * (upper - lower)
         return rng.uniform(lower + margin, upper - margin)
-
-    def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
-        """Rest state from a random configuration at least ``min_start_goal_distance`` from the goal."""
-        for _ in range(SAMPLING_ATTEMPTS):
-            q = self._sample_configuration(rng)
-            if np.linalg.norm(q - self.goal) > self.min_start_goal_distance:
-                return np.concatenate([q, np.zeros(2 * self.n)])
-        raise RuntimeError(
-            f"Unable to sample a start configuration {self.min_start_goal_distance} away from the goal "
-            f"in {SAMPLING_ATTEMPTS} attempts."
-        )
-
-    def randomize_goal_for_reset(self, rng: np.random.Generator) -> None:
-        if self.randomize_goal:
-            self.set_goal(self._sample_configuration(rng))

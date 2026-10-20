@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from collections.abc import Mapping
 
 from planning.config import load_yaml_config
 
@@ -27,10 +27,11 @@ DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
     "restart_round_seed": False,
     "initial_states": None,
     "goal_states": None,
-    "workspace_bounds": None,
     "tolerance_overrides": None,
     "eval_tolerance_overrides": None,
 }
+
+DEFAULT_PREDICTION_HORIZON = 16
 
 
 @dataclass(frozen=True)
@@ -40,9 +41,6 @@ class UnetConfig:
 
     dim: int = 32
     dim_mults: tuple[int, ...] = (1, 2, 4, 8)
-
-
-DEFAULT_PREDICTION_HORIZON = 16
 
 
 @dataclass(frozen=True)
@@ -58,16 +56,28 @@ def _cached_yaml_config(policy_config_path: Path) -> dict[str, object]:
     return load_yaml_config(policy_config_path)
 
 
+def _mapping_section(parent: Mapping[str, object], key: str, label: str) -> Mapping[str, object]:
+    section = parent.get(key, {})
+    if not isinstance(section, Mapping):
+        raise ValueError(f"{label} must be a mapping.")
+    return section
+
+
+def _model_section(policy_config_path: Path) -> tuple[dict[str, object], Mapping[str, object]]:
+    raw_config = _cached_yaml_config(policy_config_path)
+    model_section = raw_config.get("model", raw_config)
+    if not isinstance(model_section, Mapping):
+        raise ValueError("Model config 'model' section must be a mapping.")
+    return raw_config, model_section
+
+
 def load_dagger_training_config(policy_config_path: Path | None) -> dict[str, object]:
     """Load optional DAgger CLI defaults from a policy configuration file."""
     config = dict(DEFAULT_DAGGER_TRAINING_CONFIG)
     if policy_config_path is None:
         return config
 
-    raw_config = _cached_yaml_config(policy_config_path)
-    model_section = raw_config.get("model", raw_config)
-    if not isinstance(model_section, Mapping):
-        raise ValueError("Policy config model section must be a mapping.")
+    raw_config, model_section = _model_section(policy_config_path)
     training_section = raw_config.get("training", model_section.get("training", {}))
     if not isinstance(training_section, Mapping):
         raise ValueError("Policy config 'training' section must be a mapping.")
@@ -83,11 +93,8 @@ def load_dagger_training_config(policy_config_path: Path | None) -> dict[str, ob
 
 def load_unet_config(policy_config_path: Path) -> UnetConfig:
     """The ``model.unet`` section (``dim``, ``dim_mults``); what it omits keeps the SafeFlowMPC defaults."""
-    raw_config = _cached_yaml_config(policy_config_path)
-    model_section = raw_config.get("model", raw_config)
-    unet_section = model_section.get("unet", {}) if isinstance(model_section, Mapping) else {}
-    if not isinstance(unet_section, Mapping):
-        raise ValueError("Model config 'model.unet' must be a mapping.")
+    _, model_section = _model_section(policy_config_path)
+    unet_section = _mapping_section(model_section, "unet", "Model config 'model.unet'")
     dim_mults = unet_section.get("dim_mults", UnetConfig.dim_mults)
     if not isinstance(dim_mults, (list, tuple)) or not dim_mults:
         raise ValueError("'model.unet.dim_mults' must be a non-empty list of integers.")
@@ -99,9 +106,8 @@ def load_prediction_horizon(policy_config_path: Path | None) -> int:
     labels with the expert's plan); ``DEFAULT_PREDICTION_HORIZON`` if the config omits it."""
     if policy_config_path is None:
         return DEFAULT_PREDICTION_HORIZON
-    raw_config = _cached_yaml_config(policy_config_path)
-    model_section = raw_config.get("model", raw_config)
-    horizon = model_section.get("prediction_horizon", DEFAULT_PREDICTION_HORIZON) if isinstance(model_section, Mapping) else DEFAULT_PREDICTION_HORIZON
+    _, model_section = _model_section(policy_config_path)
+    horizon = model_section.get("prediction_horizon", DEFAULT_PREDICTION_HORIZON)
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
         raise ValueError("'model.prediction_horizon' must be a positive integer.")
     return horizon
@@ -110,18 +116,10 @@ def load_prediction_horizon(policy_config_path: Path | None) -> int:
 def load_policy_type(policy_config_path: Path | None) -> str:
     if policy_config_path is None:
         return "flow"
-    raw_config = _cached_yaml_config(policy_config_path)
-    model_section = raw_config.get("model", raw_config)
-    if not isinstance(model_section, Mapping):
-        raise ValueError("Model config 'model' section must be a mapping.")
+    _, model_section = _model_section(policy_config_path)
     policy_type_raw = model_section.get("policy_type", "flow")
-    if (
-        not isinstance(policy_type_raw, str)
-        or policy_type_raw.strip().lower() not in {"flow", "safeflow"}
-    ):
-        raise ValueError(
-            "'model.policy_type' must be one of {'flow', 'safeflow'}."
-        )
+    if not isinstance(policy_type_raw, str) or policy_type_raw.strip().lower() not in {"flow", "safeflow"}:
+        raise ValueError("'model.policy_type' must be one of {'flow', 'safeflow'}.")
     return policy_type_raw.strip().lower()
 
 
@@ -129,18 +127,9 @@ def load_flow_config(policy_config_path: Path | None) -> FlowConfig:
     if policy_config_path is None:
         return FlowConfig()
 
-    raw_config = _cached_yaml_config(policy_config_path)
-    model_section = raw_config.get("model", raw_config)
-    if not isinstance(model_section, Mapping):
-        raise ValueError("Model config 'model' section must be a mapping.")
-
-    flow_section = model_section.get("flow", {})
-    if not isinstance(flow_section, Mapping):
-        raise ValueError("Model config 'model.flow' must be a mapping.")
-
-    safeflow_section = model_section.get("safeflow", {})
-    if not isinstance(safeflow_section, Mapping):
-        raise ValueError("Model config 'model.safeflow' must be a mapping.")
+    _, model_section = _model_section(policy_config_path)
+    flow_section = _mapping_section(model_section, "flow", "Model config 'model.flow'")
+    safeflow_section = _mapping_section(model_section, "safeflow", "Model config 'model.safeflow'")
     safeflow_init = str(safeflow_section.get("init", FlowConfig.safeflow_init))
     if safeflow_init not in {"previous_safe", "gaussian"}:
         raise ValueError("'model.safeflow.init' must be one of {'previous_safe', 'gaussian'}.")

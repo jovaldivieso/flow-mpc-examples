@@ -12,7 +12,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import ConfigurationError, OmplConfig, load_and_validate_system_config, validate_system_config
-from planning.factory import PlannerFactory
+from planning.planner_factory import PlannerFactory
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 

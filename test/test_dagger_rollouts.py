@@ -36,26 +36,18 @@ PREDICTION_HORIZON = 2  # the chunk length of the fake system's labels (and of t
 
 
 class _FakeSimulator:
-    """Minimal 1-D stand-in exercising only what collect_dagger_rollouts needs.
+    """Minimal 1-D stand-in exercising only what collect_dagger_rollouts needs."""
 
-    ``predict_next_state`` (used for the pre-execution safety checks) and
-    ``step`` (the actual transition) are allowed to diverge via
-    ``first_step_disturbance``, so a test can force the real, post-execution
-    collision path distinctly from the raw-expert-label collision path.
-    """
-
-    def __init__(self, collision_threshold: float, goal_threshold: float, done_hold_steps: int = 1) -> None:
+    def __init__(self, collision_threshold: float = 1e9, goal_threshold: float = 1.0, done_hold_steps: int = 1) -> None:
         self.goal = np.array([0.0], dtype=float)
         self.nx = 1
         self.n = 1
         self.dt = 0.05
         self.max_action = np.array([1e9], dtype=float)
-        self.collision_threshold = collision_threshold
         self.goal_threshold = goal_threshold
         self.done_hold_steps = done_hold_steps
         self.state: np.ndarray | None = None
         self.step_call_count = 0
-        self.first_step_disturbance = 0.0
         self._rollout_done_counter = 0
 
     @property
@@ -90,13 +82,7 @@ class _FakeSimulator:
 
     def step(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
         self.step_call_count += 1
-        next_state = self.predict_next_state(state, action)
-        if self.step_call_count == 1:
-            next_state = next_state + self.first_step_disturbance
-        return next_state
-
-    def is_collision(self, state: np.ndarray) -> bool:
-        return bool(np.asarray(state, dtype=float)[0] >= self.collision_threshold)
+        return self.predict_next_state(state, action)
 
     def is_done(self, state: np.ndarray) -> bool:
         return bool(np.asarray(state, dtype=float)[0] >= self.goal_threshold)
@@ -149,22 +135,9 @@ class _FakePlantPlanner(Planner):
         raise NotImplementedError
 
 
-class _ScriptedPlanner(_FakePlantPlanner):
-    """Plans an unsafe (colliding) action on its first call, then a safe one afterwards."""
-
-    def __init__(self, unsafe_action: list[float], safe_action: list[float]) -> None:
-        super().__init__()
-        self.unsafe_action = np.asarray(unsafe_action, dtype=float)
-        self.safe_action = np.asarray(safe_action, dtype=float)
-
-    def _action_of_call(self) -> np.ndarray:
-        return self.unsafe_action if self.call_count == 1 else self.safe_action
-
-
 class _FailThenSucceedPlanner(_FakePlantPlanner):
     """Raises PlannerSolveError (a genuine solve failure) on its first call, then
-    plans a constant safe action -- unlike _ScriptedPlanner, which always
-    successfully solves but plans an action that's unsafe to execute."""
+    plans a constant safe action."""
 
     def __init__(self, safe_action: list[float]) -> None:
         super().__init__()
@@ -174,6 +147,20 @@ class _FailThenSucceedPlanner(_FakePlantPlanner):
         if self.call_count == 1:
             raise PlannerSolveError("forced solver failure for test")
         return self.safe_action
+
+
+class _FailOnCallPlanner(_FakePlantPlanner):
+    """Raises PlannerSolveError on the specified call number(s), otherwise plans a constant action."""
+
+    def __init__(self, action: list[float], fail_calls: set[int]) -> None:
+        super().__init__()
+        self.action = np.asarray(action, dtype=float)
+        self.fail_calls = fail_calls
+
+    def _action_of_call(self) -> np.ndarray:
+        if self.call_count in self.fail_calls:
+            raise PlannerSolveError("forced solver failure for test")
+        return self.action
 
 
 class _ConstantPlanner(_FakePlantPlanner):
@@ -211,19 +198,6 @@ class _AlwaysFailingPlanner(_FakePlantPlanner):
 
     def _action_of_call(self) -> np.ndarray:
         raise PlannerSolveError("forced solver failure for test")
-
-
-class _FirstCallCollidesPolicy:
-    """A learner whose first action drives the fake simulator into collision and whose later ones are safe."""
-
-    def __init__(self, colliding_action: list[float], safe_action: list[float]) -> None:
-        self.colliding_action = np.asarray(colliding_action, dtype=float)
-        self.safe_action = np.asarray(safe_action, dtype=float)
-        self.call_count = 0
-
-    def __call__(self, observation: np.ndarray) -> np.ndarray:
-        self.call_count += 1
-        return (self.colliding_action if self.call_count == 1 else self.safe_action).copy()
 
 
 def _collect(simulator, planner, writer, *, trajectories=1, steps=3, beta=1.0, policy_action_fn=None, initial_states=None):
@@ -297,42 +271,6 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
     retry is recognisable by its start state and by the number of planner calls.
     """
 
-    def test_unsafe_expert_label_drops_the_episode_and_the_retry_is_saved(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
-        planner = _ScriptedPlanner(unsafe_action=[100.0], safe_action=[1.0])
-        writer = _FakeDatasetWriter()
-
-        metrics, output = _collect(simulator, planner, writer, initial_states=[[0.0]])
-
-        self.assertEqual(metrics.num_episodes, 1)
-        self.assertEqual(metrics.success_rate, 1.0)
-        self.assertEqual(planner.call_count, 2)  # the dropped attempt and the retry
-        self.assertEqual(planner.reset_count, 2)
-        # Nothing of the dropped attempt reaches the dataset, and the retry starts elsewhere than [0.0]
-        self.assertEqual(len(writer.frames), 1)
-        _assert_label_is_the_plan_of_one_step(self, writer.frames[0], 1.0)
-        self.assertNotEqual(writer.frames[0]["observation"], [0.0])
-        self.assertEqual(writer.episode_boundaries, [1])
-        self.assertIn("Unsafe expert corrective label", output)
-        self.assertIn("Discarding DAgger episode", output)
-
-    def test_post_execution_collision_drops_the_episode_and_the_retry_is_saved(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
-        simulator.first_step_disturbance = 20.0  # only the very first .step() call collides
-        planner = _ConstantPlanner(action=[1.0])
-        writer = _FakeDatasetWriter()
-
-        metrics, output = _collect(simulator, planner, writer, initial_states=[[0.0]])
-
-        self.assertEqual(metrics.num_episodes, 1)
-        self.assertEqual(simulator.step_call_count, 2)
-        self.assertEqual(planner.reset_count, 2)
-        self.assertEqual(len(writer.frames), 1)
-        self.assertNotEqual(writer.frames[0]["observation"], [0.0])
-        self.assertEqual(writer.episode_boundaries, [1])
-        self.assertIn("DAgger rollout collision", output)
-        self.assertIn("Discarding DAgger episode", output)
-
     def test_planner_solve_failure_drops_the_episode_and_the_retry_is_saved(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
         planner = _FailThenSucceedPlanner(safe_action=[1.0])
@@ -353,13 +291,11 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         )
 
     def test_frames_of_a_dropped_episode_are_never_written_even_after_several_good_steps(self) -> None:
-        # The collision happens on step 3: the two collected frames before it must be dropped with the episode
+        # The planner fails on step 3 of every attempt (calls 3, 6, 9): the two collected frames before it must be dropped
         simulator = _FakeSimulator(collision_threshold=2.5, goal_threshold=100.0)
-        planner = _ConstantPlanner(action=[1.0])  # state 0 -> 1 -> 2 -> 3 (collides) from the first start
+        planner = _FailOnCallPlanner(action=[1.0], fail_calls={3, 6, 9})
         writer = _FakeDatasetWriter()
 
-        # The retry starts from a sampled state in [-1, 1], which also reaches the collision threshold
-        # eventually, so bound the attempts: every episode here collides and the run has to give up.
         with self.assertRaisesRegex(RuntimeError, "Too many failed DAgger rollout attempts"):
             _collect(simulator, planner, writer, steps=5, initial_states=[[0.0]])
 
@@ -378,21 +314,27 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual(writer.frames, [])
 
     def test_dropped_policy_steps_are_not_counted_in_the_execution_mixing_stats(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
-        planner = _ConstantPlanner(action=[0.5])
-        policy = _FirstCallCollidesPolicy(colliding_action=[100.0], safe_action=[0.4])
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=0.7)
+        # First attempt: step 1 succeeds (state 0.0 -> 0.4), step 2 planner fails -> attempt dropped.
+        # Second attempt: starts at 0.5, step 1 (0.5 -> 0.9 >= 0.7) reaches goal in 1 step!
+        planner = _FailOnCallPlanner(action=[0.5], fail_calls={2})
+        policy_calls = 0
+
+        def policy(observation: np.ndarray) -> np.ndarray:
+            nonlocal policy_calls
+            policy_calls += 1
+            return np.array([0.4])
+
         writer = _FakeDatasetWriter()
 
-        # beta = 0: every executed action comes from the policy; its first one collides, so that episode is dropped
         metrics, output = _collect(
-            simulator, planner, writer, beta=0.0, policy_action_fn=policy, initial_states=[[0.0]]
+            simulator, planner, writer, beta=0.0, policy_action_fn=policy, initial_states=[[0.0], [0.5]]
         )
 
         self.assertEqual(metrics.num_episodes, 1)
-        self.assertEqual(policy.call_count, 2)
+        self.assertEqual(policy_calls, 2)
         self.assertIn("realized_expert_fraction=0.000", output)
         self.assertIn("executed_steps=1", output)  # only the retry's step, not the dropped episode's
-        self.assertIn("actor=policy", output)
         # The dataset carries the expert's relabelled plan (a step of 0.5), not what the policy executed (0.4)
         _assert_label_is_the_plan_of_one_step(self, writer.frames[0], 0.5)
 
@@ -434,18 +376,6 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual(writer.episode_boundaries, [3])
         self.assertEqual(planner.reset_count, 1)
         self.assertNotIn("Discarding DAgger episode", output)
-
-    def test_colliding_initial_state_is_skipped_and_the_next_attempt_is_saved(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
-        planner = _ConstantPlanner(action=[1.0])
-        writer = _FakeDatasetWriter()
-
-        metrics, output = _collect(simulator, planner, writer, initial_states=[[50.0]])
-
-        self.assertEqual(metrics.num_episodes, 1)
-        self.assertIn("Skipping DAgger episode due to colliding initial state", output)
-        self.assertEqual(planner.reset_count, 1)  # the skipped start never reached the planner
-        self.assertNotEqual(writer.frames[0]["observation"], [50.0])
 
     def test_initial_only_episode_still_randomizes_goal(self) -> None:
         """Regression guard: an explicit initial state without a paired goal must
@@ -637,38 +567,30 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
     alone can't distinguish.
     """
 
-    def test_collision_timeout_and_solve_failure_are_counted_separately(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1000.0)
+    def test_timeout_and_solve_failure_are_counted_separately(self) -> None:
+        simulator = _FakeSimulator(goal_threshold=1000.0)
 
         def action_fn(observation: np.ndarray) -> np.ndarray:
-            # Sentinel initial state [5.0] marks the solve_failure episode;
-            # everything else is a plain no-op action (never moves, so it
-            # can only time out or start already past the collision
-            # threshold).
             if float(np.asarray(observation)[0]) == 5.0:
                 raise PlannerSolveError("forced failure for test")
             return np.array([0.0])
 
         metrics = evaluate_policy_rollouts(
             simulator=simulator,
-            num_episodes=3,
+            num_episodes=2,
             num_steps=3,
             seed_start=0,
             action_fn=action_fn,
-            # goal_threshold=1000.0 means none of these ever reach the goal;
-            # no goal_states, so all 3 are sourced from this initial_states
-            # list, indexed 0/1/2 in order.
-            initial_states=[[15.0], [0.0], [5.0]],
+            initial_states=[[0.0], [5.0]],
         )
 
         assert metrics is not None
         self.assertEqual(metrics.success_rate, 0.0)
-        self.assertEqual(metrics.collision_failures, 1)
         self.assertEqual(metrics.timeout_failures, 1)
         self.assertEqual(metrics.solve_failures, 1)
 
     def test_successful_episodes_are_not_counted_as_any_failure(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=0.0)
+        simulator = _FakeSimulator(goal_threshold=0.0)
         metrics = evaluate_policy_rollouts(
             simulator=simulator,
             num_episodes=2,
@@ -679,38 +601,8 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         )
         assert metrics is not None
         self.assertEqual(metrics.success_rate, 1.0)
-        self.assertEqual(metrics.collision_failures, 0)
         self.assertEqual(metrics.timeout_failures, 0)
         self.assertEqual(metrics.solve_failures, 0)
-
-
-class RolloutCollisionTests(unittest.TestCase):
-    def test_a_rollout_collision_is_reported_and_the_episode_discarded(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
-        simulator.first_step_disturbance = 20.0  # only the very first .step() call collides
-        planner = _ConstantPlanner(action=[1.0])
-        writer = _FakeDatasetWriter()
-
-        stdout = io.StringIO()
-        with contextlib.redirect_stdout(stdout):
-            collect_dagger_rollouts(
-                simulator=simulator,
-                expert_planner=planner,
-                dataset_writer=writer,
-                trajectories_per_iteration=1,
-                steps_per_trajectory=2,
-                action_noise_std=0.0,
-                action_noise_seed=0,
-                initial_state_seed=0,
-                expert_mixing_beta=1.0,
-                prediction_horizon=PREDICTION_HORIZON,
-                policy_action_fn=None,
-                frame_builder=_frame_builder,
-                initial_states=[[0.0]],
-                goal_states=None,
-            )
-
-        self.assertIn("DAgger rollout collision (attempt=1, step=1, actor=expert).", stdout.getvalue())
 
 
 class ApplyExecutionNoiseTests(unittest.TestCase):
@@ -943,7 +835,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         # The first episode is sourced from the explicit initial state/goal pose, the second from
         # the simulator's own random sampling.
         self.assertEqual((metrics.config_num_episodes, metrics.random_num_episodes), (1, 1))
-        failures = metrics.collision_failures + metrics.timeout_failures + metrics.solve_failures
+        failures = metrics.timeout_failures + metrics.solve_failures
         self.assertEqual(failures + round(metrics.success_rate * metrics.num_episodes), metrics.num_episodes)
         self.assertGreaterEqual(len(actions), 2)
         for action in actions:
