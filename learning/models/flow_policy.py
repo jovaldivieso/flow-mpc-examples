@@ -40,23 +40,13 @@ class FlowPolicy(ActionPolicy):
         )
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        """Load a checkpoint from either a bare FlowPolicy or a
-        SafeFlowMPCPolicy-wrapped one.
-
-        'flow' and 'safeflow' are treated as interchangeable checkpoint types
-        (see scripts/evaluate_policy.py's _POLICY_TYPE_EQUIVALENCE): a
-        SafeFlowMPCPolicy checkpoint's keys are all prefixed with
-        ``inner_policy.`` (ordinary nn.Module submodule nesting), so that
-        prefix is stripped here too -- otherwise evaluating such a checkpoint
-        with ``--policy-type flow`` would fail on missing/unexpected keys.
-        """
+        """Load a checkpoint from either a bare FlowPolicy or a SafeFlowMPCPolicy wrapper."""
         normalized_state_dict = {}
         for key, value in state_dict.items():
             if key.startswith("inner_policy."):
                 key = key[len("inner_policy.") :]
             elif key.startswith("projector."):
                 continue
-            # Checkpoints trained while the network was wrapped in torch.compile carry this infix
             key = key.replace("._orig_mod.", ".")
             normalized_state_dict[key] = value
         return super().load_state_dict(normalized_state_dict, strict=strict, assign=assign)
