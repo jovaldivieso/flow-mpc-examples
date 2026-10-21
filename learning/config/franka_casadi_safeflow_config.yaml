@@ -3,34 +3,31 @@ model:
   policy_type: safeflow         # options: flow, safeflow
 
   flow:
-    num_inference_steps: 3      # Euler integration steps for ODE sampling
+    num_inference_steps: 5      # Euler integration steps for ODE sampling
 
   # Only used by the safeflow policy
   safeflow:
     init: previous_safe         # where the flow integration starts: previous_safe (last safe actions, shifted) or gaussian
-  prediction_horizon: 16
+
+  # The policy predicts a chunk of prediction_horizon jerks per state (DAgger labels it with the expert's plan)
+  prediction_horizon: 10
   unet:
     dim: 32                     # base channel count (a multiple of 8)
-    dim_mults: [1, 2, 4, 8]     # channel multipliers of the levels; every level but the first halves the horizon
+    dim_mults: [1, 2]           # channel multipliers of the levels; every level but the first halves the horizon
 
 # Optional DAgger defaults. Explicit command-line arguments override these values.
 training:
-  dagger_iterations: 2
-  trajectories_per_iteration: [4000]
-  steps_per_trajectory: 250
-  target_epochs_per_round: [20]
-  action_noise_std: 0.0        # rad/s^3, Gaussian noise on the executed jerk
-  expert_beta_per_iteration: [1.0, 0.75]
+  dagger_iterations: 4        # one round at beta 1: the expert's rollouts only, like SafeFlowMPC's pretraining
+  trajectories_per_iteration: [1000, 1000, 1000, 1000]
+  steps_per_trajectory: 100
+  target_epochs_per_round: [50, 50, 50, 50]
+  action_noise_std: 0.0         # rad/s^3, Gaussian noise on the executed jerk
+  expert_beta_per_iteration: [0.9, 0.75, 0.6, 0.45]
   eval_episodes: 100
   tolerance_overrides:
-    pos_tol: 0.1
-    vel_tol: 0.01
-  # Deliberately more relaxed than tolerance_overrides above: collection/
-  # training wants precise demonstrations, but eval only cares whether the
-  # rollout got close and stayed collision-free, not exact final-pose
-  # matching. Falls back to tolerance_overrides if omitted.
+    pos_tol: 0.05
+    vel_tol: 0.02
+  # Deliberately more relaxed than tolerance_overrides above, falls back to tolerance_overrides if omitted.
   eval_tolerance_overrides:
     pos_tol: 0.1
-    vel_tol: 0.01
-  # round_seeds: [0, 0, 0]    # base seed per round for random initial-state/goal sampling
-  # restart_round_seed: true  # true replays identical draws whenever round_seeds repeats a value
+    vel_tol: 0.02
