@@ -25,6 +25,7 @@ DEFAULT_MAX_VELOCITY = 1.0
 DEFAULT_MAX_ACCELERATION = 2.0
 DEFAULT_MAX_JERK = 10.0
 SAMPLING_ATTEMPTS = 256
+COLLISION_BUFFER = 0.005  # [m] linearization safety margin for half-space obstacle constraints
 
 
 class TripleIntegratorSystem(SystemSimulator):
@@ -90,6 +91,10 @@ class TripleIntegratorSystem(SystemSimulator):
         self.min_start_goal_distance = float(self.config.get("min_start_goal_distance", default_min_distance))
         self.pos_tol = float(self.config.get("pos_tol", default_pos_tol))
         self.vel_tol = float(self.config.get("vel_tol", default_vel_tol))
+        raw_obstacles = self.config.get("obstacles", []) or []
+        self.obstacles: list[tuple[np.ndarray, float]] = [
+            (np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in raw_obstacles
+        ]
 
     @property
     def rest_state_indices(self) -> tuple[int, ...]:
@@ -146,6 +151,50 @@ class TripleIntegratorSystem(SystemSimulator):
         transform[:3, 3] = self.tcp_position(goal)
         return transform
 
+    def collision_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bounding sphere centers (S, d), Jacobians (S, d, n), and radii (S,) at configuration ``q``."""
+        q_pos = np.asarray(q, dtype=float)[: self.n]
+        return q_pos[None, :], np.eye(self.n)[None, :, :], np.zeros(1)
+
+    def is_collision_free(self, q: np.ndarray) -> bool:
+        """True if no bounding sphere at configuration ``q`` penetrates any obstacle."""
+        if not self.obstacles:
+            return True
+        centers, _, radii = self.collision_spheres(np.asarray(q, dtype=float)[: self.n])
+        for obs_pos, obs_radius in self.obstacles:
+            if np.any(np.linalg.norm(centers - obs_pos[None, :], axis=1) < radii + obs_radius):
+                return False
+        return True
+
+    def collision_halfspaces(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Linearized half-spaces ``A @ q >= b`` keeping all robot spheres outside all obstacles along ``q_trajectory`` (H, n).
+
+        Returns ``A`` of shape ``(H, P, n)`` and ``b`` of shape ``(H, P)``, where ``P = num_spheres * num_obstacles``.
+        """
+        q_traj = np.asarray(q_trajectory, dtype=float)
+        horizon = len(q_traj)
+        if not self.obstacles:
+            return np.zeros((horizon, 0, self.n)), np.zeros((horizon, 0))
+        _, _, radii = self.collision_spheres(q_traj[0])
+        num_pairs = len(radii) * len(self.obstacles)
+        A = np.zeros((horizon, num_pairs, self.n), dtype=float)
+        b = np.zeros((horizon, num_pairs), dtype=float)
+        for k, q in enumerate(q_traj):
+            centers, jacobians, radii = self.collision_spheres(q)
+            pair = 0
+            for s in range(len(radii)):
+                p_s, J_s, r_s = centers[s], jacobians[s], radii[s]
+                for obs_pos, obs_radius in self.obstacles:
+                    diff = p_s - obs_pos
+                    dist = float(np.linalg.norm(diff))
+                    normal = diff / dist if dist > 1e-9 else np.eye(len(obs_pos))[0]
+                    clearance = dist - (r_s + obs_radius + COLLISION_BUFFER)
+                    a_vec = normal @ J_s
+                    A[k, pair] = a_vec
+                    b[k, pair] = float(a_vec @ q) - clearance
+                    pair += 1
+        return A, b
+
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
         """What the policy sees: the goal relative to the point, ``g - p``, and the velocity and acceleration. Nothing
         is in world coordinates, which the unbounded dynamics make irrelevant."""
@@ -187,8 +236,12 @@ class TripleIntegratorSystem(SystemSimulator):
         }
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
-        """Sample a random position/configuration inside the workspace or joint bounds."""
-        return rng.uniform(*self.workspace_bounds, size=self.n)
+        """Sample a random collision-free position/configuration inside the workspace or joint bounds."""
+        for _ in range(SAMPLING_ATTEMPTS):
+            q = rng.uniform(*self.workspace_bounds, size=self.n)
+            if self.is_collision_free(q):
+                return q
+        raise RuntimeError(f"Unable to sample a collision-free configuration in {SAMPLING_ATTEMPTS} attempts.")
 
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
         return self._sample_configuration(rng)

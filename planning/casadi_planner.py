@@ -21,30 +21,39 @@ PROXQP_OPTIONS: dict[str, Any] = {
 
 class CasadiPlanner(Planner):
     """
-    CasADi model predictive control (IPOPT) of the Franka arm in joint space.
+    CasADi model predictive control (ProxQP) in joint space.
 
-    ``plan`` solves the NLP below from the current state, returns the planned joint positions over the horizon and
-    keeps the solution as the warm start of the next call (shifted by one step). The caller executes the first step.
+    ``plan`` solves the quadratic program (QP) below from the current state, returns the planned joint positions over
+    the horizon, and keeps the solution ``(X, U, lam_g)`` as the primal-dual warm start of the next call.
 
-    Problem
-    -------
-    State (nx = 21)          x = [q, v, a]: joint positions, velocities and accelerations.
-    Action (nu = 7)          u: joint jerks.
-    Goal                     x_goal = [q_goal, 0, 0]: the goal configuration at rest (for a pose goal, its inverse
-                             kinematics solution nearest to the first state, kept for the whole episode).
-    Optimization variables   X = [x_0 .. x_N] (nx, N + 1) and U = [u_0 .. u_{N-1}] (nu, N), horizon N.
-    Parameters               x_init (the current state) and x_goal.
+    Problem (Direct Multiple Shooting, Horizon N)
+    ---------------------------------------------
+    State (nx = 3n)          x_k = [q_k, v_k, a_k]: joint positions, velocities, and accelerations.
+    Action (nu = n)          u_k = j_k: joint jerks.
+    Goal                     x_goal = [q_goal, 0, 0]: goal configuration at rest (from ``FrankaKinematics`` IK).
+    Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
+                             present) slack S = [s_1 .. s_N] (P, N) with P = n_spheres * n_obstacles.
+    Parameters               x_init, x_goal, and linearized obstacle half-spaces (A_coll, b_coll).
 
-    Cost                     J = sum_{k=0..N-1} (x_k - x_goal)^T Q (x_k - x_goal) + u_k^T R u_k
-                                 + alpha (x_N - x_goal)^T Q (x_N - x_goal)
-                             with Q = diag(``Q_diag``), R = diag(``R_diag``) and alpha = ``terminal_cost_multiplier``.
+    Cost                     min_{X, U, S}  sum_{k=0..N-1} ( ||x_k - x_goal||_Q^2 + ||u_k||_R^2 )
+                                            + alpha ||x_N - x_goal||_Q^2 + w_s ||S||_F^2
+                             with Q = diag(Q_diag), R = diag(R_diag), alpha = terminal_cost_multiplier, w_s = 10^5.
+
     Constraints              x_0 = x_init
-                             x_{k+1} = f(x_k, u_k)              triple integrator (``sim.casadi_dynamics``)
-                             -j_max <= u_k <= j_max             joint jerk limits
-                             x_lower <= x_k <= x_upper, k >= 1  joint position, velocity and acceleration limits
+                             x_{k+1} = A_d x_k + B_d u_k                 triple integrator (``sim.casadi_dynamics``)
+                             -u_max <= u_k <= u_max                      jerk limits, k = 0 .. N-1
+                             x_lower <= x_k <= x_upper                   position, velocity, acceleration limits, k = 1 .. N
+                             A_coll,k q_k + s_k >= b_coll,k,  s_k >= 0   linearized sphere-obstacle half-spaces, k = 1 .. N
 
-    A solve starts from ``initial_plan`` (a joint-position plan, e.g. a path from a global planner), else from the
-    previous solution shifted by one step, else from the current state held still.
+    Solver Choice (``Opti("conic")`` + ``proxqp``)
+    ----------------------------------------------
+    Because the triple-integrator dynamics, box limits, and 1st-order Taylor obstacle half-spaces
+    ``n^T J_s(q_ref,k) q_k >= b_k`` are all affine in ``(X, U, S)`` and the cost is convex quadratic, CasADi transcribes
+    the problem into a sparse conic QP (``1/2 w^T H w + g^T w`` s.t. ``a_low <= A w <= a_high``) solved by **ProxQP**
+    (augmented-Lagrangian primal-dual QP solver). Expanding the mapped ``SX`` graph (``expand: True``) and warm-starting
+    ``(X, U, lam_g)`` keeps each solve around 1--5 ms (vs. 50--100 ms for an interior-point NLP solver like IPOPT).
+    If the first QP pass penetrates a spherical obstacle, one SQP re-linearization pass around the solved trajectory
+    refines the half-spaces.
     """
 
     def _resolve_r_diag(self, config: Mapping[str, Any]) -> np.ndarray:
@@ -126,7 +135,29 @@ class CasadiPlanner(Planner):
             ca.sum1(ca.mtimes(self.R, self.U) * self.U)
         )
         terminal = ca.mtimes(error[:, -1].T, ca.mtimes(self.Q * self.terminal_cost_multiplier, error[:, -1]))
-        self.opti.minimize(running + terminal)
+        total_cost = running + terminal
+
+        # Linearized spherical-obstacle half-space constraints A_coll @ q_k + slack >= b_coll at nodes 1 .. N
+        obstacles = getattr(self.sim, "obstacles", [])
+        if obstacles:
+            _, _, radii = self.sim.collision_spheres(np.zeros(self.n_joints))
+            self.num_collision_pairs = len(radii) * len(obstacles)
+        else:
+            self.num_collision_pairs = 0
+
+        if self.num_collision_pairs > 0:
+            P = self.num_collision_pairs
+            self.A_coll = self.opti.parameter(P * self.N, self.n_joints)
+            self.b_coll = self.opti.parameter(P * self.N)
+            self.slack = self.opti.variable(P * self.N)
+            self.opti.subject_to(self.slack >= 0.0)
+            lhs = ca.vertcat(
+                *[ca.mtimes(self.A_coll[k * P : (k + 1) * P, :], self.X[: self.n_joints, k + 1]) for k in range(self.N)]
+            )
+            self.opti.subject_to(lhs + self.slack >= self.b_coll)
+            total_cost = total_cost + 1e5 * ca.sumsqr(self.slack)
+
+        self.opti.minimize(total_cost)
         self.opti.solver("proxqp", PROXQP_OPTIONS)
 
     def reset(self) -> None:
@@ -138,6 +169,8 @@ class CasadiPlanner(Planner):
         self.goal_configuration = None
         self.opti.set_initial(self.X, 0.0)
         self.opti.set_initial(self.U, 0.0)
+        if self.num_collision_pairs > 0:
+            self.opti.set_initial(self.slack, 0.0)
         # set_initial(..., lam_g, ...) is sticky on the Opti object: without this the first solve of the new episode
         # would warm start from the final multipliers of the previous, unrelated one.
         self.opti.set_initial(self.opti.lam_g, 0.0)
@@ -176,30 +209,41 @@ class CasadiPlanner(Planner):
         """The configuration of the goal nearest to the current one."""
         return goal_configuration(self.sim, self._goal, x0[: self.n_joints])
 
+    def _update_collision_halfspaces(self, q_ref: np.ndarray) -> None:
+        """Linearize obstacle half-spaces along ``q_ref`` (N, n_joints)."""
+        if self.num_collision_pairs > 0:
+            A, b = self.sim.collision_halfspaces(q_ref)
+            self.opti.set_value(self.A_coll, A.reshape(-1, self.n_joints))
+            self.opti.set_value(self.b_coll, b.reshape(-1))
+
     def _solve(self, x0: np.ndarray, initial_plan: Plan | None) -> None:
         """Solve the NLP from ``x0`` and keep the solution."""
         self.opti.set_value(self.x0_param, x0)
         self.opti.set_value(self.goal_param, np.concatenate([self.goal_configuration, np.zeros(2 * self.n_joints)]))
 
         if initial_plan is not None:
-            self._set_initial(*self._states_through(x0, initial_plan))
+            states_guess, actions_guess = self._states_through(x0, initial_plan)
         elif self.last_X_sol is not None:
-            self._set_initial(
-                np.hstack([self.last_X_sol[:, 1:], self.last_X_sol[:, -1:]]),
-                np.hstack([self.last_U_sol[:, 1:], self.last_U_sol[:, -1:]]),
-            )
+            states_guess = np.hstack([self.last_X_sol[:, 1:], self.last_X_sol[:, -1:]])
+            actions_guess = np.hstack([self.last_U_sol[:, 1:], self.last_U_sol[:, -1:]])
         else:
-            self._set_initial(*self._states_through(x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1)))))
+            states_guess, actions_guess = self._states_through(
+                x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1)))
+            )
+        self._set_initial(states_guess, actions_guess)
+        self._update_collision_halfspaces(states_guess[: self.n_joints, 1:].T)
         if self._prev_lam_g is not None:
             self.opti.set_initial(self.opti.lam_g, self._prev_lam_g)
 
         try:
             sol = self.opti.solve()
         except RuntimeError:
-            # A warm start can leave IPOPT stuck at a locally infeasible point once the actual state has drifted from
+            # A warm start can leave the solver stuck at a locally infeasible point once the actual state has drifted from
             # what the previous solve predicted (execution noise, or during DAgger the actions of a still untrained
             # policy). A cold restart from the current state held still resolves far more of those than giving up.
-            self._set_initial(*self._states_through(x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1)))))
+            cold_states, cold_actions = self._states_through(x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1))))
+            self._set_initial(cold_states, cold_actions)
+            self._update_collision_halfspaces(cold_states[: self.n_joints, 1:].T)
             self.opti.set_initial(self.opti.lam_g, 0.0)
             try:
                 sol = self.opti.solve()
@@ -208,6 +252,17 @@ class CasadiPlanner(Planner):
                     "CasADi planner solve failed (both warm-started and cold-restarted). "
                     f"Current state estimate: {x0.tolist()}, goal configuration: {self.goal_configuration.tolist()}."
                 ) from exc
+
+        if self.num_collision_pairs > 0:
+            X_first = sol.value(self.X)
+            if not all(self.sim.is_collision_free(X_first[: self.n_joints, k]) for k in range(1, self.N + 1)):
+                self._set_initial(X_first, sol.value(self.U))
+                self._update_collision_halfspaces(X_first[: self.n_joints, 1:].T)
+                self.opti.set_initial(self.opti.lam_g, sol.value(self.opti.lam_g))
+                try:
+                    sol = self.opti.solve()
+                except RuntimeError:
+                    pass
 
         self.last_X_sol = sol.value(self.X)
         self.last_U_sol = sol.value(self.U)

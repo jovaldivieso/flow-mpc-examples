@@ -31,7 +31,7 @@ from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
 from .evaluate_policy import load_policy
-from .meshcat_utils import action_tcp_points, draw_frame, draw_plan
+from .meshcat_utils import action_tcp_points, draw_frame, draw_obstacles, draw_plan
 
 POLICY_COLOR = 0x00D0FF
 EXPERT_COLOR = 0x20D040
@@ -79,6 +79,9 @@ def rollout_policy(
         chunks.append(chunk)
         state = dyn.step(state, chunk[0])
         states.append(state.copy())
+        if not dyn.is_collision_free(state):
+            outcome = "collision"
+            break
         if dyn.should_terminate_rollout(state):
             outcome = "reached"
             break
@@ -146,6 +149,7 @@ def main() -> None:
         viz.viewer["point"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0x2060FF))
         viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
         show = lambda state: viz.viewer["point"].set_transform(tf.translation_matrix(dyn.tcp_position(state[: dyn.n])))
+    draw_obstacles(viz, dyn.obstacles)
     print("Playing the rollouts in a loop (Ctrl+C to stop): goal frame/ball = goal TCP, cyan line = the policy's chunk"
           + (", green line = the expert's plan from the same state" if args.show_expert else ""))
     try:

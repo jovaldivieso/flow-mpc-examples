@@ -28,7 +28,7 @@ from pinocchio.visualize import MeshcatVisualizer
 from planning.config import load_and_validate_system_config
 from systems.franka_system import FrankaSystem
 
-from .meshcat_utils import draw_frame, draw_plan, draw_tcp_paths, plan_tcp_points
+from .meshcat_utils import draw_frame, draw_obstacles, draw_plan, draw_tcp_paths, plan_tcp_points
 
 PLAN_COLOR = 0x00D0FF
 # A frame whose labelled plan stays within this many rad of the current configuration is a "stay" label
@@ -174,6 +174,7 @@ def main() -> None:
     viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
     viz.initViewer(open=True)
     viz.loadViewerModel()
+    draw_obstacles(viz, dyn.obstacles)
     if args.overview:
         show_overview(viz, dyn, episodes, args.success_tol)
     episodes = played

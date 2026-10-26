@@ -53,9 +53,13 @@ class OmplPlanner(Planner):
         lower, upper = self.sim.path_lower, self.sim.path_upper
         if np.any(q_start < lower) or np.any(q_start > upper):
             raise PlannerSolveError("OMPL: the start configuration is out of bounds.")
+        if getattr(self.sim, "obstacles", []) and not self.sim.is_collision_free(q_start):
+            raise PlannerSolveError("OMPL: the start configuration is in collision.")
         q_goal = goal_configuration(self.sim, observation[: self.sim.goal_dim], q_start)
         if np.any(q_goal < lower) or np.any(q_goal > upper):
             raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
+        if getattr(self.sim, "obstacles", []) and not self.sim.is_collision_free(q_goal):
+            raise PlannerSolveError("OMPL: the goal configuration is in collision.")
         path = self._connect(q_start, [q_goal], lower, upper)
         path[0] = q_start
         return Plan(positions=self._timed(path))
@@ -83,7 +87,17 @@ class OmplPlanner(Planner):
             bounds.setHigh(joint, float(upper[joint]))
         space.setBounds(bounds)
         space_information = ob.SpaceInformation(space)
-        space_information.setStateValidityChecker(lambda state: space_information.satisfiesBounds(state))
+        has_obstacles = bool(getattr(self.sim, "obstacles", []))
+
+        def is_valid(state: ob.State) -> bool:
+            if not space_information.satisfiesBounds(state):
+                return False
+            if not has_obstacles:
+                return True
+            q = np.array([state[joint] for joint in range(self.n_joints)], dtype=float)
+            return self.sim.is_collision_free(q)
+
+        space_information.setStateValidityChecker(is_valid)
         space_information.setStateValidityCheckingResolution(VALIDITY_RESOLUTION)
         space_information.setup()
 

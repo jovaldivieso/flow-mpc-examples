@@ -55,3 +55,15 @@ def draw_tcp_paths(viz, paths: list[np.ndarray], goals: list[np.ndarray], reache
         cloud = np.array(points).T
         colors_ = np.tile(np.array(color)[:, None], (1, cloud.shape[1]))
         viz.viewer[name].set_object(g.Points(g.PointsGeometry(cloud, color=colors_), g.PointsMaterial(size=size)))
+
+
+def draw_obstacles(viz, obstacles: list[tuple[np.ndarray, float]]) -> None:
+    """Draw spherical obstacles ``[(position, radius), ...]`` in translucent red at ``viz.viewer["obstacles"]``."""
+    viz.viewer["obstacles"].delete()
+    for i, (position, radius) in enumerate(obstacles):
+        pos_3d = np.pad(np.asarray(position, dtype=float)[:3], (0, max(0, 3 - len(position))))
+        viz.viewer["obstacles"][str(i)].set_object(
+            g.Sphere(float(radius)),
+            g.MeshLambertMaterial(color=0xE03030, opacity=0.5),
+        )
+        viz.viewer["obstacles"][str(i)].set_transform(tf.translation_matrix(pos_3d))

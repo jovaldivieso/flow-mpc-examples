@@ -36,8 +36,35 @@ def _homogeneous(placement: pin.SE3) -> ca.DM:
 
 
 class FrankaKinematics:
-    """Forward kinematics ``fk(q) -> (position, rotation)`` of a frame of a serial chain of revolute joints about
-    their X, Y or Z axes, and the IK solver of its pose."""
+    """
+    CasADi forward kinematics, link bounding spheres, and inverse kinematics (IPOPT) of the FR3 arm.
+
+    Built once from the reduced Pinocchio model (see ``franka_kinematics``) for a serial chain of revolute joints
+    about their X, Y, or Z axes.
+
+    Exports
+    -------
+    - ``fk(q) -> (p, R)``: TCP position ``p`` (3,) and rotation matrix ``R`` (3, 3) as a symbolic-friendly ``SX`` function.
+    - ``collision_spheres(q) -> (centers, jacobians, radii)``: centers (S, 3), analytical position Jacobians
+      ``J_s = dp_s/dq`` (S, 3, n), and radii (S,) of the 7 link bounding spheres.
+    - ``inverse_kinematics(p_d, R_d, q_init) -> q``: solves the nonlinear program (NLP) below from ``q_init``.
+
+    Problem (Inverse Kinematics NLP)
+    --------------------------------
+    Decision variable        q in R^n (n = 7): joint angles.
+    Parameters               p_d in R^3 (target TCP position), R_d in SO(3) (target TCP rotation matrix).
+
+    Cost                     min_q  ||p(q) - p_d||_2^2 + ||R(q) R_d^T - I_3||_F^2
+    Constraints              q_lower <= q <= q_upper            joint position limits
+
+    Solver Choice (``nlpsol`` + ``ipopt``)
+    --------------------------------------
+    Forward kinematics ``p(q), R(q)`` is a product of trigonometric joint transforms, making the pose residual
+    non-convex in ``q``. Because there is only one 7-D decision variable ``q`` with simple box bounds and no general
+    constraints, the problem is formulated directly on the ``SX`` kinematics graph via ``ca.nlpsol("ik", "ipopt", ...)``
+    (interior-point NLP solver) without ``Opti`` wrapper state, allowing a single stateless solver instance to be shared
+    across all simulators.
+    """
 
     def __init__(self, model: pin.Model, frame_id: int) -> None:
         frame = model.frames[frame_id]
@@ -48,13 +75,31 @@ class FrankaKinematics:
 
         q = ca.SX.sym("q", self.n)
         transform = ca.SX.eye(4)
+        joint_origins: list[ca.SX] = []
         for joint in range(1, model.njoints):
             axis = model.joints[joint].shortname()[-1]
             if model.joints[joint].shortname() != f"JointModelR{axis}":
                 raise ValueError(f"Joint {model.names[joint]} is not a revolute joint about a coordinate axis.")
             transform = transform @ _homogeneous(model.jointPlacements[joint]) @ _axis_rotation(axis, q[model.joints[joint].idx_q])
+            joint_origins.append(transform[:3, 3])
         transform = transform @ _homogeneous(frame.placement)
-        self.fk = ca.Function("fk", [q], [transform[:3, 3], transform[:3, :3]])
+        tcp_origin = transform[:3, 3]
+        self.fk = ca.Function("fk", [q], [tcp_origin, transform[:3, :3]])
+
+        # Bounding spheres covering the moving links of the FR3 (upper arm, elbow, forearm, wrist, hand, TCP)
+        sphere_centers = [
+            joint_origins[2],
+            joint_origins[3],
+            0.5 * (joint_origins[3] + joint_origins[4]),
+            joint_origins[5],
+            joint_origins[6],
+            0.5 * (joint_origins[6] + tcp_origin),
+            tcp_origin,
+        ]
+        self.sphere_radii = np.array([0.06, 0.07, 0.06, 0.06, 0.06, 0.07, 0.05], dtype=float)
+        centers_mat = ca.vertcat(*[c.T for c in sphere_centers])
+        jacobians_mat = ca.vertcat(*[ca.jacobian(c, q) for c in sphere_centers])
+        self._spheres_fn = ca.Function("spheres", [q], [centers_mat, jacobians_mat])
 
         position_goal, rotation_goal = ca.SX.sym("p_d", 3), ca.SX.sym("R_d", 3, 3)
         position, rotation = self.fk(q)
@@ -65,6 +110,12 @@ class FrankaKinematics:
 
     def __deepcopy__(self, memo: dict) -> FrankaKinematics:
         return self  # immutable once built, so the copies of a simulator share it
+
+    def collision_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bounding sphere centers (S, 3), position Jacobians (S, 3, n), and radii (S,) at configuration ``q``."""
+        centers, jacobians = self._spheres_fn(q)
+        s = len(self.sphere_radii)
+        return np.array(centers, dtype=float), np.array(jacobians, dtype=float).reshape(s, 3, self.n), self.sphere_radii
 
     def inverse_kinematics(self, position: np.ndarray, rotation: np.ndarray, q_init: np.ndarray) -> np.ndarray:
         """The configuration of the TCP pose, found by IPOPT from ``q_init`` (which is returned as it is if it already

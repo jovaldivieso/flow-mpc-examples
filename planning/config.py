@@ -208,6 +208,7 @@ COMMON_KEYS = OmplConfig.keys() | {
     "min_start_goal_distance",
     "pos_tol",
     "vel_tol",
+    "obstacles",
 }
 SYSTEM_KEYS = {
     "franka": set(),
@@ -279,6 +280,28 @@ def _tolerances(raw_config: Mapping[str, Any], pos_tol: float, vel_tol: float) -
     return tolerances
 
 
+def _obstacles(raw_config: Mapping[str, Any], dimension: int) -> list[dict[str, Any]]:
+    """Spherical obstacles: each entry has ``position`` (length ``dimension``) and a positive ``radius``."""
+    raw = raw_config.get("obstacles", [])
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigurationError(f"'obstacles' must be a list of mappings, got {type(raw).__name__}.")
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, Mapping):
+            raise ConfigurationError(f"'obstacles[{idx}]' must be a mapping, got {type(item).__name__}.")
+        _require_only_known_keys(item, {"position", "radius"}, context=f"'obstacles[{idx}]'")
+        if "position" not in item or "radius" not in item:
+            raise ConfigurationError(f"'obstacles[{idx}]' must define 'position' and 'radius'.")
+        pos = _vector(item, "position", dimension, ())
+        radius = _float(item, "radius", 0.0)
+        if radius <= 0:
+            raise ConfigurationError(f"'obstacles[{idx}].radius' must be positive.")
+        out.append({"position": list(pos), "radius": radius})
+    return out
+
+
 def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     """The fields of the arm: limits, tolerances, sampling and goal."""
     min_start_goal_distance = _float(raw_config, "min_start_goal_distance", 0.25)
@@ -290,6 +313,7 @@ def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "min_start_goal_distance": min_start_goal_distance,
         "max_acceleration": list(_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS)),
         "max_jerk": list(_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS)),
+        "obstacles": _obstacles(raw_config, 3),
         **_tolerances(raw_config, 0.03, 0.05),
     }
     if "goal" in raw_config:
@@ -320,6 +344,7 @@ def _triple_integrator_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "max_velocity": list(_limits(raw_config, "max_velocity", 1.0, dimension)),
         "max_acceleration": list(_limits(raw_config, "max_acceleration", 2.0, dimension)),
         "max_jerk": list(_limits(raw_config, "max_jerk", 10.0, dimension)),
+        "obstacles": _obstacles(raw_config, dimension),
         **_tolerances(raw_config, 0.02, 0.02),
     }
     if "goal" in raw_config:

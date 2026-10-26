@@ -325,6 +325,23 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CasadiTrajectoryProjector(self.simulator, self.config, horizon=0)
 
+    def test_projector_pushes_an_obstacle_colliding_proposal_outside_the_sphere(self) -> None:
+        state = _rest_state(self.simulator)
+        proposal = _moving_chunk()
+        rollout_q = self.simulator.rollout_positions(state, proposal)
+        target_tcp = self.simulator.tcp_position(rollout_q[-1]).tolist()
+
+        obs_config = _validated_config(obstacles=[{"position": target_tcp, "radius": 0.05}])
+        obs_sim = FrankaSystem(obs_config)
+        self.assertTrue(obs_sim.is_collision_free(state))
+        self.assertFalse(obs_sim.is_collision_free(rollout_q[-1]))
+
+        projector = CasadiTrajectoryProjector(obs_sim, obs_config, horizon=HORIZON)
+        projected = projector.project(obs_sim.observe(state), proposal)
+        projected_q = obs_sim.rollout_positions(state, projected)
+        for q in projected_q[1:]:
+            self.assertTrue(obs_sim.is_collision_free(q), "projected trajectory collided with obstacle")
+
 
 if __name__ == "__main__":
     unittest.main()

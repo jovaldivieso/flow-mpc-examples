@@ -13,9 +13,9 @@ acceleration and jerk limits from the config). No masses or torques: a joint tra
 follow the motion.
 
 The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. Start configurations
-are sampled well inside the joint limits, goals as the TCP pose of such a configuration, and there is no collision
-checking. The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the
-orientation is not tested (``goal_errors`` reports it).
+are sampled well inside the joint limits and free of spherical obstacles, goals as the TCP pose of such a configuration.
+The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the orientation is
+not tested (``goal_errors`` reports it).
 """
 
 import functools
@@ -205,6 +205,10 @@ class FrankaSystem(TripleIntegratorSystem):
         """The 4x4 homogeneous transform of the goal TCP pose."""
         return self.vector_pose(goal).homogeneous
 
+    def collision_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bounding sphere centers (S, 3), position Jacobians (S, 3, n), and radii (S,) at configuration ``q``."""
+        return self.kinematics.collision_spheres(np.asarray(q, dtype=float)[: self.n])
+
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray = Q_READY) -> np.ndarray:
         """The joint configuration of the ``goal`` pose: ``q_reference`` if it already is one, else the inverse
         kinematics solution from ``Q_READY`` (or the nearest to ``Q_READY`` from ``q_reference`` and random starts).
@@ -212,15 +216,16 @@ class FrankaSystem(TripleIntegratorSystem):
         pose = self.vector_pose(goal)
         q_ref = np.clip(q_reference, self.kinematics.lower, self.kinematics.upper)
         goal_vec = np.concatenate([pose.translation, pose.rotation.ravel(order="F")])
-        if float(self.kinematics._ik_cost(q_ref, goal_vec)) <= IK_TOLERANCE**2:
+        if float(self.kinematics._ik_cost(q_ref, goal_vec)) <= IK_TOLERANCE**2 and self.is_collision_free(q_ref):
             return q_ref
         if self._cached_goal is not None and np.array_equal(goal, self._cached_goal):
             return self._cached_q_goal.copy()
         for q_seed in (Q_READY, q_ref):
             try:
                 solution = self.kinematics.inverse_kinematics(pose.translation, pose.rotation, q_seed)
-                self._cached_goal, self._cached_q_goal = np.asarray(goal, dtype=float).copy(), solution.copy()
-                return solution
+                if self.is_collision_free(solution):
+                    self._cached_goal, self._cached_q_goal = np.asarray(goal, dtype=float).copy(), solution.copy()
+                    return solution
             except RuntimeError:
                 pass
         rng = np.random.default_rng(0)
@@ -228,7 +233,9 @@ class FrankaSystem(TripleIntegratorSystem):
         for _ in range(IK_ATTEMPTS):
             try:
                 q_start = rng.uniform(self.model.lowerPositionLimit, self.model.upperPositionLimit)
-                found.append(self.kinematics.inverse_kinematics(pose.translation, pose.rotation, q_start))
+                candidate = self.kinematics.inverse_kinematics(pose.translation, pose.rotation, q_start)
+                if self.is_collision_free(candidate):
+                    found.append(candidate)
             except RuntimeError:
                 continue
             if len(found) == IK_SOLUTIONS:
@@ -274,6 +281,7 @@ class FrankaSystem(TripleIntegratorSystem):
                 and y_min <= tcp[1] <= y_max
                 and z_min <= tcp[2] <= z_max
                 and all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:])
+                and self.is_collision_free(q)
             ):
                 return q
         raise RuntimeError(f"Unable to sample an arm configuration in the workspace in {SAMPLING_ATTEMPTS} attempts.")

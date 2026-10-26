@@ -326,6 +326,32 @@ class InitialPlanTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     planner.plan(simulator.observe(state), Plan(positions=positions))
 
+    def test_closed_loop_mpc_detours_around_a_spherical_obstacle_between_start_and_goal(self) -> None:
+        # Place a sphere directly at the TCP position of the midpoint configuration between start and goal
+        q_start = Q_READY.copy()
+        q_start[0] = -0.45
+        q_goal = Q_READY.copy()
+        q_goal[0] = 0.45
+        mid_q = 0.5 * (q_start + q_goal)
+        sim_free, _, _ = _build()
+        obs_pos = sim_free.tcp_position(mid_q).tolist()
+
+        simulator, planner, _ = _build(
+            pos_tol=0.02,
+            vel_tol=0.05,
+            obstacles=[{"position": obs_pos, "radius": 0.06}],
+        )
+        simulator.set_goal(pose_goal(simulator, q_goal))
+        self.assertTrue(simulator.is_collision_free(q_start))
+        self.assertTrue(simulator.is_collision_free(q_goal))
+        self.assertFalse(simulator.is_collision_free(mid_q))
+
+        start_state = np.concatenate([q_start, np.zeros(2 * simulator.n)])
+        trajectory = simulator.simulate(start_state, lambda obs: planner.plan(obs).actions[0], num_steps=80)
+        for state in trajectory["states"]:
+            self.assertTrue(simulator.is_collision_free(state), "MPC collided with the spherical obstacle")
+        self.assertTrue(simulator.is_done(trajectory["states"][-1]), "MPC did not reach the goal around the obstacle")
+
 
 if __name__ == "__main__":
     unittest.main()

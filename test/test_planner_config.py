@@ -248,6 +248,28 @@ class ExpertConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config=raw_config)
 
+    def test_spherical_obstacles_are_validated(self) -> None:
+        raw_config = _load_raw_config()
+        raw_config.pop("obstacles", None)
+        self.assertEqual(validate_system_config(raw_config=raw_config)["obstacles"], [])
+
+        raw_config["obstacles"] = [{"position": [0.5, 0.0, 0.4], "radius": 0.08}]
+        validated = validate_system_config(raw_config=raw_config)
+        self.assertEqual(validated["obstacles"], [{"position": [0.5, 0.0, 0.4], "radius": 0.08}])
+
+        for bad_obstacles in (
+            [{"position": [0.5, 0.0], "radius": 0.08}],  # wrong position length
+            [{"position": [0.5, 0.0, 0.4], "radius": 0.0}],  # non-positive radius
+            [{"position": [0.5, 0.0, 0.4], "radius": -0.1}],
+            [{"position": [0.5, 0.0, 0.4]}],  # missing radius
+            [{"position": [0.5, 0.0, 0.4], "radius": 0.08, "extra": 1}],  # unknown key
+            "not-a-list",
+        ):
+            with self.subTest(bad_obstacles=bad_obstacles):
+                raw_config["obstacles"] = bad_obstacles
+                with self.assertRaises(ConfigurationError):
+                    validate_system_config(raw_config=raw_config)
+
 
 if __name__ == "__main__":
     unittest.main()

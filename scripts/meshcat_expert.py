@@ -25,7 +25,7 @@ from planning.config import load_and_validate_system_config, validate_system_con
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
-from .meshcat_utils import draw_frame, draw_tcp_paths
+from .meshcat_utils import draw_frame, draw_obstacles, draw_tcp_paths
 
 
 def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
@@ -48,6 +48,9 @@ def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarra
         state = dyn.step(state, executed)
         states.append(state.copy())
         actions.append(executed)
+        if not dyn.is_collision_free(state):
+            outcome = "collision"
+            break
         if dyn.should_terminate_rollout(state):
             outcome = "reached"
             break
@@ -118,7 +121,7 @@ def main() -> None:
 
     reached = [r[2]["outcome"] == "reached" for r in results]
     print(f"\ngoal reached in {sum(reached)}/{len(results)} rollouts")
-    for kind in ("timeout", "planner failure"):
+    for kind in ("collision", "timeout", "planner failure"):
         count = sum(r[2]["outcome"].startswith(kind) for r in results)
         if count:
             print(f"  {kind}: {count}")
@@ -132,6 +135,7 @@ def main() -> None:
     viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
     viz.initViewer(open=True)
     viz.loadViewerModel()
+    draw_obstacles(viz, dyn.obstacles)
     tcp_paths = [np.array([dyn.tcp_placement(s[: dyn.n]).translation for s in r[2]["states"]]) for r in results]
     draw_tcp_paths(viz, tcp_paths, [r[1][:3] for r in results], reached)
     draw_frame(viz, "goal")
