@@ -4,9 +4,9 @@ from typing import Any, Mapping
 import casadi as ca
 import numpy as np
 
-from planning.casadi_planner import IPOPT_OPTIONS
+from planning.casadi_planner import PROXQP_OPTIONS
 from planning.planner import PlannerSolveError
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 
 
 class CasadiTrajectoryProjector:
@@ -38,7 +38,7 @@ class CasadiTrajectoryProjector:
     The task goal is not part of the problem.
     """
 
-    def __init__(self, local_sim: DynamicsSimulator, config: Mapping[str, Any], *, horizon: int):
+    def __init__(self, local_sim: SystemSimulator, config: Mapping[str, Any], *, horizon: int):
         self.sim = local_sim
         # The chunk length is the flow policy's prediction horizon, not the expert's ``horizon``
         self.tracked_horizon = self.N = int(horizon)
@@ -57,7 +57,7 @@ class CasadiTrajectoryProjector:
         self.rest_idx = list(self.sim.rest_state_indices)
         max_action = np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1)
 
-        self.opti = ca.Opti()
+        self.opti = ca.Opti("conic")
         self.X = self.opti.variable(self.sim.nx, self.N + 1)
         self.U = self.opti.variable(self.sim.nu, self.N)
         self.x0_param = self.opti.parameter(self.sim.nx)
@@ -71,16 +71,22 @@ class CasadiTrajectoryProjector:
         limits = np.repeat(max_action, self.N, axis=1)
         self.opti.subject_to(ca.vec(self.U) >= ca.vec(-limits))
         self.opti.subject_to(ca.vec(self.U) <= ca.vec(limits))
-        lower = ca.repmat(ca.DM(np.asarray(self.sim.state_lower_bounds, dtype=float)), 1, self.N)
-        upper = ca.repmat(ca.DM(np.asarray(self.sim.state_upper_bounds, dtype=float)), 1, self.N)
-        self.opti.subject_to(ca.vec(self.X[:, 1:]) >= ca.vec(lower))
-        self.opti.subject_to(ca.vec(self.X[:, 1:]) <= ca.vec(upper))
+        lower_bounds = np.asarray(self.sim.state_lower_bounds, dtype=float)
+        finite_lower = np.flatnonzero(np.isfinite(lower_bounds)).tolist()
+        if finite_lower:
+            lower = ca.repmat(ca.DM(lower_bounds[finite_lower]), 1, self.N)
+            self.opti.subject_to(ca.vec(self.X[finite_lower, 1:]) >= ca.vec(lower))
+        upper_bounds = np.asarray(self.sim.state_upper_bounds, dtype=float)
+        finite_upper = np.flatnonzero(np.isfinite(upper_bounds)).tolist()
+        if finite_upper:
+            upper = ca.repmat(ca.DM(upper_bounds[finite_upper]), 1, self.N)
+            self.opti.subject_to(ca.vec(self.X[finite_upper, 1:]) <= ca.vec(upper))
 
         tracking = ca.sumsqr((self.U - self.u_ref_param) / ca.repmat(ca.DM(max_action), 1, self.N))
         self.opti.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(self.X[self.rest_idx, self.N]))
 
         # Consecutive solves differ little: the multipliers are warm started too (see CasadiPlanner)
-        self.opti.solver("ipopt", IPOPT_OPTIONS)
+        self.opti.solver("proxqp", PROXQP_OPTIONS)
         self.reset()
 
     def reset(self) -> None:

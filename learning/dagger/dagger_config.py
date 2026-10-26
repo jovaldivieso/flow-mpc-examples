@@ -47,6 +47,7 @@ class DaggerConfig:
     # relaxed without touching training dynamics or demonstration length.
     # Falls back to tolerance_overrides when unset.
     eval_tolerance_overrides: dict[str, float] | None = None
+    num_workers: int = 1
 
     def __post_init__(self) -> None:
         if self.dagger_iterations < 0:
@@ -102,5 +103,7 @@ class DaggerConfig:
             value <= 0 for value in self.eval_tolerance_overrides.values()
         ):
             raise ValueError("'eval_tolerance_overrides' values must be positive.")
+        if self.num_workers <= 0:
+            raise ValueError("'num_workers' must be positive.")
         if not self.dataset_root.exists() and not self.start_with_aggregation:
             raise FileNotFoundError(self.dataset_root)

@@ -11,7 +11,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy import PolicyFactory, observation_features
+from learning.models.policy import observation_features
+from learning.models.policy_factory import PolicyFactory
 
 
 def _build_policy(action_scale=None) -> FlowPolicy:
@@ -100,53 +101,6 @@ class VelocityNetworkTests(unittest.TestCase):
         net = FlowPolicy(action_dim=7, state_dim=26, prediction_horizon=16).velocity_net
 
         self.assertEqual(sum(p.numel() for p in net.unet.parameters()), 3_962_311)  # dim 32, mults (1, 2, 4, 8)
-
-
-class PathLossTests(unittest.TestCase):
-    """compute_path_loss regresses the velocity onto given path velocities (the safety fine-tuning stage)."""
-
-    @staticmethod
-    def _path_batch(batch_size: int = 4):
-        x_t = torch.randn(batch_size, 4, 2)
-        dx_t = torch.randn(batch_size, 4, 2)
-        t = torch.rand(batch_size)
-        return x_t, dx_t, t
-
-    def test_loss_is_zero_for_a_network_that_predicts_the_path_velocity(self) -> None:
-        policy = _build_policy()
-        x_t, dx_t, t = self._path_batch()
-        with mock.patch.object(policy.velocity_net, "predict_velocity", return_value=dx_t.flatten(1)):
-            loss = policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
-        self.assertEqual(float(loss), 0.0)
-
-    def test_the_network_is_queried_at_the_path_point_and_time(self) -> None:
-        policy = _build_policy()
-        x_t, dx_t, t = self._path_batch()
-        with mock.patch.object(policy.velocity_net, "predict_velocity", return_value=torch.zeros(4, 8)) as predict:
-            policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
-        flat_input, obs_cond, timesteps = predict.call_args.args
-        torch.testing.assert_close(flat_input, x_t.flatten(1))
-        torch.testing.assert_close(timesteps, t)
-        self.assertEqual(tuple(obs_cond.shape), (4, 6))
-
-    def test_paths_in_physical_units_reproduce_the_unscaled_loss(self) -> None:
-        x_t, dx_t, t = self._path_batch()
-        torch.manual_seed(0)
-        unscaled = _build_policy(action_scale=None)
-        baseline = unscaled.compute_path_loss(_fake_observation(4), x_t, dx_t, t)
-
-        scale = torch.tensor([2.0, 5.0])
-        torch.manual_seed(0)
-        scaled = _build_policy(action_scale=scale.tolist())
-        rescaled = scaled.compute_path_loss(_fake_observation(4), x_t * scale, dx_t * scale, t)
-
-        torch.testing.assert_close(rescaled, baseline)
-
-    def test_the_loss_is_differentiable_with_respect_to_the_network(self) -> None:
-        policy = _build_policy()
-        x_t, dx_t, t = self._path_batch()
-        policy.compute_path_loss(_fake_observation(4), x_t, dx_t, t).backward()
-        self.assertTrue(any(p.grad is not None and bool(p.grad.abs().sum() > 0) for p in policy.parameters()))
 
 
 class ComputeLossActionScaleInvarianceTests(unittest.TestCase):

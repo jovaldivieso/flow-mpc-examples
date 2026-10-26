@@ -9,7 +9,7 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.casadi_planner import CasadiPlanner
 from planning.planner_factory import PlannerFactory
@@ -25,7 +25,7 @@ class PlannerInterfaceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = pinned_config()
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         cls.start = sample_initial_state(cls.simulator, 3)  # also sets the goal of the sample
         cls.observation = cls.simulator.observe(cls.start)
 

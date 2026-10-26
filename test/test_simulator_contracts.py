@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import unittest
@@ -16,12 +17,13 @@ sys.path.insert(0, PROJECT_ROOT)
 import torch
 
 from planning.config import ConfigurationError, load_and_validate_system_config, validate_system_config
-from dynamics.dynamics import DynamicsSimulator
-from dynamics.dynamics_factory import DynamicsFactory
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
-from dynamics.triple_integrator import TripleIntegrator
-from learning.models.policy import PolicyFactory
+from systems.system import SystemSimulator
+from systems.system_factory import SystemFactory
+from systems.franka_system import FLOOR_CLEARANCE, Q_READY, SAMPLING_RADIUS, WORKSPACE_BOUNDS, FrankaSystem
+from systems.triple_integrator_system import TripleIntegratorSystem
+from learning.models.policy_factory import PolicyFactory
 from planning.planner_factory import PlannerFactory
+from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 CHUNK = 16  # actions per state the policy predicts
@@ -36,15 +38,15 @@ PINNED_EXPERT_SETTINGS = {
 }
 
 
-def _build_simulator(**overrides) -> FrankaDynamics:
+def _build_simulator(**overrides) -> FrankaSystem:
     with open(CONFIG_PATH) as f:
         raw_config = yaml.safe_load(f)
     raw_config.update(PINNED_EXPERT_SETTINGS)
     raw_config.update(overrides)
-    return FrankaDynamics(validate_system_config(raw_config=raw_config))
+    return FrankaSystem(validate_system_config(raw_config=raw_config))
 
 
-def _rest_state(simulator: FrankaDynamics) -> np.ndarray:
+def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     """Ready pose at rest."""
     return np.concatenate([Q_READY, np.zeros(2 * simulator.n)])
 
@@ -55,12 +57,14 @@ class SimulatorContractTests(unittest.TestCase):
         cls.simulator = _build_simulator()
 
     def test_satisfies_the_dynamics_hierarchy(self) -> None:
-        self.assertIsInstance(self.simulator, DynamicsSimulator)
-        self.assertIsInstance(self.simulator, TripleIntegrator)
+        self.assertIsInstance(self.simulator, SystemSimulator)
+        self.assertIsInstance(self.simulator, TripleIntegratorSystem)
 
     def test_dimensions_and_rest_state_indices(self) -> None:
         simulator = self.simulator
-        self.assertEqual((simulator.nx, simulator.nu, simulator.obs_dim, simulator.goal_dim), (21, 7, 28, 7))
+        # observation = goal pose (12) + state (21); the policy sees the goal in the TCP frame (12) + q_rel (7) = 19
+        self.assertEqual((simulator.nx, simulator.nu, simulator.obs_dim, simulator.goal_dim), (21, 7, 33, 12))
+        self.assertEqual(simulator.environment_dim, 19)
         self.assertEqual(simulator.max_action.shape, (simulator.nu,))
         self.assertEqual(simulator.state_lower_bounds.shape, (simulator.nx,))
         # state = [q, v, a]: the projector's terminal come-to-rest cost reads the velocities and accelerations
@@ -98,7 +102,14 @@ class SimulatorContractTests(unittest.TestCase):
             self.assertEqual(str(frame[name].dtype), feature["dtype"], name)
             self.assertEqual(len(feature["names"]), feature["shape"][0], name)
 
-        np.testing.assert_allclose(frame["observation.environment_state"], simulator.goal, atol=1e-6)
+        q = state[: simulator.n]
+        relative = simulator.tcp_placement(q).actInv(simulator.vector_pose(simulator.goal))
+        q_rel = simulator.goal_configuration(simulator.goal, q) - q
+        np.testing.assert_allclose(
+            frame["observation.environment_state"],
+            np.concatenate([simulator.pose_vector(relative), q_rel]),
+            atol=1e-6,
+        )
         np.testing.assert_allclose(frame["observation.state"], state, atol=1e-6)
         # The dataset action is the expert's plan, one joint configuration per row, flattened row by row
         self.assertEqual(features["action"]["shape"], (CHUNK * simulator.n,))
@@ -122,10 +133,41 @@ class SimulatorContractTests(unittest.TestCase):
         np.testing.assert_array_equal(observation[simulator.goal_dim :], state)
         np.testing.assert_array_equal(simulator.invert_obs(observation), state)
 
+    def test_the_policy_sees_the_goal_in_the_tcp_frame(self) -> None:
+        simulator = _build_simulator()
+        rng = np.random.default_rng(4)
+        simulator.randomize_goal_for_reset(rng)
+        state = simulator.reset(simulator.random_initial_state(rng))
+        placement = simulator.tcp_placement(state[: simulator.n])
+        goal = simulator.vector_pose(simulator.goal)
+
+        seen = simulator.policy_observation(simulator.observe(state))["observation.environment_state"].astype(float)
+
+        np.testing.assert_allclose(seen[:3], placement.rotation.T @ (goal.translation - placement.translation), atol=1e-6)
+        np.testing.assert_allclose(seen[3:12].reshape(3, 3), placement.rotation.T @ goal.rotation, atol=1e-6)
+        np.testing.assert_allclose(
+            seen[12:], simulator.goal_configuration(simulator.goal, state[: simulator.n]) - state[: simulator.n], atol=1e-6
+        )
+        # the goal comes back from what the policy saw and the state
+        rebuilt = simulator.observation_from_policy(seen, state[:])
+        np.testing.assert_allclose(rebuilt[: simulator.goal_dim], simulator.goal, atol=1e-5)
+        np.testing.assert_array_equal(rebuilt[simulator.goal_dim :], state)
+
+    def test_a_reached_goal_is_the_identity_in_the_tcp_frame(self) -> None:
+        simulator = _build_simulator()
+        state = _rest_state(simulator)
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
+
+        seen = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+
+        np.testing.assert_allclose(
+            seen, np.concatenate([np.zeros(3), np.eye(3).ravel(), np.zeros(simulator.n)]), atol=1e-6
+        )
+
     def test_set_goal_rejects_a_wrong_shape_and_copies_its_input(self) -> None:
         simulator = _build_simulator()
         with self.assertRaises(ValueError):
-            simulator.set_goal(np.zeros(12))
+            simulator.set_goal(np.zeros(7))
         goal = simulator.goal.copy()
         goal[0] += 0.1
         simulator.set_goal(goal)
@@ -135,7 +177,7 @@ class SimulatorContractTests(unittest.TestCase):
     def test_randomize_goal_contract(self) -> None:
         self.assertIsInstance(self.simulator.randomize_goal, bool)
         self.assertTrue(callable(getattr(self.simulator, "randomize_goal_for_reset", None)))
-        self.assertFalse(_build_simulator(goal=list(Q_READY)).randomize_goal)
+        self.assertFalse(_build_simulator(goal=list(pose_goal(self.simulator, Q_READY))).randomize_goal)
 
 
 class DynamicsModelTests(unittest.TestCase):
@@ -200,12 +242,21 @@ class DynamicsModelTests(unittest.TestCase):
     def test_goal_errors_and_is_done_need_the_goal_and_rest(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(state[: simulator.n])
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
 
         position_error, rotation_error = simulator.goal_errors(state)
         self.assertAlmostEqual(position_error, 0.0, places=9)
         self.assertAlmostEqual(rotation_error, 0.0, places=9)
         self.assertTrue(simulator.is_done(state))
+
+        # only the position counts: a turned wrist at the goal position is done, and is reported as turned
+        turned = state.copy()
+        turned[6] += 0.5
+        simulator.set_goal(np.concatenate([simulator.tcp_position(state[: simulator.n]), simulator.goal[3:]]))
+        self.assertGreater(simulator.goal_errors(turned)[1], 0.1)
+        self.assertLess(simulator.goal_errors(turned)[0], simulator.pos_tol)
+        self.assertTrue(simulator.is_done(turned))
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
 
         moving = state.copy()
         moving[simulator.n] = 10 * simulator.vel_tol
@@ -225,7 +276,7 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_rollout_termination_state_resets_and_honors_hold_steps(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(state[: simulator.n])
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
         self.assertTrue(simulator.is_done(state), "a rest state at the goal must satisfy is_done()")
 
         hold_steps = int(simulator.config.get("done_hold_steps", 5))
@@ -249,7 +300,7 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_disabling_early_termination_never_terminates(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(state[: simulator.n])
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
         simulator.set_early_rollout_termination(False)
         for _ in range(20):
             self.assertFalse(simulator.should_terminate_rollout(state))
@@ -257,7 +308,7 @@ class RolloutTerminationTests(unittest.TestCase):
     def test_simulate_stops_after_the_hold_steps_and_returns_matching_arrays(self) -> None:
         simulator = _build_simulator()
         state = _rest_state(simulator)
-        simulator.set_goal(state[: simulator.n])
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
         observations = []
 
         def policy(observation: np.ndarray) -> np.ndarray:
@@ -284,7 +335,46 @@ class SamplingTests(unittest.TestCase):
         np.testing.assert_allclose(simulator_a.goal, simulator_b.goal, atol=1e-12)
         lower, upper = simulator_a.model.lowerPositionLimit, simulator_a.model.upperPositionLimit
         self.assertTrue(np.all(state_a[: simulator_a.n] >= lower) and np.all(state_a[: simulator_a.n] <= upper))
-        self.assertTrue(np.all(simulator_a.goal >= lower) and np.all(simulator_a.goal <= upper))
+
+    def test_random_goals_are_reachable_poses_and_their_configuration_reproduces_them(self) -> None:
+        simulator = _build_simulator()
+        rng = np.random.default_rng(5)
+        for _ in range(10):
+            simulator.randomize_goal_for_reset(rng)
+            rotation = simulator.goal[3:].reshape(3, 3)
+            np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-9)
+
+            q_start_a = simulator.random_initial_state(rng)[: simulator.n]
+            q_start_b = simulator.random_initial_state(rng)[: simulator.n]
+            q_goal = simulator.goal_configuration(simulator.goal, q_start_a)
+            np.testing.assert_allclose(q_goal, simulator.goal_configuration(simulator.goal, q_start_b), atol=1e-12)
+
+            np.testing.assert_allclose(pose_goal(simulator, q_goal), simulator.goal, atol=1e-5)
+            self.assertTrue(np.all(q_goal >= simulator.model.lowerPositionLimit))
+            self.assertTrue(np.all(q_goal <= simulator.model.upperPositionLimit))
+
+    def test_the_casadi_forward_kinematics_matches_pinocchio(self) -> None:
+        simulator = _build_simulator()
+        rng = np.random.default_rng(2)
+        for _ in range(20):
+            q = simulator._sample_configuration(rng)
+            position, rotation = simulator.kinematics.fk(q)
+
+            placement = simulator.tcp_placement(q)
+            np.testing.assert_allclose(np.array(position).ravel(), placement.translation, atol=1e-12)
+            np.testing.assert_allclose(np.array(rotation), placement.rotation, atol=1e-12)
+
+    def test_the_kinematics_are_built_once_and_shared_by_every_simulator_and_copy(self) -> None:
+        self.assertIs(_build_simulator().kinematics, _build_simulator().kinematics)
+        simulator = _build_simulator()
+        self.assertIs(copy.deepcopy(simulator).kinematics, simulator.kinematics)
+
+    def test_a_goal_pose_out_of_reach_has_no_configuration(self) -> None:
+        simulator = _build_simulator()
+        goal = simulator.goal.copy()
+        goal[:3] = [5.0, 0.0, 0.0]
+        with self.assertRaises(RuntimeError):
+            simulator.goal_configuration(goal, Q_READY)
 
     def test_random_initial_state_does_not_change_the_goal(self) -> None:
         simulator = _build_simulator()
@@ -293,23 +383,29 @@ class SamplingTests(unittest.TestCase):
         np.testing.assert_array_equal(simulator.goal, goal_before)
 
     def test_fixed_goal_is_kept_by_randomize_goal_for_reset(self) -> None:
-        simulator = _build_simulator(goal=list(Q_READY))
+        simulator = _build_simulator(goal=list(pose_goal(_build_simulator(), Q_READY)))
         goal_before = simulator.goal.copy()
         simulator.randomize_goal_for_reset(np.random.default_rng(3))
         np.testing.assert_array_equal(simulator.goal, goal_before)
 
     def test_sampled_start_is_a_safe_rest_state_away_from_the_goal(self) -> None:
         simulator = _build_simulator()
+        (x_min, x_max), (y_min, y_max), (z_min, z_max) = WORKSPACE_BOUNDS
         for seed in range(25):
             rng = np.random.default_rng(seed)
             simulator.randomize_goal_for_reset(rng)
             state = simulator.random_initial_state(rng)
+            q = state[: simulator.n]
+            tcp = simulator.tcp_position(q)
 
             np.testing.assert_array_equal(state[simulator.n :], 0.0)
             self.assertTrue(np.all(state >= simulator.state_lower_bounds - 1e-12))
             self.assertTrue(np.all(state <= simulator.state_upper_bounds + 1e-12))
-            distance = np.linalg.norm(state[: simulator.n] - simulator.goal)
-            self.assertGreater(distance, simulator.min_start_goal_distance)
+            self.assertTrue(np.all(np.abs(q - Q_READY) <= SAMPLING_RADIUS + 1e-12))
+            self.assertGreater(simulator.goal_errors(state)[0], simulator.min_start_goal_distance)
+            for point in (simulator.goal[:3], tcp):
+                self.assertTrue(x_min <= point[0] <= x_max and y_min <= point[1] <= y_max and z_min <= point[2] <= z_max)
+            self.assertTrue(all(joint.translation[2] >= FLOOR_CLEARANCE for joint in simulator.data.oMi[1:]))
 
     def test_infeasible_min_start_goal_distance_raises_instead_of_looping_forever(self) -> None:
         simulator = _build_simulator(min_start_goal_distance=100.0)
@@ -327,22 +423,22 @@ def _point_mass_config(**overrides) -> dict:
         return validate_system_config({**yaml.safe_load(f), **POINT_MASS_SETTINGS, **overrides})
 
 
-class TripleIntegratorTests(unittest.TestCase):
+class TripleIntegratorSystemTests(unittest.TestCase):
     """The toy system: the same plant as the arm's joints, the same pipeline hooks, a position as the goal."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = _point_mass_config()
-        cls.simulator = DynamicsFactory.create(cls.config["system"], cls.config)
+        cls.simulator = SystemFactory.create(cls.config["system"], cls.config)
 
     def test_the_factory_builds_it_from_the_config_and_it_satisfies_the_base_class(self) -> None:
-        self.assertIsInstance(self.simulator, TripleIntegrator)
-        self.assertIsInstance(self.simulator, DynamicsSimulator)
+        self.assertIsInstance(self.simulator, TripleIntegratorSystem)
+        self.assertIsInstance(self.simulator, SystemSimulator)
         self.assertEqual(
             (self.simulator.nx, self.simulator.nu, self.simulator.obs_dim, self.simulator.goal_dim), (6, 2, 8, 2)
         )
         with self.assertRaises(ValueError):
-            DynamicsFactory.create("pendulum", self.config)
+            SystemFactory.create("pendulum", self.config)
 
     def test_the_plant_is_the_triple_integrator_the_planner_models(self) -> None:
         simulator, n = self.simulator, 2
@@ -364,15 +460,34 @@ class TripleIntegratorTests(unittest.TestCase):
     def test_the_viewers_draw_the_position_padded_to_three_axes(self) -> None:
         np.testing.assert_array_equal(self.simulator.tcp_position(np.array([0.5, -0.25])), [0.5, -0.25, 0.0])
 
-    def test_the_plant_saturates_the_jerk_and_stops_at_the_position_limit(self) -> None:
+    def test_the_plant_saturates_the_jerk_and_has_no_position_limit(self) -> None:
         simulator = self.simulator
         rest = np.zeros(simulator.nx)
         np.testing.assert_allclose(
             simulator.predict_next_state(rest, np.full(2, 1e3)), simulator.predict_next_state(rest, simulator.max_action)
         )
-        at_the_limit = np.array([simulator.state_upper_bounds[0] - 1e-4, 0.0, 0.5, 0.0, 0.0, 0.0])
-        stopped = simulator.predict_next_state(at_the_limit, np.zeros(2))
-        self.assertEqual((stopped[0], stopped[2], stopped[4]), (simulator.state_upper_bounds[0], 0.0, 0.0))
+        self.assertTrue(np.all(np.isinf(simulator.state_upper_bounds[:2])))
+        far = np.array([100.0, -100.0, 0.5, -0.5, 0.0, 0.0])
+        moved = simulator.predict_next_state(far, np.zeros(2))
+        self.assertTrue(np.all(moved[:2] != far[:2]))  # it keeps moving at its velocity, nowhere to stop
+
+    def test_the_policy_sees_the_goal_relative_to_the_point_and_nothing_in_world_coordinates(self) -> None:
+        simulator = _TripleIntegratorFactory.build()
+        state = np.array([0.1, 0.2, 0.3, -0.1, 0.05, 0.0])
+        shift = np.array([5.0, -3.0])
+
+        simulator.set_goal(np.array([0.3, -0.4]))
+        seen = simulator.policy_observation(simulator.observe(state))
+        simulator.set_goal(np.array([0.3, -0.4]) + shift)
+        moved = simulator.policy_observation(simulator.observe(np.concatenate([state[:2] + shift, state[2:]])))
+
+        np.testing.assert_allclose(seen["observation.environment_state"], [0.2, -0.6], atol=1e-6)
+        np.testing.assert_allclose(seen["observation.state"], state[2:], atol=1e-6)
+        for name in seen:  # moving the point and the goal together changes nothing
+            np.testing.assert_allclose(moved[name], seen[name], atol=1e-6)
+        # an observation for the planners can be rebuilt from it, with the point at the origin
+        rebuilt = simulator.observation_from_policy(seen["observation.environment_state"], seen["observation.state"])
+        np.testing.assert_allclose(rebuilt, [0.2, -0.6, 0.0, 0.0, *state[2:]], atol=1e-6)
 
     def test_observation_dataset_frame_and_policy_input_follow_the_arm_convention(self) -> None:
         simulator = self.simulator
@@ -413,7 +528,7 @@ class TripleIntegratorTests(unittest.TestCase):
 
     def test_the_ompl_casadi_expert_reaches_random_goals_too(self) -> None:
         config = _point_mass_config(expert="ompl_casadi")
-        simulator = TripleIntegrator(config)
+        simulator = TripleIntegratorSystem(config)
         planner = PlannerFactory.create("ompl_casadi", simulator, config)
         for _ in range(3):
             state = simulator.reset_random()
@@ -433,7 +548,8 @@ class TripleIntegratorTests(unittest.TestCase):
         for policy_type, extra in (("flow", {}), ("safeflow", {"simulator": simulator, "planner_config": self.config})):
             with self.subTest(policy_type=policy_type):
                 policy = PolicyFactory.create(
-                    policy_type, action_dim=2, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
+                    policy_type, action_dim=2, state_dim=sum(value.shape[0] for value in observation.values()),
+                    unet_dim=8, unet_dim_mults=(1, 2),
                     prediction_horizon=CHUNK, num_inference_steps=2, action_scale=[1.0, 1.0], **extra,
                 ).eval()
                 self.assertEqual(tuple(policy.select_action(batch).shape), (1, CHUNK, 2))
@@ -448,8 +564,8 @@ class TripleIntegratorTests(unittest.TestCase):
 
 class _TripleIntegratorFactory:
     @staticmethod
-    def build(**overrides) -> TripleIntegrator:
-        return TripleIntegrator(_point_mass_config(**overrides))
+    def build(**overrides) -> TripleIntegratorSystem:
+        return TripleIntegratorSystem(_point_mass_config(**overrides))
 
 
 if __name__ == "__main__":

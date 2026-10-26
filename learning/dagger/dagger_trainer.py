@@ -14,17 +14,18 @@ from tqdm.auto import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 from planning.config import validate_system_config
-from dynamics.dynamics import DynamicsSimulator
-from dynamics.dynamics_factory import DynamicsFactory
-from dynamics.seed_utils import default_action_noise_seed_for_config
+from systems.system import SystemSimulator
+from systems.system_factory import SystemFactory
+from systems.seed_utils import default_action_noise_seed_for_config
 from learning.data_utils import create_collate_fn
-from learning.models.ema import ExponentialMovingAverage
-from learning.models.policy import ActionPolicy, PolicyFactory
+from learning.models.exponential_moving_average import ExponentialMovingAverage
+from learning.models.policy import ActionPolicy
+from learning.models.policy_factory import PolicyFactory
 from planning.planner_factory import PlannerFactory
 
 from .dagger_config import DaggerConfig
 from .metrics import DaggerEvalMetrics
-from .rollouts import build_policy_action, collect_dagger_rollouts, evaluate_policy_rollouts
+from .rollouts import RolloutWorkerSpec, build_policy_action, collect_dagger_rollouts, evaluate_policy_rollouts
 from .utils import (
     apply_config_overrides,
     print_rollout_metrics,
@@ -75,7 +76,7 @@ class DaggerTrainer:
     def __init__(self, cfg: DaggerConfig) -> None:
         self.cfg = cfg
         self.device: torch.device | None = None
-        self.simulator: DynamicsSimulator | None = None
+        self.simulator: SystemSimulator | None = None
         self.seeded_config: Mapping[str, Any] | None = None
         self.policy: ActionPolicy | None = None
         self.rollout_policy: ActionPolicy | None = None
@@ -117,7 +118,7 @@ class DaggerTrainer:
             self.cfg.experiment_config,
             self.cfg.seed,
         )
-        self.simulator = DynamicsFactory.create(self.seeded_config["system"], self.seeded_config)
+        self.simulator = SystemFactory.create(self.seeded_config["system"], self.seeded_config)
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         elif torch.backends.mps.is_available():
@@ -321,6 +322,34 @@ class DaggerTrainer:
         assert self.rollout_policy is not None and self.ema is not None
         self.rollout_policy.load_state_dict({name: tensor.cpu() for name, tensor in self.ema.state_dict().items()})
 
+    def _worker_spec(self, config: dict[str, Any], *, need_expert: bool, need_policy: bool) -> RolloutWorkerSpec:
+        assert self.simulator is not None and self.rollout_policy is not None
+        policy_kwargs = None
+        policy_state_dict = None
+        if need_policy:
+            policy_kwargs = {
+                "policy_type": self.cfg.policy_type,
+                "action_dim": self.action_dim,
+                "state_dim": self.state_dim,
+                "unet_dim": self.cfg.unet.dim,
+                "unet_dim_mults": self.cfg.unet.dim_mults,
+                "prediction_horizon": self.prediction_horizon,
+                "num_inference_steps": self.cfg.flow_config.num_inference_steps,
+                "action_scale": np.asarray(self.simulator.max_action, dtype=float).tolist(),
+                **(
+                    {"flow_init": self.cfg.flow_config.safeflow_init}
+                    if self.cfg.policy_type == "safeflow"
+                    else {}
+                ),
+            }
+            policy_state_dict = {name: tensor.cpu() for name, tensor in self.rollout_policy.state_dict().items()}
+        return RolloutWorkerSpec(
+            config=dict(config),
+            policy_kwargs=policy_kwargs,
+            policy_state_dict=policy_state_dict,
+            need_expert=need_expert,
+        )
+
     def evaluate_current_policy(self, label: str) -> DaggerEvalMetrics | None:
         assert self.rollout_policy is not None
         assert self.seeded_config is not None
@@ -330,7 +359,7 @@ class DaggerTrainer:
             copy.deepcopy(dict(self.seeded_config)),
             tolerance_overrides=self.cfg.eval_tolerance_overrides,
         )
-        simulator = DynamicsFactory.create(eval_config["system"], eval_config)
+        simulator = SystemFactory.create(eval_config["system"], eval_config)
 
         def action_fn(obs: np.ndarray) -> np.ndarray:
             return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
@@ -347,6 +376,8 @@ class DaggerTrainer:
             action_noise_seed=self.action_noise_seed,
             initial_states=self.cfg.initial_states,
             goal_states=self.cfg.goal_states,
+            num_workers=self.cfg.num_workers,
+            worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True),
         )
         if metrics is not None:
             print_rollout_metrics(label, "eval", metrics)
@@ -615,7 +646,7 @@ class DaggerTrainer:
             )
             print(f"Aggregation goal source: {mode}")
 
-            simulator = DynamicsFactory.create(collection_config["system"], collection_config)
+            simulator = SystemFactory.create(collection_config["system"], collection_config)
             planner = PlannerFactory.create(collection_config["expert"], simulator, collection_config)
 
             round_beta = self.cfg.expert_beta_per_iteration[schedule]
@@ -661,6 +692,12 @@ class DaggerTrainer:
                     policy_action_fn=action_fn,
                     policy_reset_fn=self.rollout_policy.reset,
                     frame_builder=frames,
+                    num_workers=self.cfg.num_workers,
+                    worker_spec=self._worker_spec(
+                        collection_config,
+                        need_expert=True,
+                        need_policy=round_beta < 1.0,
+                    ),
                 )
                 if metrics.num_episodes == 0:
                     raise RuntimeError(

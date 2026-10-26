@@ -23,15 +23,15 @@ import numpy as np
 import torch
 from pinocchio.visualize import MeshcatVisualizer
 
-from dynamics.dynamics_factory import DynamicsFactory
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.system_factory import SystemFactory
+from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
 from .evaluate_policy import load_policy
-from .meshcat_utils import action_tcp_points, draw_plan
+from .meshcat_utils import action_tcp_points, draw_frame, draw_plan
 
 POLICY_COLOR = 0x00D0FF
 EXPERT_COLOR = 0x20D040
@@ -46,7 +46,7 @@ class PolicyRollout(NamedTuple):
 
 
 def rollout_policy(
-    dyn: FrankaDynamics,
+    dyn: FrankaSystem,
     policy,
     initial_state: np.ndarray,
     num_steps: int,
@@ -110,7 +110,7 @@ def main() -> None:
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})
     device = torch.device(args.device)
-    dyn = DynamicsFactory.create(config["system"], config)
+    dyn = SystemFactory.create(config["system"], config)
     policy_type = args.policy_type or torch.load(args.model_dir, map_location="cpu", weights_only=True)["policy_type"]
     policy = load_policy(policy_type, args.model_dir, dyn, config, device)
     planner = PlannerFactory.create(config["expert"], dyn, config) if args.show_expert else None
@@ -138,20 +138,21 @@ def main() -> None:
         viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
         viz.initViewer(open=True)
         viz.loadViewerModel()
+        draw_frame(viz, "goal")
         show = lambda state: viz.display(state[: dyn.n])
     else:  # a point mass has no model: a sphere at its position (padded to three axes)
         viz = type("Viewer", (), {"viewer": meshcat.Visualizer()})()
         viz.viewer.open()
         viz.viewer["point"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0x2060FF))
+        viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
         show = lambda state: viz.viewer["point"].set_transform(tf.translation_matrix(dyn.tcp_position(state[: dyn.n])))
-    viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
-    print("Playing the rollouts in a loop (Ctrl+C to stop): red ball = goal TCP, cyan line = the policy's chunk"
+    print("Playing the rollouts in a loop (Ctrl+C to stop): goal frame/ball = goal TCP, cyan line = the policy's chunk"
           + (", green line = the expert's plan from the same state" if args.show_expert else ""))
     try:
         while True:
             for seed, goal, rollout in rollouts:
                 print(f"seed {seed}: {rollout.outcome} after {len(rollout.chunks)} steps")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(goal)))
+                viz.viewer["goal"].set_transform(dyn.goal_transform(goal))
                 for index, state in enumerate(rollout.states):
                     show(state)
                     if index < len(rollout.chunks):

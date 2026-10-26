@@ -1,9 +1,22 @@
 """Shared Meshcat drawing helpers for the visualization scripts."""
 
 import meshcat.geometry as g
+import meshcat.transformations as tf
 import numpy as np
 
 GREEN, ORANGE = np.array([0.1, 0.8, 0.2]), np.array([1.0, 0.55, 0.0])
+
+
+def draw_frame(viz, name: str, length: float = 0.1, radius: float = 0.005) -> None:
+    """Create a 3-D RGB coordinate frame (X=red, Y=green, Z=blue) with solid cylinders at ``viz.viewer[name]``."""
+    axes = (
+        ("x", 0xFF2020, [length / 2, 0, 0], tf.rotation_matrix(-np.pi / 2, [0, 0, 1])),
+        ("y", 0x20D040, [0, length / 2, 0], np.eye(4)),
+        ("z", 0x2060FF, [0, 0, length / 2], tf.rotation_matrix(np.pi / 2, [1, 0, 0])),
+    )
+    for axis, color, offset, rotation in axes:
+        viz.viewer[name][axis].set_object(g.Cylinder(length, radius), g.MeshLambertMaterial(color=color))
+        viz.viewer[name][axis].set_transform(tf.translation_matrix(offset) @ rotation)
 
 
 def plan_tcp_points(dyn, plan: np.ndarray) -> np.ndarray:

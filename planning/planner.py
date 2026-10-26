@@ -3,10 +3,20 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from systems.system import SystemSimulator
+
 
 class PlannerSolveError(RuntimeError):
     """Planner could not find/produce a valid solution."""
     pass
+
+
+def goal_configuration(simulator: SystemSimulator, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
+    """The configuration of ``goal`` nearest to ``q_reference``, or ``PlannerSolveError`` if there is none."""
+    try:
+        return simulator.goal_configuration(goal, q_reference)
+    except RuntimeError as exc:
+        raise PlannerSolveError(f"No joint configuration reaches the goal {np.asarray(goal).tolist()}.") from exc
 
 
 @dataclass(frozen=True)

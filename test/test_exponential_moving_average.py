@@ -10,7 +10,7 @@ from torch import nn
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from learning.models.ema import DEFAULT_EMA_DECAY, ExponentialMovingAverage
+from learning.models.exponential_moving_average import DEFAULT_EMA_DECAY, ExponentialMovingAverage
 
 
 class _Tiny(nn.Module):

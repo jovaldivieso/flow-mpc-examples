@@ -1,11 +1,12 @@
 # Expert (CasADi MPC) config for the Franka FR3 arm (7 joints, the gripper is fixed geometry).
-# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target configuration.
+# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
 system: franka
 dt: 0.1
 # The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
 # chunk length, at most this) of its planned jerks.
 horizon: 20
-# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0]: Q_diag weights the squared
+# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0] (q_goal: the inverse kinematics
+# solution of the goal pose nearest to the start): Q_diag weights the squared
 # position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
 # terminal_cost_multiplier the terminal node's Q cost.
 Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
@@ -27,12 +28,12 @@ ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner 
 ompl_timeout: 5.0               # s per RRT-Connect solve
 ompl_seed: 0
 
-# Success: within pos_tol [rad] of the goal and at rest (vel_tol [rad/s])
-pos_tol: 0.02
+# Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
+pos_tol: 0.03
 vel_tol: 0.01
 
-# Random start/goal configurations: minimum start-goal distance [rad]
-min_start_goal_distance: 0.5
+# Random start configurations and goal poses (the TCP pose of a random configuration): minimum TCP-to-goal distance [m]
+min_start_goal_distance: 0.3
 
 initial_state_seed: 0
 action_noise_seed: 0

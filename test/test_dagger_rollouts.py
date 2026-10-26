@@ -15,8 +15,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import validate_system_config
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from learning.dagger.rollouts import (
+    RolloutWorkerSpec,
     apply_execution_noise,
     build_policy_action,
     collect_dagger_rollouts,
@@ -25,7 +26,8 @@ from learning.dagger.rollouts import (
 from learning.models.flow_policy import FlowPolicy
 from planning.casadi_planner import CasadiPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
-from dynamics.seed_utils import (
+from test.planner_fixtures import pose_goal
+from systems.seed_utils import (
     action_noise_seed_for_rollout,
     initial_state_seed_for_rollout,
     torch_inference_seed_for_rollout,
@@ -88,7 +90,7 @@ class _FakeSimulator:
         return bool(np.asarray(state, dtype=float)[0] >= self.goal_threshold)
 
     def should_terminate_rollout(self, state: np.ndarray) -> bool:
-        """Mirrors DynamicsSimulator.should_terminate_rollout's consecutive-hold-steps contract."""
+        """Mirrors SystemSimulator.should_terminate_rollout's consecutive-hold-steps contract."""
         if self.is_done(state):
             self._rollout_done_counter += 1
         else:
@@ -96,7 +98,7 @@ class _FakeSimulator:
         return self._rollout_done_counter >= self.done_hold_steps
 
     def format_dataset_frame(self, obs: np.ndarray, plan: np.ndarray) -> dict[str, np.ndarray]:
-        """Mirrors FrankaDynamics.format_dataset_frame: ONE mapping (no ``task`` -- the caller adds it).
+        """Mirrors FrankaSystem.format_dataset_frame: ONE mapping (no ``task`` -- the caller adds it).
 
         The dataset action is the expert's planned actions (prediction_horizon, nu) flattened row by row.
         """
@@ -107,7 +109,7 @@ class _FakeSimulator:
         }
 
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """Mirrors DynamicsSimulator.policy_observation: the dataset's two observation keys, float32."""
+        """Mirrors SystemSimulator.policy_observation: the dataset's two observation keys, float32."""
         frame = self.format_dataset_frame(obs, np.zeros((1, self.n)))
         return {
             "observation.environment_state": frame["observation.environment_state"],
@@ -743,7 +745,7 @@ class DefaultFrameBuilderTests(unittest.TestCase):
 
 
 class RolloutsWithTheArmTests(unittest.TestCase):
-    """The same entry points on the real FrankaDynamics/CasadiPlanner instead of
+    """The same entry points on the real FrankaSystem/CasadiPlanner instead of
     the 1-D fake: a few steps from a start near the ready pose towards a
     nearby goal pose, so this stays fast and deterministic -- what it checks
     is the interfaces (frame schema, the 12-dim goal, the policy input), not
@@ -754,13 +756,11 @@ class RolloutsWithTheArmTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         with open(CONFIG_PATH) as f:
             cls.config = validate_system_config(raw_config=yaml.safe_load(f))
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         q = Q_READY.copy()
         q += np.array([0.12, -0.10, 0.08, 0.10, -0.12, 0.10, 0.25])
         cls.initial_state = np.concatenate([q, np.zeros(2 * cls.simulator.n)])
-        goal_q = q.copy()
-        goal_q += 0.1
-        cls.goal = goal_q
+        cls.goal = pose_goal(cls.simulator, q + 0.1)
 
     def test_collect_dagger_rollouts_writes_frames_matching_the_dataset_schema(self) -> None:
         simulator = self.simulator
@@ -793,7 +793,14 @@ class RolloutsWithTheArmTests(unittest.TestCase):
             for name, feature in features.items():
                 self.assertEqual(frame[name].shape, tuple(feature["shape"]), name)
             self.assertEqual(frame["task"], simulator.task_description)
-            np.testing.assert_allclose(frame["observation.environment_state"], self.goal, atol=1e-6)
+            # the goal in the TCP frame: the goal comes back from it and the state
+            np.testing.assert_allclose(
+                simulator.observation_from_policy(
+                    frame["observation.environment_state"].astype(float), frame["observation.state"].astype(float)
+                )[: simulator.goal_dim],
+                self.goal,
+                atol=1e-4,
+            )
         np.testing.assert_allclose(writer.frames[0]["observation.state"], self.initial_state, atol=1e-6)
         # The label of a step is the expert's plan from its state: its jerks, the first of which is the action the
         # expert executed (it leads to the next frame's state)
@@ -808,7 +815,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
     def test_evaluate_policy_rollouts_queries_the_policy_through_build_policy_action(self) -> None:
         simulator = self.simulator
         policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
+            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=4, num_inference_steps=2,
         ).eval()
         actions: list[np.ndarray] = []
@@ -841,6 +848,38 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         for action in actions:
             self.assertEqual(action.shape, (simulator.nu,))
             self.assertTrue(np.all(np.isfinite(action)))
+
+    def test_parallel_workers_produce_the_same_frames_and_metrics_as_one_process(self) -> None:
+        config = {**self.config, "randomize_goal": True}
+        worker_spec = RolloutWorkerSpec(config=config, need_expert=True)
+        writers = [_FakeDatasetWriter(), _FakeDatasetWriter()]
+        metrics_by_workers = []
+        for num_workers, writer in zip((1, 2), writers):
+            simulator = FrankaSystem(config)
+            planner = CasadiPlanner(simulator, dict(config))
+            with contextlib.redirect_stdout(io.StringIO()):
+                metrics = collect_dagger_rollouts(
+                    simulator=simulator,
+                    expert_planner=planner,
+                    dataset_writer=writer,
+                    trajectories_per_iteration=2,
+                    steps_per_trajectory=2,
+                    action_noise_std=0.0,
+                    action_noise_seed=0,
+                    initial_state_seed=0,
+                    expert_mixing_beta=1.0,
+                    prediction_horizon=PREDICTION_HORIZON,
+                    policy_action_fn=None,
+                    num_workers=num_workers,
+                    worker_spec=worker_spec,
+                )
+            metrics_by_workers.append(metrics)
+
+        self.assertEqual(metrics_by_workers[0], metrics_by_workers[1])
+        self.assertEqual(writers[0].episode_boundaries, writers[1].episode_boundaries)
+        for frame_single, frame_multi in zip(writers[0].frames, writers[1].frames):
+            for key in ("observation.environment_state", "observation.state", "action"):
+                np.testing.assert_allclose(frame_single[key], frame_multi[key], atol=1e-6)
 
 
 if __name__ == "__main__":

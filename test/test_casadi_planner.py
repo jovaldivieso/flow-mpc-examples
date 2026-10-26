@@ -12,9 +12,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import validate_system_config
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from planning.casadi_planner import CasadiPlanner
 from planning.planner import Plan, PlannerSolveError
+from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 
@@ -30,17 +31,17 @@ PINNED_EXPERT_SETTINGS = {
 }
 
 
-def _build(**overrides) -> tuple[FrankaDynamics, CasadiPlanner, dict]:
+def _build(**overrides) -> tuple[FrankaSystem, CasadiPlanner, dict]:
     with open(CONFIG_PATH) as f:
         raw_config = yaml.safe_load(f)
     raw_config.update(PINNED_EXPERT_SETTINGS)
     raw_config.update(overrides)
     validated = validate_system_config(raw_config=raw_config)
-    simulator = FrankaDynamics(validated)
+    simulator = FrankaSystem(validated)
     return simulator, CasadiPlanner(simulator, dict(validated)), validated
 
 
-def _first_action(planner: CasadiPlanner, simulator: FrankaDynamics, state: np.ndarray) -> np.ndarray:
+def _first_action(planner: CasadiPlanner, simulator: FrankaSystem, state: np.ndarray) -> np.ndarray:
     """The action of the planner's first step: the first jerk of its plan."""
     return planner.plan(simulator.observe(state)).actions[0]
 
@@ -59,7 +60,7 @@ def _initial_guess(planner: CasadiPlanner, observation: np.ndarray, initial_plan
     return guessed[id(planner.X)], guessed[id(planner.U)]
 
 
-def _start_near_the_ready_pose(simulator: FrankaDynamics) -> np.ndarray:
+def _start_near_the_ready_pose(simulator: FrankaSystem) -> np.ndarray:
     q = Q_READY.copy()
     q += np.array([0.12, -0.10, 0.08, 0.10, -0.12, 0.10, 0.25])
     return np.concatenate([q, np.zeros(2 * simulator.n)])
@@ -140,7 +141,7 @@ class PlannerBehaviorTests(unittest.TestCase):
 
     def test_closed_loop_mpc_reaches_a_nearby_goal_and_comes_to_rest(self) -> None:
         simulator, planner, _ = _build(pos_tol=0.005, vel_tol=0.05)
-        simulator.set_goal(Q_READY)
+        simulator.set_goal(pose_goal(simulator, Q_READY))
 
         def first_action(observation: np.ndarray) -> np.ndarray:
             return planner.plan(observation).actions[0]
@@ -228,19 +229,29 @@ class PlannerBehaviorTests(unittest.TestCase):
 
 
 class GoalConfigurationTests(unittest.TestCase):
-    """The goal of the MPC is the goal configuration in the observation."""
+    """The goal of the MPC is the configuration of the goal pose in the observation, nearest to the start."""
 
-    def test_the_goal_configuration_matches_the_goal_in_the_observation(self) -> None:
+    def test_the_goal_configuration_reaches_the_goal_pose_in_the_observation(self) -> None:
         simulator, planner, _ = _build()
         start = simulator.reset(_start_near_the_ready_pose(simulator))
 
         planner.plan(simulator.observe(start))
 
-        np.testing.assert_allclose(planner.goal_configuration, simulator.goal, atol=1e-9)
+        np.testing.assert_allclose(pose_goal(simulator, planner.goal_configuration), simulator.goal, atol=1e-5)
 
-        simulator.set_goal(start[: simulator.n])
+        simulator.set_goal(pose_goal(simulator, start[: simulator.n]))
         planner.plan(simulator.observe(start))
         np.testing.assert_allclose(planner.goal_configuration, start[: simulator.n], atol=1e-9)
+
+    def test_a_goal_pose_out_of_reach_is_a_solve_error(self) -> None:
+        simulator, planner, _ = _build()
+        start = simulator.reset(_start_near_the_ready_pose(simulator))
+        unreachable = simulator.goal.copy()
+        unreachable[:3] = [5.0, 0.0, 0.0]
+        simulator.set_goal(unreachable)
+
+        with self.assertRaises(PlannerSolveError):
+            planner.plan(simulator.observe(start))
 
 
 class InitialPlanTests(unittest.TestCase):

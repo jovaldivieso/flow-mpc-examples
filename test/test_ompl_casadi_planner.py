@@ -10,23 +10,23 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.casadi_planner import CasadiPlanner
 from planning.ompl_casadi_planner import OmplCasadiPlanner
 from planning.planner import Planner, PlannerSolveError
-from test.planner_fixtures import pinned_config
+from test.planner_fixtures import pinned_config, pose_goal
 
 N = 7
 SEED = 3  # a start and goal pair far enough apart for the MPC to plan a long motion
 
 
-def _step_along(simulator: FrankaDynamics, planner: Planner, state: np.ndarray) -> np.ndarray:
+def _step_along(simulator: FrankaSystem, planner: Planner, state: np.ndarray) -> np.ndarray:
     """The state after one control step along the first action of the planner's plan from ``state``."""
     return simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
 
 
-def _closed_loop(simulator: FrankaDynamics, planner: Planner, start: np.ndarray, steps: int) -> bool:
+def _closed_loop(simulator: FrankaSystem, planner: Planner, start: np.ndarray, steps: int) -> bool:
     """Whether the planner in closed loop on the plant reaches the goal."""
     state = simulator.reset(start)
     planner.reset()
@@ -41,7 +41,7 @@ class OmplCasadiPlannerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = pinned_config()
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         cls.start = sample_initial_state(cls.simulator, SEED)  # also sets the goal
         cls.goal = cls.simulator.goal.copy()
 
@@ -175,7 +175,7 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         observation = self._first_observation()
         self.planner.plan(observation)
 
-        self.simulator.set_goal(self.start[:N] + 0.2)
+        self.simulator.set_goal(pose_goal(self.simulator, self.start[:N] + 0.2))
         self.planner.plan(self.simulator.observe(self.start))
 
         self.assertEqual(self.planner.path_plans, 2)

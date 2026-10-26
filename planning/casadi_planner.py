@@ -2,25 +2,20 @@ import casadi as ca
 import numpy as np
 from typing import Any, Mapping
 
-from .planner import Plan, Planner, PlannerSolveError
-from dynamics.dynamics import DynamicsSimulator
+from .planner import Plan, Planner, PlannerSolveError, goal_configuration
+from systems.system import SystemSimulator
 
-# The same problem is re-solved at every step with slightly perturbed parameters, so the multipliers are warm
-# started too: with the warm_start_init_point option alone IPOPT still pushes the iterates away from the bounds
-# and restarts the barrier parameter high, so the push/frac options and a small mu_init are part of the recipe.
-# The mapped dynamics expand to SX, which makes every solve faster.
-IPOPT_OPTIONS: dict[str, Any] = {
+# Consecutive MPC/projection solves differ little: ProxQP warm-starts both primal and dual variables by default,
+# and expanding the mapped dynamics to SX keeps every solve fast.
+PROXQP_OPTIONS: dict[str, Any] = {
     "expand": True,
-    "ipopt.print_level": 0,
-    "print_time": 0,
-    "ipopt.sb": "yes",
-    "ipopt.warm_start_init_point": "yes",
-    "ipopt.warm_start_bound_push": 1e-9,
-    "ipopt.warm_start_bound_frac": 1e-9,
-    "ipopt.warm_start_slack_bound_push": 1e-9,
-    "ipopt.warm_start_slack_bound_frac": 1e-9,
-    "ipopt.warm_start_mult_bound_push": 1e-9,
-    "ipopt.mu_init": 1e-6,
+    "print_time": False,
+    "error_on_fail": False,
+    "proxqp": {
+        "verbose": False,
+        "eps_abs": 1e-8,
+        "eps_rel": 0.0,
+    },
 }
 
 
@@ -35,7 +30,8 @@ class CasadiPlanner(Planner):
     -------
     State (nx = 21)          x = [q, v, a]: joint positions, velocities and accelerations.
     Action (nu = 7)          u: joint jerks.
-    Goal                     x_goal = [q_goal, 0, 0]: the goal configuration at rest.
+    Goal                     x_goal = [q_goal, 0, 0]: the goal configuration at rest (for a pose goal, its inverse
+                             kinematics solution nearest to the first state, kept for the whole episode).
     Optimization variables   X = [x_0 .. x_N] (nx, N + 1) and U = [u_0 .. u_{N-1}] (nu, N), horizon N.
     Parameters               x_init (the current state) and x_goal.
 
@@ -66,7 +62,7 @@ class CasadiPlanner(Planner):
             raise ValueError("'R_weight' must be a positive number.")
         return np.full(self.sim.nu, float(r_weight), dtype=float)
 
-    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]):
+    def __init__(self, simulator: SystemSimulator, config: Mapping[str, Any]):
         self.sim = simulator
         self.N = config.get("horizon", 20)
         self.n_joints = simulator.n
@@ -93,7 +89,7 @@ class CasadiPlanner(Planner):
         self.goal_configuration: np.ndarray | None = None
         self.optimizations = 0  # NLP solves since the planner was built
 
-        self.opti = ca.Opti()
+        self.opti = ca.Opti("conic")
         self.X = self.opti.variable(self.sim.nx, self.N + 1)
         self.U = self.opti.variable(self.sim.nu, self.N)
         self.x0_param = self.opti.parameter(self.sim.nx)
@@ -112,11 +108,17 @@ class CasadiPlanner(Planner):
         self.opti.subject_to(ca.vec(self.U) >= ca.vec(-max_action))
         self.opti.subject_to(ca.vec(self.U) <= ca.vec(max_action))
 
-        # State limits at the nodes 1 .. N (node 0 is the current state)
-        lower = ca.repmat(ca.DM(np.asarray(self.sim.state_lower_bounds, dtype=float)), 1, self.N)
-        upper = ca.repmat(ca.DM(np.asarray(self.sim.state_upper_bounds, dtype=float)), 1, self.N)
-        self.opti.subject_to(ca.vec(self.X[:, 1:]) >= ca.vec(lower))
-        self.opti.subject_to(ca.vec(self.X[:, 1:]) <= ca.vec(upper))
+        # State limits at the nodes 1 .. N (node 0 is the current state); skip infinite bounds (e.g. TripleIntegratorSystem positions)
+        lower_bounds = np.asarray(self.sim.state_lower_bounds, dtype=float)
+        finite_lower = np.flatnonzero(np.isfinite(lower_bounds)).tolist()
+        if finite_lower:
+            lower = ca.repmat(ca.DM(lower_bounds[finite_lower]), 1, self.N)
+            self.opti.subject_to(ca.vec(self.X[finite_lower, 1:]) >= ca.vec(lower))
+        upper_bounds = np.asarray(self.sim.state_upper_bounds, dtype=float)
+        finite_upper = np.flatnonzero(np.isfinite(upper_bounds)).tolist()
+        if finite_upper:
+            upper = ca.repmat(ca.DM(upper_bounds[finite_upper]), 1, self.N)
+            self.opti.subject_to(ca.vec(self.X[finite_upper, 1:]) <= ca.vec(upper))
 
         # Cost: distance to the goal state and effort over the horizon, and the terminal distance
         error = self.X - ca.repmat(self.goal_param, 1, self.N + 1)
@@ -125,7 +127,7 @@ class CasadiPlanner(Planner):
         )
         terminal = ca.mtimes(error[:, -1].T, ca.mtimes(self.Q * self.terminal_cost_multiplier, error[:, -1]))
         self.opti.minimize(running + terminal)
-        self.opti.solver("ipopt", IPOPT_OPTIONS)
+        self.opti.solver("proxqp", PROXQP_OPTIONS)
 
     def reset(self) -> None:
         """Signals the start of a new episode."""
@@ -171,8 +173,8 @@ class CasadiPlanner(Planner):
         return None
 
     def _goal_configuration(self, x0: np.ndarray) -> np.ndarray:
-        """The goal configuration."""
-        return self._goal.copy()
+        """The configuration of the goal nearest to the current one."""
+        return goal_configuration(self.sim, self._goal, x0[: self.n_joints])
 
     def _solve(self, x0: np.ndarray, initial_plan: Plan | None) -> None:
         """Solve the NLP from ``x0`` and keep the solution."""

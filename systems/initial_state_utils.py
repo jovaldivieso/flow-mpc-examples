@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 
 
 def _parse_state_spec_argument(raw: str | None, flag_name: str, examples: str) -> Any | None:
@@ -38,8 +38,8 @@ def parse_goal_states_argument(raw_goal_states: str | None) -> Any | None:
     return _parse_state_spec_argument(
         raw_goal_states,
         "--goal-states",
-        "'[q1, ..., q7]' (single rollout, goal configuration) or "
-        "'[[q1, ..., q7], [q1, ..., q7]]' (multiple rollouts).",
+        "'[g1, ..., g12]' (single rollout, goal pose: position and row-major rotation matrix) or "
+        "'[[g1, ..., g12], [g1, ..., g12]]' (multiple rollouts).",
     )
 
 
@@ -96,7 +96,7 @@ def _normalize_state_specs(
 
 
 def normalize_initial_state_specs(
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     initial_states: Any | None,
 ) -> list[np.ndarray]:
     return _normalize_state_specs(
@@ -107,7 +107,7 @@ def normalize_initial_state_specs(
 
 
 def normalize_goal_state_specs(
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     goal_states: Any | None,
 ) -> list[np.ndarray]:
     return _normalize_state_specs(

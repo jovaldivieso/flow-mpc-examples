@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .metrics import DaggerEvalMetrics
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 
 
 def set_seed(seed: int) -> None:
@@ -122,7 +122,7 @@ def rng_for_seed_spec(seed_spec: int) -> np.random.Generator:
     return np.random.default_rng(int(seed_spec))
 
 
-def sample_initial_state(simulator: DynamicsSimulator, seed_spec: int) -> np.ndarray:
+def sample_initial_state(simulator: SystemSimulator, seed_spec: int) -> np.ndarray:
     rng = rng_for_seed_spec(seed_spec)
     simulator.randomize_goal_for_reset(rng)
     return simulator.random_initial_state(rng)

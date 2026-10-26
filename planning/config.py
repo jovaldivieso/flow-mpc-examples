@@ -4,14 +4,16 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Mapping
 
+import numpy as np
 import yaml
 
-from dynamics.franka_dynamics import (
+from systems.franka_system import (
     FRANKA_DEFAULT_MAX_ACCELERATION,
     FRANKA_DEFAULT_MAX_JERK,
     FRANKA_NUM_JOINTS,
+    POSE_DIM,
 )
-from dynamics.dynamics_factory import DynamicsFactory
+from systems.system_factory import SystemFactory
 from planning.planner_factory import PlannerFactory
 
 
@@ -209,7 +211,7 @@ COMMON_KEYS = OmplConfig.keys() | {
 }
 SYSTEM_KEYS = {
     "franka": set(),
-    "triple_integrator": {"dimension", "position_limit", "max_velocity", "workspace_bounds"},
+    "triple_integrator": {"dimension", "max_velocity", "workspace_bounds"},
 }
 
 
@@ -288,10 +290,14 @@ def _franka_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "min_start_goal_distance": min_start_goal_distance,
         "max_acceleration": list(_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS)),
         "max_jerk": list(_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS)),
-        **_tolerances(raw_config, 2e-3, 2e-2),
+        **_tolerances(raw_config, 0.03, 0.05),
     }
     if "goal" in raw_config:
-        fields["goal"] = list(_vector(raw_config, "goal", FRANKA_NUM_JOINTS, ()))
+        goal = _vector(raw_config, "goal", POSE_DIM, ())
+        rotation = np.array(goal[3:]).reshape(3, 3)
+        if not (np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-6) and np.linalg.det(rotation) > 0):
+            raise ConfigurationError("'goal' must be a position followed by a rotation matrix (row-major, 9 numbers).")
+        fields["goal"] = list(goal)
     return fields
 
 
@@ -311,7 +317,6 @@ def _triple_integrator_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "workspace_bounds": list(bounds),
         "randomize_goal": _bool(raw_config, "randomize_goal", "goal" not in raw_config),
         "min_start_goal_distance": min_start_goal_distance,
-        "position_limit": list(_limits(raw_config, "position_limit", 1.5, dimension)),
         "max_velocity": list(_limits(raw_config, "max_velocity", 1.0, dimension)),
         "max_acceleration": list(_limits(raw_config, "max_acceleration", 2.0, dimension)),
         "max_jerk": list(_limits(raw_config, "max_jerk", 10.0, dimension)),
@@ -325,8 +330,8 @@ def _triple_integrator_system(raw_config: Mapping[str, Any]) -> dict[str, Any]:
 def validate_system_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate system and planner fields, returning normalized config values."""
     system = raw_config.get("system", "franka")
-    if system not in DynamicsFactory.names():
-        raise ConfigurationError(f"'system' must be one of {', '.join(DynamicsFactory.names())}, got {system!r}.")
+    if system not in SystemFactory.names():
+        raise ConfigurationError(f"'system' must be one of {', '.join(SystemFactory.names())}, got {system!r}.")
     _require_only_known_keys(raw_config, COMMON_KEYS | SYSTEM_KEYS[system], context=f"'{system}' config")
 
     dt = _float(raw_config, "dt", 0.05)

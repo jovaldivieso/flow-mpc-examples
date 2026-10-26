@@ -15,7 +15,7 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dynamics.initial_state_utils import parse_goal_states_argument, parse_initial_states_argument
+from systems.initial_state_utils import parse_goal_states_argument, parse_initial_states_argument
 from learning.config_loaders import (
     default_checkpoint_dir,
     default_dataset_root,
@@ -92,6 +92,7 @@ def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
         "policy_config": str(args.policy_config),
         "checkpoint_dir": str(args.checkpoint_dir) if args.checkpoint_dir is not None else None,
         "seed": args.seed,
+        "num_workers": args.num_workers,
     }
 
 
@@ -112,6 +113,7 @@ def _summarize_dagger_config(cfg: Any) -> dict[str, Any]:
         "policy_type": cfg.policy_type,
         "checkpoint_dir": str(cfg.checkpoint_dir),
         "seed": cfg.seed,
+        "num_workers": cfg.num_workers,
     }
 
 
@@ -209,6 +211,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--checkpoint-dir", type=Path)
     p.add_argument("--seed", type=int)
     p.add_argument("--max-train-steps", type=int)
+    p.add_argument("--num-workers", type=int, help="parallel worker processes for rollout collection and evaluation")
     return p.parse_args()
 
 
@@ -333,6 +336,7 @@ def main() -> None:
         checkpoint_dir=experiment_dir,
         seed=int(option("seed", 99)),
         max_train_steps=option("max_train_steps", None),
+        num_workers=int(option("num_workers", 1)),
     )
     _print_yaml_block(
         "Resolved DaggerConfig (summary; full explicit states omitted)",

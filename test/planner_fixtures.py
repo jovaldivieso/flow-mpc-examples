@@ -10,7 +10,7 @@ import os
 import numpy as np
 import yaml
 
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from planning.config import validate_system_config
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -40,8 +40,13 @@ def pinned_config(**overrides) -> dict:
     return validate_system_config(raw_config=raw_config)
 
 
-def rest_state(simulator: FrankaDynamics) -> np.ndarray:
+def rest_state(simulator: FrankaSystem) -> np.ndarray:
     """The ready pose with the wrist turned by 0.3 rad, at rest."""
     q = Q_READY.copy()
     q[6] += 0.3
     return np.concatenate([q, np.zeros(2 * simulator.n)])
+
+
+def pose_goal(simulator: FrankaSystem, q: np.ndarray) -> np.ndarray:
+    """The goal pose of the TCP in the configuration ``q``."""
+    return simulator.pose_vector(simulator.tcp_placement(q))

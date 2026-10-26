@@ -70,7 +70,7 @@ class LoadDaggerTrainingConfigTests(unittest.TestCase):
             "expert_beta_per_iteration",
             "target_epochs_per_round", "eval_episodes", "eval_steps",
             "eval_seed_start", "eval_action_noise_std", "batch_size",
-            "learning_rate", "seed", "max_train_steps",
+            "learning_rate", "seed", "max_train_steps", "num_workers",
         }
         self.assertEqual(expected_keys, set(DEFAULT_DAGGER_TRAINING_CONFIG))
 
@@ -210,7 +210,7 @@ class ShippedPolicyConfigTests(unittest.TestCase):
     def test_shipped_policy_configs_load_through_every_loader(self) -> None:
         for file_name, policy_type, expected_unet, expected_horizon in (
             ("franka_casadi_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
-            ("franka_casadi_safeflow_config.yaml", "safeflow", UnetConfig(), 16),
+            ("franka_casadi_safeflow_config.yaml", "safeflow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
             ("triple_integrator_casadi_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
             ("triple_integrator_casadi_safeflow_config.yaml", "safeflow", UnetConfig(), 16),
         ):

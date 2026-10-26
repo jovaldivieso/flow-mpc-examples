@@ -29,6 +29,7 @@ DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
     "goal_states": None,
     "tolerance_overrides": None,
     "eval_tolerance_overrides": None,
+    "num_workers": 1,
 }
 
 DEFAULT_PREDICTION_HORIZON = 16

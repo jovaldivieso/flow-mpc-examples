@@ -10,14 +10,13 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
 from test.planner_fixtures import pinned_config
 
 N = 7
-IN_COLLISION = np.array([2.82, 1.602, -0.228, -0.861, -0.015, 2.65, 1.714])  # 18 cm below the floor
 
 
 def _observation(q: np.ndarray, goal: np.ndarray) -> np.ndarray:
@@ -29,7 +28,7 @@ class OmplPlannerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = pinned_config()
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         cls.start = sample_initial_state(cls.simulator, 3)  # also sets the goal of the sample
         cls.observation = _observation(cls.start[:N], cls.simulator.goal)
         cls.planner = OmplPlanner(cls.simulator, cls.config)
@@ -85,8 +84,9 @@ class OmplPlannerTests(unittest.TestCase):
     def test_reset_is_a_no_op(self) -> None:
         self.planner.reset()
 
-    def test_a_goal_out_of_bounds_raises(self) -> None:
-        goal = self.simulator.state_upper_bounds[:N] + 1.0
+    def test_a_goal_out_of_reach_raises(self) -> None:
+        goal = self.simulator.goal.copy()
+        goal[:3] = [5.0, 0.0, 0.0]
         with self.assertRaises(PlannerSolveError):
             self.planner.plan(_observation(self.start[:N], goal))
 

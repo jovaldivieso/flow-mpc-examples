@@ -13,24 +13,25 @@ PROJECT_ROOT = os.path.dirname(
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import load_and_validate_system_config, validate_system_config
-from dynamics.initial_state_utils import (
+from systems.initial_state_utils import (
     normalize_goal_state_specs,
     normalize_initial_state_specs,
     parse_goal_states_argument,
     parse_initial_states_argument,
 )
-from dynamics.seed_utils import (
+from systems.seed_utils import (
     DEFAULT_SINGLE_ROBOT_SEED,
     action_noise_seed_for_rollout,
     default_action_noise_seed_for_config,
 )
-from dynamics.dynamics import DynamicsSimulator
-from dynamics.dynamics_factory import DynamicsFactory
+from systems.system import SystemSimulator
+from systems.system_factory import SystemFactory
 from learning.config_loaders import UnetConfig
 from learning.dagger import apply_config_overrides, build_policy_action
 from learning.dagger.rollouts import apply_execution_noise
 from learning.dagger.utils import rng_for_seed_spec as _rng_for_seed_spec, sample_initial_state
-from learning.models.policy import ActionPolicy, PolicyFactory
+from learning.models.policy import ActionPolicy
+from learning.models.policy_factory import PolicyFactory
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
@@ -41,7 +42,7 @@ def is_observation_feature(feature_name: str) -> bool:
 
 def resolve_checkpoint_observation_dimensions(
     checkpoint: Mapping[str, Any],
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     requested_policy_type: str,
 ) -> tuple[int, int]:
     """Resolve and validate checkpoint dimensions against the evaluation simulator."""
@@ -147,7 +148,7 @@ def _synchronize_device(device: torch.device) -> None:
 
 
 def rollout_planner(
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     planner: Planner,
     initial_state: np.ndarray,
     num_steps: int,
@@ -207,7 +208,7 @@ def rollout_planner(
 
 
 def rollout_policy(
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     policy: ActionPolicy,
     device: torch.device,
     initial_state: np.ndarray,
@@ -272,7 +273,7 @@ def rollout_policy(
 
 def _load_checkpoint_policy_components(
     model_dir: str,
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     policy_type: str,
     device: torch.device,
 ) -> tuple[
@@ -325,7 +326,7 @@ def _load_checkpoint_policy_components(
 def load_policy(
     policy_type: str,
     model_dir: str,
-    simulator: DynamicsSimulator,
+    simulator: SystemSimulator,
     planner_config: Mapping[str, Any],
     device: torch.device,
 ):
@@ -385,7 +386,7 @@ def run_evaluation(
     validated_config = validate_system_config(raw_config=config)
     action_noise_seed = default_action_noise_seed_for_config(validated_config)
 
-    simulator = DynamicsFactory.create(validated_config["system"], validated_config)
+    simulator = SystemFactory.create(validated_config["system"], validated_config)
     seed_specs = normalize_seed_specs(seeds=seeds)
     initial_state_specs = normalize_initial_state_specs(
         simulator=simulator,
@@ -629,9 +630,9 @@ def run_evaluation(
     print(f"policy_solve_failure_rate: {policy_solve_failure_rate:.4f}")
     print(f"mean_policy_steps: {mean_policy_steps:.3f}")
     print(f"mean_expert_steps: {mean_expert_steps:.3f}")
-    print(f"mean_policy_goal_position_error: {mean_policy_position_error:.6f} rad")
+    print(f"mean_policy_goal_position_error: {mean_policy_position_error:.6f} m")
     print(f"mean_policy_goal_rotation_error: {mean_policy_rotation_error:.6f} rad")
-    print(f"mean_expert_goal_position_error: {mean_expert_position_error:.6f} rad")
+    print(f"mean_expert_goal_position_error: {mean_expert_position_error:.6f} m")
     print(f"mean_expert_goal_rotation_error: {mean_expert_rotation_error:.6f} rad")
 
     def _fmt_solve_time(value: float | None) -> str:

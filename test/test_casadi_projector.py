@@ -12,10 +12,11 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import validate_system_config
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from planning.casadi_planner import CasadiPlanner
 from planning.casadi_projector import CasadiTrajectoryProjector
 from planning.planner import PlannerSolveError
+from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 
@@ -38,7 +39,7 @@ def _validated_config(**overrides) -> dict:
     return validate_system_config(raw_config=raw_config)
 
 
-def _rest_state(simulator: FrankaDynamics) -> np.ndarray:
+def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     """Ready pose with the wrist turned by 0.3 rad, at rest."""
     q = Q_READY.copy()
     q[6] += 0.3
@@ -73,7 +74,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # rest: the terminal-rest condition is a soft cost, not a hard
         # constraint, and these tests need a genuinely resting cached
         # trajectory to fall back on.
-        self.simulator = FrankaDynamics(config)
+        self.simulator = FrankaSystem(config)
         self.projector = CasadiTrajectoryProjector(self.simulator, config, horizon=HORIZON)
         self.state0 = _rest_state(self.simulator)
         self.obs0 = self.simulator.observe(self.state0)
@@ -181,7 +182,7 @@ class FallbackRevalidationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         config = _validated_config(terminal_velocity_weight=500.0)
-        self.simulator = FrankaDynamics(config)
+        self.simulator = FrankaSystem(config)
         self.projector = CasadiTrajectoryProjector(self.simulator, config, horizon=HORIZON)
         self.state0 = _rest_state(self.simulator)
         self.u_rest = np.zeros((self.simulator.nu, HORIZON))
@@ -201,7 +202,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = _validated_config()
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         cls.projector = CasadiTrajectoryProjector(cls.simulator, cls.config, horizon=HORIZON)
 
     def test_projection_of_a_resting_reference_at_rest_stays_put(self) -> None:
@@ -247,7 +248,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_the_projection_stays_inside_the_joint_limits_the_proposal_ignores(self) -> None:
         # A proposal that drives joint 5 into its upper limit at full jerk
         joint = 4
-        simulator = FrankaDynamics(self.config)
+        simulator = FrankaSystem(self.config)
         projector = CasadiTrajectoryProjector(simulator, self.config, horizon=HORIZON)
         state = _rest_state(simulator)
         upper = simulator.state_upper_bounds[joint]
@@ -262,7 +263,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_a_feasible_plan_of_the_expert_is_tracked_closely(self) -> None:
         # The projector only corrects what is unsafe: an action chunk the expert planned stays almost untouched
         simulator = self.simulator
-        simulator.set_goal(Q_READY)
+        simulator.set_goal(pose_goal(simulator, Q_READY))
         state = _rest_state(simulator)
         reference = CasadiPlanner(simulator, self.config).plan(simulator.observe(state)).actions[:HORIZON]
         self.projector.reset()
@@ -299,8 +300,8 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_the_projector_ignores_the_goal_of_the_simulator_it_was_built_on(self) -> None:
         # Goal-anchor independence (see PolicyFactory): invert_obs drops the goal, and no projector
         # cost or constraint reads it, so a zeroed goal must not change the projection.
-        simulator = FrankaDynamics(self.config)
-        local_sim = FrankaDynamics(self.config)
+        simulator = FrankaSystem(self.config)
+        local_sim = FrankaSystem(self.config)
         local_sim.set_goal(np.zeros_like(local_sim.goal))
         projector = CasadiTrajectoryProjector(local_sim, self.config, horizon=HORIZON)
         reference = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)

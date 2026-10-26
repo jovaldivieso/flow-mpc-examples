@@ -212,17 +212,21 @@ class ExpertConfigValidationTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=raw_config)
 
-    def test_goal_is_a_seven_vector_and_controls_the_randomize_goal_default(self) -> None:
+    def test_goal_is_a_pose_and_controls_the_randomize_goal_default(self) -> None:
         raw_config = _load_raw_config()
         self.assertTrue(validate_system_config(raw_config=raw_config)["randomize_goal"])
         self.assertNotIn("goal", validate_system_config(raw_config=raw_config))
 
-        raw_config["goal"] = [0.0] * 7
+        pose = [0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, -1.0]
+        raw_config["goal"] = pose
         validated = validate_system_config(raw_config=raw_config)
         self.assertFalse(validated["randomize_goal"])
-        self.assertEqual(len(validated["goal"]), 7)
+        self.assertEqual(validated["goal"], pose)
 
-        raw_config["goal"] = [0.4, 0.0, 0.4]
+        raw_config["goal"] = [0.4, 0.0, 0.4]  # a position alone is no pose
+        with self.assertRaises(ConfigurationError):
+            validate_system_config(raw_config=raw_config)
+        raw_config["goal"] = [0.4, 0.0, 0.4] + [1.0] * 9  # the rotation block is no rotation matrix
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config=raw_config)
 

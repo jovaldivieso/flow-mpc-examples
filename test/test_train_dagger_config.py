@@ -17,12 +17,12 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import load_and_validate_system_config
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.franka_system import FrankaSystem
 from learning.config_loaders import FlowConfig, UnetConfig
 from learning.dagger.dagger_trainer import MIN_LEARNING_RATE, WEIGHT_DECAY, _validate_resumable_dataset_schema
 from learning.dagger.metrics import DaggerEvalMetrics
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy import PolicyFactory
+from learning.models.policy_factory import PolicyFactory
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from learning.train_dagger import DaggerConfig, DaggerTrainer
 
@@ -292,7 +292,7 @@ class ResumableDatasetSchemaTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.features = FrankaDynamics(load_and_validate_system_config(EXPERT_CONFIG_PATH)).get_dataset_features(16)
+        cls.features = FrankaSystem(load_and_validate_system_config(EXPERT_CONFIG_PATH)).get_dataset_features(16)
 
     def test_matching_schema_is_accepted(self) -> None:
         _validate_resumable_dataset_schema(copy.deepcopy(self.features), self.features)
@@ -355,13 +355,13 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
     def test_setup_sizes_a_flow_policy_from_the_dataset_schema(self) -> None:
         trainer = self._setup_trainer("flow")
 
-        self.assertIsInstance(trainer.simulator, FrankaDynamics)
-        self.assertEqual((trainer.state_dim, trainer.action_dim), (7 + 21, 7))
+        self.assertIsInstance(trainer.simulator, FrankaSystem)
+        self.assertEqual((trainer.state_dim, trainer.action_dim), (19 + 21, 7))  # goal in the TCP frame + q_rel, state
         self.assertEqual(trainer.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(trainer.obs_feature_names, ["observation.environment_state", "observation.state"])
         self.assertIsInstance(trainer.policy, FlowPolicy)
         velocity_net = trainer.policy.velocity_net
-        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (28, 7))
+        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (40, 7))
         self.assertEqual(velocity_net.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(velocity_net.num_inference_steps, self.NUM_INFERENCE_STEPS)
         # The chunk is jerks, scaled by their limits
@@ -373,7 +373,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         self.assertIsInstance(trainer.optimizer, torch.optim.AdamW)
         self.assertEqual(trainer.optimizer.defaults["weight_decay"], WEIGHT_DECAY)
         batch = (
-            {"observation.environment_state": torch.zeros(2, 7), "observation.state": torch.zeros(2, 21)},
+            {"observation.environment_state": torch.zeros(2, 19), "observation.state": torch.zeros(2, 21)},
             torch.zeros(2, self.PREDICTION_HORIZON, 7),
         )
         base = trainer.cfg.learning_rate
@@ -429,7 +429,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(checkpoint["iteration"], 2)
-                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (28, 7))
+                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (40, 7))
                 self.assertEqual(checkpoint["prediction_horizon"], self.PREDICTION_HORIZON)
                 self.assertEqual(checkpoint["unet"], {"dim": self.UNET.dim, "dim_mults": list(self.UNET.dim_mults)})
                 self.assertEqual(checkpoint["obs_feature_names"], ["observation.environment_state", "observation.state"])

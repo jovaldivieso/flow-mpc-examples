@@ -121,23 +121,6 @@ class FlowVelocityNet(nn.Module):
         pred_velocity = self.predict_velocity(x_t.flatten(1), obs_cond, t)
         return F.mse_loss(pred_velocity, target_velocity.flatten(1))
 
-    def compute_path_loss(
-        self,
-        obs_cond: torch.Tensor,
-        x_t: torch.Tensor,
-        dx_t: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """Regression of the velocity along given paths, instead of along the straight line between noise and data.
-
-        ``x_t`` (batch, horizon, n) are points of a path at flow times ``t`` (batch,) and ``dx_t`` the path's velocity
-        there, both in physical units like the dataset's chunks. The safety fine-tuning of SafeFlowMPC trains the
-        network on the *projected* paths, where every point has been made safe by the projector, so that the Euler
-        steps of the safe policy's inference follow them.
-        """
-        pred_velocity = self.predict_velocity((x_t / self.action_scale).flatten(1), obs_cond, t)
-        return F.mse_loss(pred_velocity, (dx_t / self.action_scale).flatten(1))
-
     @torch.no_grad()
     def integrate(self, obs_cond: torch.Tensor) -> torch.Tensor:
         batch_size = obs_cond.shape[0]

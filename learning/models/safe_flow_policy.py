@@ -8,7 +8,7 @@ import torch
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy, observation_features
 from planning.casadi_projector import CasadiTrajectoryProjector
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 
 FLOW_INITIALIZATIONS = ("previous_safe", "gaussian")
 
@@ -22,16 +22,14 @@ class SafeFlowMPCPolicy(ActionPolicy):
     returned chunk is what the system executes.
 
     With ``flow_init="previous_safe"`` the integration does not start from Gaussian noise but from the previous
-    tick's safe actions (shifted by one step), or, on the first tick of an episode, from zero actions. A network
-    trained only from noise is not adapted to that start; ``learning/finetune_safe.py`` trains it on the projected
-    paths from such starts.
+    tick's safe actions (shifted by one step), or, on the first tick of an episode, from zero actions.
     """
 
     def __init__(
         self,
         inner_policy: FlowPolicy,
         projector: CasadiTrajectoryProjector,
-        local_sim: DynamicsSimulator,
+        local_sim: SystemSimulator,
         flow_init: str = "previous_safe",
     ) -> None:
         super().__init__()
@@ -81,12 +79,10 @@ class SafeFlowMPCPolicy(ActionPolicy):
         return self.inner_policy.compute_loss(observation_dict, actions)
 
     def _extract_ego_observation(self, observation_dict: Mapping[str, torch.Tensor]) -> np.ndarray:
-        """Reconstruct the flat ego observation ``local_sim.invert_obs`` expects."""
-        parts = [
-            observation_dict["observation.environment_state"],
-            observation_dict["observation.state"],
-        ]
-        return torch.cat(parts, dim=-1).detach().cpu().numpy()
+        """The observation ``[goal, state]`` the projector expects, rebuilt from the policy observation (batch of one)."""
+        environment_state = observation_dict["observation.environment_state"][0].detach().cpu().numpy()
+        state = observation_dict["observation.state"][0].detach().cpu().numpy()
+        return self.local_sim.observation_from_policy(environment_state, state)
 
     def _initial_chunk(self) -> np.ndarray | None:
         """The safe actions the flow integration starts from, or None for Gaussian noise."""
@@ -111,7 +107,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
                 "this policy was constructed for a single system. The batch must contain exactly one row."
             )
         device = obs_cond.device
-        ego_obs_np = self._extract_ego_observation(observation_dict)[0]
+        ego_obs_np = self._extract_ego_observation(observation_dict)
 
         # net.predict_velocity operates in FlowVelocityNet's normalized space (see FlowVelocityNet.compute_loss /
         # integrate), but the projector compares physical actions, so x stays normalized throughout (that's what the

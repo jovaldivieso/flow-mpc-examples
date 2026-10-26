@@ -8,8 +8,8 @@ DEFAULT_DONE_HOLD_STEPS = 5
 DEFAULT_INITIAL_STATE_SEED = 0
 
 
-class DynamicsSimulator(ABC):
-    """Abstract base class for dynamical systems used by planners, rollouts, and imitation learning."""
+class SystemSimulator(ABC):
+    """Abstract base class for systems used by planners, rollouts, and imitation learning."""
 
     task_description = "reach target"
 
@@ -50,6 +50,11 @@ class DynamicsSimulator(ABC):
     def goal_dim(self) -> int:
         """Dimensionality of the goal vector accepted by ``set_goal``."""
         return int(self.goal.shape[0])
+
+    @property
+    def environment_dim(self) -> int:
+        """Dimensionality of the observation's part before the state: the goal, and what else the system observes."""
+        return self.obs_dim - self.nx
 
     @property
     def rest_state_indices(self) -> tuple[int, ...]:
@@ -107,12 +112,12 @@ class DynamicsSimulator(ABC):
         """Return a random initial state without changing the goal."""
 
     def observe(self, state: np.ndarray) -> np.ndarray:
-        """The observation ``[goal, state]``."""
+        """The observation ``[goal, state]``; the goal comes first, and a system can put more before the state."""
         return np.concatenate([self.goal, np.asarray(state, dtype=float)])
 
     def invert_obs(self, obs: np.ndarray) -> np.ndarray:
-        """The state of the observation (the goal part is dropped)."""
-        return np.asarray(obs, dtype=float)[self.goal_dim :]
+        """The state of the observation (the part before it is dropped)."""
+        return np.asarray(obs, dtype=float)[self.obs_dim - self.nx :]
 
     def reset_random(self) -> np.ndarray:
         """Randomize goal (if enabled) and reset to a random valid initial state."""
@@ -124,12 +129,17 @@ class DynamicsSimulator(ABC):
         return self.reset(self.random_initial_state(self._sampling_rng))
 
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """What the policy sees of an observation ``[goal, state]``: the two dataset observation features."""
+        """What the policy sees of an observation: the part before the state and the state, the two dataset features."""
         obs_array = np.asarray(obs, dtype=np.float32)
         return {
-            "observation.environment_state": obs_array[: self.goal_dim],
-            "observation.state": obs_array[self.goal_dim :],
+            "observation.environment_state": obs_array[: self.environment_dim],
+            "observation.state": obs_array[self.environment_dim :],
         }
+
+    def observation_from_policy(self, environment_state: np.ndarray, state: np.ndarray) -> np.ndarray:
+        """An observation ``[goal, state]`` that gives the policy observation (the inverse of ``policy_observation``,
+        up to what the policy cannot see); here the policy sees the observation itself."""
+        return np.concatenate([np.asarray(environment_state, dtype=float), np.asarray(state, dtype=float)])
 
     def format_dataset_frame(self, obs: np.ndarray, actions: np.ndarray) -> dict[str, np.ndarray]:
         """An observation and the expert's planned actions ``(prediction_horizon, nu)`` in the LeRobot format (without

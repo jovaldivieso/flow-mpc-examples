@@ -14,23 +14,21 @@ import ast
 import time
 from pathlib import Path
 
-import meshcat.geometry as g
-import meshcat.transformations as tf
 import numpy as np
 from pinocchio.visualize import MeshcatVisualizer
 
-from dynamics.franka_dynamics import FrankaDynamics
-from dynamics.seed_utils import action_noise_rng_for_rollout, default_action_noise_seed_for_config
+from systems.franka_system import FrankaSystem
+from systems.seed_utils import action_noise_rng_for_rollout, default_action_noise_seed_for_config
 from learning.dagger.rollouts import apply_execution_noise
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
-from .meshcat_utils import draw_tcp_paths
+from .meshcat_utils import draw_frame, draw_tcp_paths
 
 
-def rollout_expert(dyn: FrankaDynamics, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
+def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
     """One closed-loop expert rollout; stops at the goal or when the planner fails."""
     state = dyn.reset(initial_state)
     planner.reset()
@@ -56,7 +54,7 @@ def rollout_expert(dyn: FrankaDynamics, planner: Planner, initial_state: np.ndar
     return {"states": np.array(states), "actions": np.array(actions).reshape(-1, dyn.nu), "solve_times": solve_times, "outcome": outcome}
 
 
-def summarize(dyn: FrankaDynamics, rollout: dict) -> dict:
+def summarize(dyn: FrankaSystem, rollout: dict) -> dict:
     states, actions = rollout["states"], rollout["actions"]
     position_error, rotation_error = dyn.goal_errors(states[-1])
     stats = {
@@ -97,7 +95,7 @@ def main() -> None:
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})
     seeds = [int(s) for s in ast.literal_eval(args.seeds)] if args.seeds else list(range(args.num_traj))
-    dyn = FrankaDynamics(config)
+    dyn = FrankaSystem(config)
     planner = PlannerFactory.create(config["expert"], dyn, config)
     noise_seed = default_action_noise_seed_for_config(config)
     print(f"expert: horizon={config['horizon']} dt={config['dt']} | tolerances pos={config['pos_tol']} vel={config['vel_tol']}")
@@ -111,7 +109,7 @@ def main() -> None:
         stats = summarize(dyn, rollout)
         results.append((seed, dyn.goal.copy(), rollout, stats))
         print(
-            f"[{number}/{len(seeds)}] seed {seed:3d}: {rollout['outcome']:10s} steps {stats['steps']:3d} | final error {stats['position_error']:.4f} rad"
+            f"[{number}/{len(seeds)}] seed {seed:3d}: {rollout['outcome']:10s} steps {stats['steps']:3d} | final error {stats['position_error']:.4f} m"
             f" | max |v| {stats['max_joint_speed']:.2f} rad/s"
             f" | at jerk limit {100 * stats['at_jerk_limit']:4.1f}% | jerkiness {stats['jerkiness']:.3f}"
             f" | joint path {stats['joint_path']:.1f} rad (x{stats['joint_ratio']:.1f} straight) | TCP path x{stats['tcp_ratio']:.1f} straight | {stats['ms_per_step']:.0f} ms/step",
@@ -135,14 +133,14 @@ def main() -> None:
     viz.initViewer(open=True)
     viz.loadViewerModel()
     tcp_paths = [np.array([dyn.tcp_placement(s[: dyn.n]).translation for s in r[2]["states"]]) for r in results]
-    draw_tcp_paths(viz, tcp_paths, [dyn.tcp_position(r[1]) for r in results], reached)
-    viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
+    draw_tcp_paths(viz, tcp_paths, [r[1][:3] for r in results], reached)
+    draw_frame(viz, "goal")
     print("\nPlaying the rollouts in a loop (Ctrl+C to stop): green path = reached the goal, orange = did not")
     try:
         while True:
             for (seed, goal, rollout, stats), path in zip(results, tcp_paths):
                 print(f"seed {seed}: {rollout['outcome']}")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(goal)))
+                viz.viewer["goal"].set_transform(dyn.goal_transform(goal))
                 for state in rollout["states"]:
                     viz.display(state[: dyn.n])
                     time.sleep(dyn.dt / args.speed)

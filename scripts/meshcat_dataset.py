@@ -26,9 +26,9 @@ import pandas as pd
 from pinocchio.visualize import MeshcatVisualizer
 
 from planning.config import load_and_validate_system_config
-from dynamics.franka_dynamics import FrankaDynamics
+from systems.franka_system import FrankaSystem
 
-from .meshcat_utils import draw_plan, draw_tcp_paths, plan_tcp_points
+from .meshcat_utils import draw_frame, draw_plan, draw_tcp_paths, plan_tcp_points
 
 PLAN_COLOR = 0x00D0FF
 # A frame whose labelled plan stays within this many rad of the current configuration is a "stay" label
@@ -51,7 +51,7 @@ class Episode(NamedTuple):
         return self.states[:, self.actions.shape[2] : 2 * self.actions.shape[2]]
 
 
-def plan_positions(dyn: FrankaDynamics, episode: Episode) -> np.ndarray:
+def plan_positions(dyn: FrankaSystem, episode: Episode) -> np.ndarray:
     """The joint positions (T, H + 1, n) of the plan that labels each frame, row 0 the frame's own configuration."""
     return np.stack([dyn.rollout_positions(state, actions) for state, actions in zip(episode.states, episode.actions)])
 
@@ -71,12 +71,14 @@ def read_frames(root: Path) -> pd.DataFrame:
 
 def load_episodes(
     root: Path,
+    dyn: FrankaSystem,
     count: int,
     seed: int,
     first: bool = False,
     indices: list[int] | None = None,
 ) -> list[Episode]:
-    """Episodes of the dataset at ``root``: ``indices`` if given, else the first ``count`` or ``count`` random ones."""
+    """Episodes of the dataset at ``root``: ``indices`` if given, else the first ``count`` or ``count`` random ones. The
+    goal is recovered from the first frame's environment state (the goal in the TCP frame) and state."""
     frames = read_frames(root)
     available = sorted(frames["episode_index"].unique().tolist())
     if indices is not None:
@@ -93,13 +95,14 @@ def load_episodes(
         rows = frames[frames["episode_index"] == index].sort_values("frame_index")
         state = np.stack(rows["observation.state"].to_numpy()).astype(float)
         n = state.shape[1] // 3
-        goal = np.stack(rows["observation.environment_state"].to_numpy()).astype(float)[0]
+        environment = np.stack(rows["observation.environment_state"].to_numpy()).astype(float)[0]
+        goal = dyn.observation_from_policy(environment, state[0])[: dyn.goal_dim]
         action = np.stack(rows["action"].to_numpy()).astype(float)
         episodes.append(Episode(int(index), state, goal, action.reshape(len(rows), -1, n)))
     return episodes
 
 
-def episode_summary(dyn: FrankaDynamics, episode: Episode) -> dict[str, float]:
+def episode_summary(dyn: FrankaSystem, episode: Episode) -> dict[str, float]:
     """What the episode ends like and what its labels say: how far from the goal, how much of it at rest or 'stay'."""
     dyn.set_goal(episode.goal)
     position_error, rotation_error = dyn.goal_errors(episode.positions[-1])
@@ -115,25 +118,25 @@ def episode_summary(dyn: FrankaDynamics, episode: Episode) -> dict[str, float]:
     }
 
 
-def print_table(dyn: FrankaDynamics, episodes: list[Episode], cap: int) -> None:
+def print_table(dyn: FrankaSystem, episodes: list[Episode], cap: int) -> None:
     for episode in episodes:
         s = episode_summary(dyn, episode)
         note = "  <- ran into the step cap" if s["frames"] >= cap else ""
         print(
-            f"episode {episode.index:5d}: {s['frames']:3d} frames | final error {s['final_position_error']:.4f} rad"
+            f"episode {episode.index:5d}: {s['frames']:3d} frames | final error {s['final_position_error']:.4f} m"
             f" | at rest {s['at_rest_fraction']:4.0%} "
             f"| 'stay' labels {s['stay_label_fraction']:4.0%} | largest plan excursion {s['plan_excursion']:.2f} rad{note}"
         )
 
 
-def show_overview(viz, dyn: FrankaDynamics, episodes: list[Episode], success_tol: float) -> None:
+def show_overview(viz, dyn: FrankaSystem, episodes: list[Episode], success_tol: float) -> None:
     """Draw the TCP path of every episode at once."""
     paths = [np.array([dyn.tcp_placement(q).translation for q in episode.positions]) for episode in episodes]
-    goals = [dyn.tcp_position(episode.goal) for episode in episodes]
-    reached = [bool(np.linalg.norm(episode.positions[-1] - episode.goal) < success_tol) for episode in episodes]
+    goals = [episode.goal[:3] for episode in episodes]
+    reached = [bool(np.linalg.norm(path[-1] - goal) < success_tol) for path, goal in zip(paths, goals)]
     draw_tcp_paths(viz, paths, goals, reached)
     print(
-        f"Drawn {len(episodes)} episodes: {sum(reached)} ended within {success_tol} rad of the goal (green), "
+        f"Drawn {len(episodes)} episodes: {sum(reached)} ended within {success_tol} m of the goal (green), "
         f"{len(episodes) - sum(reached)} did not (orange); blue = starts, red = goals"
     )
 
@@ -156,12 +159,12 @@ def main() -> None:
     parser.add_argument("--no-viewer", action="store_true", help="print the per-episode table only")
     parser.add_argument("--overview", action="store_true", help="additionally draw the TCP paths of all episodes at once")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
-    parser.add_argument("--success-tol", type=float, default=0.02, help="goal distance [rad] for a green path in --overview (default: %(default)s)")
+    parser.add_argument("--success-tol", type=float, default=0.02, help="TCP distance to the goal [m] for a green path in --overview (default: %(default)s)")
     args = parser.parse_args()
 
-    dyn = FrankaDynamics(load_and_validate_system_config(args.config))
+    dyn = FrankaSystem(load_and_validate_system_config(args.config))
     indices = [int(i) for i in ast.literal_eval(args.indices)] if args.indices else None
-    episodes = load_episodes(args.root, 10**9 if args.overview else args.episodes, args.seed, args.first, indices)
+    episodes = load_episodes(args.root, dyn, 10**9 if args.overview else args.episodes, args.seed, args.first, indices)
     played = episodes[: args.episodes] if indices is None else episodes
     print_table(dyn, played, args.cap)
     if args.no_viewer:
@@ -174,17 +177,17 @@ def main() -> None:
     if args.overview:
         show_overview(viz, dyn, episodes, args.success_tol)
     episodes = played
-    viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
+    draw_frame(viz, "goal")
 
     viz.viewer["start"].set_object(g.Sphere(0.015), g.MeshLambertMaterial(color=0x2060FF, opacity=0.9))
 
-    print(f"Playing {len(episodes)} episodes in a loop (Ctrl+C to stop): blue dot = start TCP, red ball = goal TCP"
+    print(f"Playing {len(episodes)} episodes in a loop (Ctrl+C to stop): blue dot = start TCP, frame = goal TCP"
           + (", cyan line = the expert's labelled plan of the frame" if args.show_plan else ""))
     try:
         while True:
             for number, episode in enumerate(episodes, 1):
                 print(f"episode {episode.index} ({number}/{len(episodes)}): {len(episode.positions)} frames")
-                viz.viewer["goal"].set_transform(tf.translation_matrix(dyn.tcp_position(episode.goal)))
+                viz.viewer["goal"].set_transform(dyn.goal_transform(episode.goal))
                 start = dyn.tcp_placement(episode.positions[0]).translation
                 viz.viewer["start"].set_transform(tf.translation_matrix(start))
                 for q, plan in zip(episode.positions, plan_positions(dyn, episode)):

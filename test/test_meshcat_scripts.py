@@ -16,7 +16,7 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from learning.models.flow_policy import FlowPolicy
 from planning.casadi_planner import CasadiPlanner
 from planning.config import validate_system_config
@@ -24,6 +24,7 @@ from scripts.evaluate_policy import load_policy
 from scripts.meshcat_dataset import episode_summary, load_episodes, plan_positions, read_frames
 from scripts.meshcat_utils import plan_tcp_points
 from scripts.meshcat_policy import rollout_policy
+from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 PLAN_HORIZON = 4  # of the synthetic dataset
@@ -38,12 +39,12 @@ def _config(**overrides) -> dict:
     return validate_system_config(raw_config=raw_config)
 
 
-def _rest_state(simulator: FrankaDynamics) -> np.ndarray:
+def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     q = Q_READY.copy()
     return np.concatenate([q, np.zeros(2 * simulator.n)])
 
 
-def _episode_rows(index: int, frames: int, goal: np.ndarray, q: np.ndarray, moving_plan: bool) -> pd.DataFrame:
+def _episode_rows(index: int, frames: int, environment: np.ndarray, q: np.ndarray, moving_plan: bool) -> pd.DataFrame:
     """Frames of a synthetic episode: the arm stays at ``q``; the labelled plan holds still or applies a jerk of
     15 rad/s^3 for ``PLAN_HORIZON`` steps."""
     rows = []
@@ -54,7 +55,7 @@ def _episode_rows(index: int, frames: int, goal: np.ndarray, q: np.ndarray, movi
                 "episode_index": index,
                 "frame_index": frame,
                 "observation.state": np.concatenate([q, np.zeros(2 * N)]).astype(np.float32),
-                "observation.environment_state": goal.astype(np.float32),
+                "observation.environment_state": environment.astype(np.float32),
                 "action": plan.reshape(-1).astype(np.float32),
             }
         )
@@ -64,19 +65,22 @@ def _episode_rows(index: int, frames: int, goal: np.ndarray, q: np.ndarray, movi
 class DatasetViewerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.simulator = FrankaDynamics(_config())
+        cls.simulator = FrankaSystem(_config())
         cls.q = _rest_state(cls.simulator)[:N]
-        cls.goal = cls.q + 0.1
+        cls.goal = pose_goal(cls.simulator, cls.q + 0.1)
+        cls.simulator.set_goal(cls.goal)
+        state = np.concatenate([cls.q, np.zeros(2 * N)])
+        cls.environment = cls.simulator.policy_observation(cls.simulator.observe(state))["observation.environment_state"]
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         chunk = self.root / "data" / "chunk-000"
         chunk.mkdir(parents=True)
-        _episode_rows(0, 5, self.goal, self.q, moving_plan=True).to_parquet(chunk / "file-000.parquet")
+        _episode_rows(0, 5, self.environment, self.q, moving_plan=True).to_parquet(chunk / "file-000.parquet")
         pd.concat(
             [
-                _episode_rows(1, 4, self.goal, self.q, moving_plan=False),
-                _episode_rows(2, 6, self.goal, self.q, moving_plan=True),
+                _episode_rows(1, 4, self.environment, self.q, moving_plan=False),
+                _episode_rows(2, 6, self.environment, self.q, moving_plan=True),
             ]
         ).to_parquet(chunk / "file-001.parquet")
         # the file a running DAgger job is still writing: no parquet footer yet
@@ -84,7 +88,7 @@ class DatasetViewerTests(unittest.TestCase):
 
     def _load(self, *args, **kwargs):
         with contextlib.redirect_stdout(io.StringIO()):
-            return load_episodes(self.root, *args, **kwargs)
+            return load_episodes(self.root, self.simulator, *args, **kwargs)
 
     def test_an_unfinished_file_is_skipped_and_the_rest_read(self) -> None:
         output = io.StringIO()
@@ -108,7 +112,7 @@ class DatasetViewerTests(unittest.TestCase):
         self.assertEqual(episode.positions.shape, (5, N))
         self.assertEqual(episode.actions.shape, (5, PLAN_HORIZON, N))
         self.assertEqual(episode.velocities.shape, (5, N))
-        self.assertEqual(episode.goal.shape, (7,))
+        np.testing.assert_allclose(episode.goal, self.goal, atol=1e-5)  # recovered from the goal in the TCP frame
         plans = plan_positions(self.simulator, episode)
         self.assertEqual(plans.shape, (5, PLAN_HORIZON + 1, N))
         np.testing.assert_allclose(plans[0, 0], episode.positions[0], atol=1e-6)  # row 0 is the frame's own q
@@ -152,12 +156,12 @@ class PolicyRolloutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = _config()
-        cls.simulator = FrankaDynamics(cls.config)
+        cls.simulator = FrankaSystem(cls.config)
         cls.state = _rest_state(cls.simulator)
-        cls.simulator.set_goal(cls.state[:N] + 0.3)
+        cls.simulator.set_goal(pose_goal(cls.simulator, cls.state[:N] + 0.3))
         torch.manual_seed(0)
         cls.policy = FlowPolicy(
-            action_dim=N, state_dim=cls.simulator.obs_dim, prediction_horizon=CHUNK,
+            action_dim=N, state_dim=cls.simulator.environment_dim + cls.simulator.nx, prediction_horizon=CHUNK,
             unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
         ).eval()
 
@@ -186,8 +190,8 @@ class PolicyRolloutTests(unittest.TestCase):
         np.testing.assert_allclose(rollout.expert_plans[0][0], first_action, atol=1e-6)  # the plan starts at the state
 
     def test_a_rollout_that_starts_at_the_goal_is_reached_without_steps(self) -> None:
-        simulator = FrankaDynamics(_config(done_hold_steps=1))  # one check at the goal and at rest is enough
-        simulator.set_goal(self.state[:N])
+        simulator = FrankaSystem(_config(done_hold_steps=1))  # one check at the goal and at rest is enough
+        simulator.set_goal(pose_goal(simulator, self.state[:N]))
 
         rollout = rollout_policy(simulator, self.policy, self.state, 5, torch.device("cpu"))
 
@@ -196,16 +200,17 @@ class PolicyRolloutTests(unittest.TestCase):
 
 class LoadPolicyTests(unittest.TestCase):
     def test_the_policy_of_a_checkpoint_runs_with_its_ema_weights_in_eval_mode(self) -> None:
-        simulator = FrankaDynamics(_config())
+        simulator = FrankaSystem(_config())
+        state_dim = simulator.environment_dim + simulator.nx
         template = FlowPolicy(
-            action_dim=N, state_dim=simulator.obs_dim, prediction_horizon=CHUNK,
+            action_dim=N, state_dim=state_dim, prediction_horizon=CHUNK,
             unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
         )
         averaged = {name: torch.full_like(tensor, 0.25) for name, tensor in template.state_dict().items()}
         checkpoint = {
             "model_state_dict": template.state_dict(),
             "ema_model_state_dict": averaged,
-            "state_dim": simulator.obs_dim,
+            "state_dim": state_dim,
             "action_dim": N,
             "prediction_horizon": CHUNK,
             "unet": {"dim": 8, "dim_mults": [1, 2]},

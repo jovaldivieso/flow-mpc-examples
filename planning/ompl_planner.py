@@ -7,8 +7,8 @@ from ompl import base as ob
 from ompl import geometric as og
 from ompl import util as ou
 
-from dynamics.dynamics import DynamicsSimulator
-from planning.planner import Plan, Planner, PlannerSolveError
+from systems.system import SystemSimulator
+from planning.planner import Plan, Planner, PlannerSolveError, goal_configuration
 
 ou.setLogLevel(ou.LogLevel.LOG_ERROR)
 
@@ -31,7 +31,7 @@ class OmplPlanner(Planner):
 
     _rng_is_seeded = False
 
-    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: SystemSimulator, config: Mapping[str, Any]) -> None:
         self.sim = simulator
         self.n_joints = simulator.n
         self.timeout = float(config["ompl_timeout"])
@@ -50,11 +50,10 @@ class OmplPlanner(Planner):
         configuration. ``initial_plan`` is ignored. Raises ``PlannerSolveError`` when the start or goal is out of
         bounds or when no exact path is found within ``ompl_timeout`` seconds."""
         q_start = np.asarray(self.sim.invert_obs(observation), dtype=float)[: self.n_joints]
-        lower = self.sim.state_lower_bounds[: self.n_joints]
-        upper = self.sim.state_upper_bounds[: self.n_joints]
+        lower, upper = self.sim.path_lower, self.sim.path_upper
         if np.any(q_start < lower) or np.any(q_start > upper):
             raise PlannerSolveError("OMPL: the start configuration is out of bounds.")
-        q_goal = np.asarray(observation[: self.sim.goal_dim], dtype=float)
+        q_goal = goal_configuration(self.sim, observation[: self.sim.goal_dim], q_start)
         if np.any(q_goal < lower) or np.any(q_goal > upper):
             raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
         path = self._connect(q_start, [q_goal], lower, upper)

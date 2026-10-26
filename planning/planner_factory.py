@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 from planning.casadi_planner import CasadiPlanner
 from planning.ompl_casadi_planner import OmplCasadiPlanner
 from planning.planner import Planner
 
-PlannerBuilder = Callable[[DynamicsSimulator, Mapping[str, Any]], Planner]
+PlannerBuilder = Callable[[SystemSimulator, Mapping[str, Any]], Planner]
 
 # The experts the config can choose (``expert``): the MPC alone, or the MPC with the goal configuration and the first
 # guess of the path planner. The path alone is no expert: a jerk-limited arm cannot follow it step by step.
@@ -27,7 +27,7 @@ class PlannerFactory:
     @staticmethod
     def create(
         planner_name: str,
-        simulator: DynamicsSimulator,
+        simulator: SystemSimulator,
         config: Mapping[str, Any],
     ) -> Planner:
         try:

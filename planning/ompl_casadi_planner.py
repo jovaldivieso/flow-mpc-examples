@@ -4,7 +4,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from dynamics.dynamics import DynamicsSimulator
+from systems.system import SystemSimulator
 from planning.casadi_planner import CasadiPlanner
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, PlannerSolveError
@@ -22,7 +22,7 @@ class OmplCasadiPlanner(CasadiPlanner):
     plan instead (``trajectory_fallbacks``).
     """
 
-    def __init__(self, simulator: DynamicsSimulator, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: SystemSimulator, config: Mapping[str, Any]) -> None:
         super().__init__(simulator, config)
         self.path_planner = OmplPlanner(simulator, config)
         self.replan_distance = float(config["ompl_replan_distance"])

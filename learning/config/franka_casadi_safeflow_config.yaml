@@ -31,3 +31,4 @@ training:
   eval_tolerance_overrides:
     pos_tol: 0.1
     vel_tol: 0.02
+  num_workers: 4

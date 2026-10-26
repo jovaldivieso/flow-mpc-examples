@@ -59,17 +59,6 @@ class FlowPolicy(ActionPolicy):
         obs_cond = observation_features(observation_dict)
         return self.velocity_net.compute_loss(obs_cond, actions)
 
-    def compute_path_loss(
-        self,
-        observation_dict: Mapping[str, torch.Tensor],
-        x_t: torch.Tensor,
-        dx_t: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        """Velocity regression along given (projected) paths, see ``FlowVelocityNet.compute_path_loss``."""
-        obs_cond = observation_features(observation_dict)
-        return self.velocity_net.compute_path_loss(obs_cond, x_t, dx_t, t)
-
     @torch.no_grad()
     def select_action(self, observation_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
         obs_cond = observation_features(observation_dict)

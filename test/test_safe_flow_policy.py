@@ -13,12 +13,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import validate_system_config
-from dynamics.franka_dynamics import Q_READY, FrankaDynamics
+from systems.franka_system import Q_READY, FrankaSystem
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy import PolicyFactory
+from learning.models.policy_factory import PolicyFactory
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.planner import PlannerSolveError
 from planning.casadi_projector import CasadiTrajectoryProjector
+from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 
@@ -31,9 +32,6 @@ PINNED_EXPERT_SETTINGS = {
     "vel_tol": 0.02,
 }
 HORIZON = 10
-# Two goal configurations (7,): which one the arm holds must never matter to the projection.
-GOAL = [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.5]
-OTHER_GOAL = [0.2, -0.7, 0.1, -1.8, -0.2, 1.3, 0.8]
 
 
 def _validated_config(**overrides) -> dict:
@@ -44,24 +42,29 @@ def _validated_config(**overrides) -> dict:
     return validate_system_config(raw_config=raw_config)
 
 
-def _build_simulator(goal: list[float] = GOAL, **overrides) -> FrankaDynamics:
+# Two goal poses (12,), of two configurations: which one the arm holds must never matter to the projection.
+GOAL = list(pose_goal(FrankaSystem(_validated_config()), np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.5])))
+OTHER_GOAL = list(pose_goal(FrankaSystem(_validated_config()), np.array([0.2, -0.7, 0.1, -1.8, -0.2, 1.3, 0.8])))
+
+
+def _build_simulator(goal: list[float] = GOAL, **overrides) -> FrankaSystem:
     """The arm with an explicit, non-randomized goal pose."""
-    return FrankaDynamics(_validated_config(goal=goal, **overrides))
+    return FrankaSystem(_validated_config(goal=goal, **overrides))
 
 
-def _rest_state(simulator: FrankaDynamics) -> np.ndarray:
+def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     """Ready pose with the wrist turned by 0.3 rad, at rest."""
     q = Q_READY.copy()
     q[6] += 0.3
     return np.concatenate([q, np.zeros(2 * simulator.n)])
 
 
-def _rest_observation_dict(simulator: FrankaDynamics) -> dict[str, torch.Tensor]:
+def _rest_observation_dict(simulator: FrankaSystem) -> dict[str, torch.Tensor]:
     """The policy input (a batch of one) for the arm at rest in the ready pose."""
     return _policy_input(simulator, _rest_state(simulator))
 
 
-def _policy_input(simulator: FrankaDynamics, state: np.ndarray) -> dict[str, torch.Tensor]:
+def _policy_input(simulator: FrankaSystem, state: np.ndarray) -> dict[str, torch.Tensor]:
     policy_observation = simulator.policy_observation(simulator.observe(state))
     return {
         name: torch.as_tensor(np.expand_dims(value, axis=0), dtype=torch.float32)
@@ -71,15 +74,13 @@ def _policy_input(simulator: FrankaDynamics, state: np.ndarray) -> dict[str, tor
 
 def _build_safe_flow_policy(simulator, planner_config=None, **policy_options) -> SafeFlowMPCPolicy:
     # The flow policy conditions directly on observation_features:
-    # environment_state(12) + state(21) = 33 = simulator.obs_dim, so state_dim
-    # must be 33 -- a mismatch here would only surface once something
-    # actually calls select_action with this policy, not at construction.
+    # environment_state(19) + state(21) = 40 = simulator.environment_dim + simulator.nx.
     # The chunk is jerks, scaled by their limits exactly as DaggerTrainer passes it;
     # planner_config defaults to the validated expert config, as it does there. policy_options are the
     # safeflow options (flow_init, use_guidance).
     policy = PolicyFactory.create(
         "safeflow",
-        action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
+        action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
         num_inference_steps=2, action_scale=simulator.max_action.tolist(),
         simulator=simulator, planner_config=_validated_config() if planner_config is None else planner_config,
         **policy_options,
@@ -114,7 +115,7 @@ class GoalAnchorIndependenceTests(unittest.TestCase):
     terminal velocity -- is built
     from the state invert_obs reconstructs from the observation, which
     carries no goal; the goal used there is never anything more than a
-    fixed, self-consistent local anchor. See learning/models/policy.py's
+    fixed, self-consistent local anchor. See learning/models/policy_factory.py's
     comment for the one way this could stop being true (a future
     world-frame-referencing term).
     """
@@ -123,7 +124,7 @@ class GoalAnchorIndependenceTests(unittest.TestCase):
         simulator = _build_simulator(goal=GOAL)
         policy = _build_safe_flow_policy(simulator)
 
-        np.testing.assert_allclose(policy.local_sim.goal, np.zeros(7))
+        np.testing.assert_allclose(policy.local_sim.goal, np.zeros(12))
         # projector.sim and local_sim must still be the same object
         # (both are PolicyFactory.create's own copy) -- a projector never
         # needs a goal of its own, separate from local_sim's.
@@ -290,7 +291,7 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
     def test_requires_simulator_and_planner_config(self) -> None:
         simulator = _build_simulator()
         flow_kwargs = dict(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
+            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=HORIZON, num_inference_steps=2,
         )
         for given in ({}, {"simulator": simulator}, {"planner_config": {}}):
@@ -303,7 +304,7 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
 
         self.assertEqual(policy.projector.N, HORIZON)
         self.assertEqual(policy.projector.tracked_horizon, HORIZON)
-        self.assertIsInstance(policy.local_sim, FrankaDynamics)
+        self.assertIsInstance(policy.local_sim, FrankaSystem)
         # What the terminal come-to-rest cost reads: the arm's joint velocities and accelerations, state = [q, v, a].
         self.assertEqual(policy.projector.rest_idx, list(range(7, 21)))
 
@@ -354,12 +355,11 @@ class SelectActionProjectionTests(unittest.TestCase):
         action = policy.select_action(observation_dict)
 
         self.assertEqual(len(calls), policy.inner_policy.velocity_net.num_inference_steps)
-        flat_observation = np.concatenate(
-            [observation_dict["observation.environment_state"][0].numpy(), observation_dict["observation.state"][0].numpy()]
-        )
+        # the projector gets the observation [goal, state] rebuilt from what the policy saw
+        expected_observation = simulator.observe(_rest_state(simulator))
         for obs, q_ref, _ in calls:
             self.assertEqual(obs.shape, (simulator.obs_dim,))
-            np.testing.assert_allclose(obs, flat_observation)
+            np.testing.assert_allclose(obs, expected_observation, atol=1e-5)
             self.assertEqual(q_ref.shape, (HORIZON, simulator.nu))
         np.testing.assert_allclose(calls[0][1], expected_x0[0].numpy() * simulator.max_action, rtol=1e-5, atol=1e-4)
         np.testing.assert_allclose(calls[1][1], calls[0][2], rtol=1e-5, atol=1e-5)
@@ -470,7 +470,7 @@ class StateDictInterchangeTests(unittest.TestCase):
         simulator = _build_simulator()
         safe_policy = _build_safe_flow_policy(simulator)
         flow_policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.obs_dim, unet_dim=8, unet_dim_mults=(1, 2),
+            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=HORIZON, num_inference_steps=2,
         )
         flow_state_dict = {name: value.clone() for name, value in flow_policy.state_dict().items()}
