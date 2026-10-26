@@ -89,6 +89,8 @@ class FlowVelocityNet(nn.Module):
         # gaining an unexpected key.
         self.register_buffer("action_scale", action_scale_tensor, persistent=False)
 
+        self._flow_time_distribution = torch.distributions.Beta(torch.tensor(TIME_BETA_ALPHA), torch.tensor(TIME_BETA_BETA))
+
         self.unet = TemporalUnet(
             horizon=self.prediction_horizon,
             transition_dim=self.action_dim,
@@ -96,6 +98,11 @@ class FlowVelocityNet(nn.Module):
             dim=unet_dim,
             dim_mults=tuple(int(m) for m in unet_dim_mults),
         )
+
+    def reset(self) -> None:
+        """Start of a new episode. The network keeps nothing between calls; the call goes on to the U-Net so that a
+        stateful layer added anywhere below is reset by it."""
+        self.unet.reset()
 
     def predict_velocity(
         self,
@@ -112,9 +119,11 @@ class FlowVelocityNet(nn.Module):
         x_0 = torch.randn_like(actions)
         # t = 1 - Beta(1.5, 1): the density rises toward t = 0, so the early, noisy part of the flow gets more of the
         # training steps than the end of it, where the target is almost determined (SafeFlowMPC's training scripts)
-        # Sampled on the CPU: the Dirichlet sampler behind Beta is not implemented on the MPS backend
-        beta_distribution = torch.distributions.Beta(torch.tensor(TIME_BETA_ALPHA), torch.tensor(TIME_BETA_BETA))
-        t = 1.0 - beta_distribution.sample((batch_size,)).to(device=actions.device, dtype=actions.dtype)
+        # Sampled on the CPU: the Dirichlet sampler behind Beta is not implemented on the MPS backend. The copy to the
+        # device does not wait for the host (non_blocking); everything else is created on the device it is used on.
+        t = 1.0 - self._flow_time_distribution.sample((batch_size,)).to(
+            device=actions.device, dtype=actions.dtype, non_blocking=True
+        )
         t_expanded = t.view(batch_size, 1, 1)
         x_t = t_expanded * x_1 + (1.0 - t_expanded) * x_0
         target_velocity = x_1 - x_0

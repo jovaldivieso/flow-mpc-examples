@@ -12,6 +12,9 @@ import yaml
 
 from systems.franka_system import Q_READY, FrankaSystem
 from planning.config import validate_system_config
+from planning.ompl_planner import initialize_ompl
+
+initialize_ompl(0)  # the entry point of the planner tests: OMPL's seed and log level are set once per process
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EXPERT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")

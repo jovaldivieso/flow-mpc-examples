@@ -19,10 +19,11 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import load_and_validate_system_config
 from systems.franka_system import FrankaSystem
 from learning.config_loaders import FlowConfig, UnetConfig
+from learning.data_utils import build_dataset_features
 from learning.dagger.dagger_trainer import MIN_LEARNING_RATE, WEIGHT_DECAY, _validate_resumable_dataset_schema
 from learning.dagger.metrics import DaggerEvalMetrics
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from learning.train_dagger import DaggerConfig, DaggerTrainer
 
@@ -83,7 +84,7 @@ class DaggerConfigRoundSeedsTests(unittest.TestCase):
 class DaggerConfigExpertBetaPerIterationTests(unittest.TestCase):
     def test_single_or_matching_length_beta_list_is_accepted(self) -> None:
         cfg_single = _minimal_dagger_config(dagger_iterations=3, expert_beta_per_iteration=[0.9])
-        self.assertEqual(cfg_single.expert_beta_per_iteration, [0.9])
+        self.assertEqual(cfg_single.expert_beta_per_iteration, [0.9, 0.9, 0.9])
         cfg_multi = _minimal_dagger_config(dagger_iterations=3, expert_beta_per_iteration=[0.9, 0.6, 0.3])
         self.assertEqual(cfg_multi.expert_beta_per_iteration, [0.9, 0.6, 0.3])
 
@@ -115,47 +116,102 @@ class DaggerConfigEvalToleranceOverridesTests(unittest.TestCase):
             _minimal_dagger_config(eval_tolerance_overrides={"pos_tol": -0.1})
 
 
-class DaggerTrainerSchedulesRoundSeedsTests(unittest.TestCase):
-    def test_length_one_round_seeds_broadcasts_to_every_round(self) -> None:
-        _, _, betas, _, round_seeds = DaggerTrainer.schedules(
-            trajectories=[10],
-            epochs=[10.0],
-            betas=[0.8],
-            rounds=3,
-            round_seeds=[5],
-        )
-        self.assertEqual(betas, [0.8, 0.8, 0.8])
-        self.assertEqual(round_seeds, [5, 5, 5])
+class DaggerConfigPerRoundExpansionTests(unittest.TestCase):
+    """The per-round lists are expanded by DaggerConfig itself: one value is repeated for every round."""
 
-    def test_exact_length_round_seeds_is_preserved(self) -> None:
-        _, _, betas, _, round_seeds = DaggerTrainer.schedules(
-            trajectories=[10],
-            epochs=[10.0],
-            betas=[0.9, 0.6, 0.3],
-            rounds=3,
-            round_seeds=[0, 0, 1],
-        )
-        self.assertEqual(betas, [0.9, 0.6, 0.3])
-        self.assertEqual(round_seeds, [0, 0, 1])
+    def test_length_one_lists_are_repeated_for_every_round(self) -> None:
+        cfg = _minimal_dagger_config(dagger_iterations=3, round_seeds=[5], training_curriculum=["config"])
 
-    def test_mismatched_round_seeds_length_raises(self) -> None:
-        with self.assertRaises(ValueError):
-            DaggerTrainer.schedules(
-                trajectories=[10],
-                epochs=[10.0],
-                betas=[0.8],
-                rounds=3,
-                round_seeds=[0, 1],
-            )
+        self.assertEqual(cfg.trajectories_per_iteration, [10, 10, 10])
+        self.assertEqual(cfg.target_epochs_per_round, [10.0, 10.0, 10.0])
+        self.assertEqual(cfg.expert_beta_per_iteration, [0.8, 0.8, 0.8])
+        self.assertEqual(cfg.round_seeds, [5, 5, 5])
+        self.assertEqual(cfg.training_curriculum, ["config", "config", "config"])
 
-    def test_omitted_round_seeds_stays_none(self) -> None:
-        _, _, _, _, round_seeds = DaggerTrainer.schedules(
-            trajectories=[10],
-            epochs=[10.0],
-            betas=[0.8],
-            rounds=3,
+    def test_exact_length_lists_are_preserved(self) -> None:
+        cfg = _minimal_dagger_config(
+            dagger_iterations=3, expert_beta_per_iteration=[0.9, 0.6, 0.3], round_seeds=[0, 0, 1],
+            trajectories_per_iteration=[4, 5, 6], target_epochs_per_round=[1.0, 2.0, 3.0],
         )
-        self.assertIsNone(round_seeds)
+
+        self.assertEqual(cfg.expert_beta_per_iteration, [0.9, 0.6, 0.3])
+        self.assertEqual(cfg.round_seeds, [0, 0, 1])
+        self.assertEqual((cfg.trajectories_per_iteration, cfg.target_epochs_per_round), ([4, 5, 6], [1.0, 2.0, 3.0]))
+
+    def test_a_list_of_another_length_is_rejected_whichever_it_is(self) -> None:
+        for name, value in (
+            ("trajectories_per_iteration", [1, 2]),
+            ("expert_beta_per_iteration", [0.5, 0.5]),
+            ("target_epochs_per_round", [1.0, 2.0]),
+            ("round_seeds", [0, 1]),
+            ("training_curriculum", ["random", "config"]),
+        ):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                _minimal_dagger_config(dagger_iterations=3, **{name: value})
+
+    def test_omitted_round_seeds_and_curriculum_stay_none(self) -> None:
+        cfg = _minimal_dagger_config(dagger_iterations=3)
+        self.assertIsNone(cfg.round_seeds)
+        self.assertIsNone(cfg.training_curriculum)
+
+    def test_the_trainer_has_no_schedule_expansion_of_its_own(self) -> None:
+        self.assertFalse(hasattr(DaggerTrainer, "schedules"))
+        self.assertFalse(hasattr(DaggerTrainer, "persist_round_summary"))
+
+
+class DaggerEvalMetricsSummaryTests(unittest.TestCase):
+    """DaggerEvalMetrics structures its own entry of training_summary.yaml."""
+
+    def _metrics(self, **overrides) -> DaggerEvalMetrics:
+        fields = dict(
+            success_rate=0.5, mean_steps=40.0, min_steps=20, max_steps=60, num_episodes=4,
+            config_successes=1, config_num_episodes=2, random_successes=1, random_num_episodes=2,
+            timeout_failures=1, solve_failures=0, collision_failures=1,
+        )
+        return DaggerEvalMetrics(**{**fields, **overrides})
+
+    def test_to_dict_is_the_evaluation_part_of_the_entry(self) -> None:
+        self.assertEqual(
+            self._metrics().to_dict(),
+            {
+                "eval_success_rate": 0.5, "eval_mean_steps": 40.0, "eval_min_steps": 20, "eval_max_steps": 60,
+                "eval_num_episodes": 4,
+                "eval_success_by_source": {
+                    "config": {"successes": 1, "total": 2, "rate": 50.0},
+                    "random": {"successes": 1, "total": 2, "rate": 50.0},
+                },
+                "eval_failure_breakdown": {"timeout": 1, "solve_failure": 0, "collision": 1},
+            },
+        )
+
+    def test_a_source_with_no_episodes_has_no_rate(self) -> None:
+        by_source = self._metrics(config_successes=0, config_num_episodes=0).to_dict()["eval_success_by_source"]
+        self.assertEqual(by_source["config"], {"successes": 0, "total": 0, "rate": None})
+
+    def test_a_round_that_was_not_evaluated_has_the_same_keys_without_rates_and_with_zero_counts(self) -> None:
+        empty = DaggerEvalMetrics.not_evaluated()
+
+        self.assertEqual(set(empty), set(self._metrics().to_dict()))
+        self.assertIsNone(empty["eval_success_rate"])
+        self.assertEqual(empty["eval_failure_breakdown"], {"timeout": 0, "solve_failure": 0, "collision": 0})
+        self.assertEqual(empty["eval_success_by_source"]["random"], {"successes": 0, "total": 0, "rate": None})
+
+    def test_the_collection_summary_has_the_failures_and_the_expert_statistics_when_there_are_any(self) -> None:
+        collected = self._metrics(
+            attempted_episodes=12, discarded_episodes=2, planner_failures=2, policy_solve_fallbacks=1,
+            expert_statistics={"ompl_paths": 10},
+        )
+
+        self.assertEqual(
+            collected.collection_summary(),
+            {
+                "aggregation_failures": {
+                    "attempted_episodes": 12, "discarded_episodes": 2, "planner_failures": 2, "policy_solve_fallbacks": 1,
+                },
+                "expert_statistics": {"ompl_paths": 10},
+            },
+        )
+        self.assertNotIn("expert_statistics", self._metrics().collection_summary())
 
 
 class DaggerTrainerSummaryYamlTests(unittest.TestCase):
@@ -292,7 +348,7 @@ class ResumableDatasetSchemaTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.features = FrankaSystem(load_and_validate_system_config(EXPERT_CONFIG_PATH)).get_dataset_features(16)
+        cls.features = build_dataset_features(FrankaSystem(load_and_validate_system_config(EXPERT_CONFIG_PATH)), 16)
 
     def test_matching_schema_is_accepted(self) -> None:
         _validate_resumable_dataset_schema(copy.deepcopy(self.features), self.features)
@@ -401,13 +457,12 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     self.assertEqual(value.device.type, "cpu")
                     torch.testing.assert_close(value, expected[name].cpu())
 
-    def test_setup_builds_the_safeflow_projector_on_a_goal_zeroed_copy_of_the_simulator(self) -> None:
+    def test_setup_builds_the_safeflow_projector_on_the_trainers_simulator(self) -> None:
         trainer = self._setup_trainer("safeflow")
 
         self.assertIsInstance(trainer.policy, SafeFlowMPCPolicy)
         self.assertEqual(trainer.policy.projector.N, self.PREDICTION_HORIZON)
-        self.assertIsNot(trainer.policy.local_sim, trainer.simulator)
-        self.assertTrue((trainer.policy.local_sim.goal == 0.0).all())
+        self.assertIs(trainer.policy.projector.sim, trainer.simulator)
 
     def test_checkpoints_follow_the_documented_schema_and_rebuild_a_flow_policy(self) -> None:
         for policy_type in ("flow", "safeflow"):
@@ -444,7 +499,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 )
 
                 # 'flow' and 'safeflow' checkpoints are interchangeable: a bare FlowPolicy rebuilt
-                # from the checkpoint's own metadata loads either one.
+                # from the checkpoint's own metadata loads either one (through the loading utility).
                 rebuilt = PolicyFactory.create(
                     "flow",
                     action_dim=checkpoint["action_dim"],
@@ -455,7 +510,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     num_inference_steps=checkpoint["flow_config"]["num_inference_steps"],
                     action_scale=checkpoint["flow_config"]["action_scale"],
                 )
-                rebuilt.load_state_dict(checkpoint["ema_model_state_dict"])
+                load_policy_state_dict(rebuilt, checkpoint["ema_model_state_dict"])
                 prefix = "inner_policy." if policy_type == "safeflow" else ""
                 self.assertEqual({prefix + name for name in rebuilt.state_dict()}, set(checkpoint["ema_model_state_dict"]))
                 for name, value in rebuilt.state_dict().items():

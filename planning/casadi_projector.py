@@ -4,9 +4,9 @@ from typing import Any, Mapping
 import casadi as ca
 import numpy as np
 
-from planning.casadi_planner import PROXQP_OPTIONS
+from planning.casadi_graph import CasadiKinematicGraph
 from planning.planner import PlannerSolveError
-from systems.system import SystemSimulator
+from systems.kinematic_collision_system import KinematicCollisionSystem
 
 
 class CasadiTrajectoryProjector:
@@ -14,9 +14,9 @@ class CasadiTrajectoryProjector:
     CasADi (ProxQP) projection of the flow policy's proposed action chunk onto the safe set (SafeFlowMPC, Oelerich et
     al., 2026).
 
-    ``project`` takes an observation and a proposed action chunk ``u_ref`` (H, nu) and returns the closest safe action
-    chunk (H, nu), whose first row is executed. Each call keeps its solution as the warm start of the next. If a solve
-    fails, the previous safe solution shifted by one step is revalidated and reused (SafeFlowMPC, Theorem 2) for at
+    ``project`` takes the current state (as the policy observes it, see ``SystemSimulator.state_from_policy``) and a
+    proposed action chunk ``u_ref`` (H, nu) and returns the closest safe action chunk (H, nu), whose first row is
+    executed. Each call keeps its solution as the warm start of the next. If a solve fails, the previous safe solution shifted by one step is revalidated and reused (SafeFlowMPC, Theorem 2) for at
     most ``max_consecutive_fallbacks`` ticks in a row; else it raises ``PlannerSolveError``. The unprojected proposal
     is never returned.
 
@@ -39,7 +39,8 @@ class CasadiTrajectoryProjector:
                              x_lower <= x_k <= x_upper                   position, velocity, acceleration limits, k = 1 .. N
                              A_coll,k q_k + s_k >= b_coll,k,  s_k >= 0   linearized sphere-obstacle half-spaces, k = 1 .. N
 
-    The task goal is not part of the problem.
+    The task goal is not part of the problem: the projector never reads the goal of its ``simulator`` (only the dynamics,
+    the limits and the obstacles), so it can share the simulator of the rollout instead of holding a copy of its own.
 
     Solver Choice (``Opti("conic")`` + ``proxqp``)
     ----------------------------------------------
@@ -48,91 +49,45 @@ class CasadiTrajectoryProjector:
     the tracking + terminal-rest objective is strictly convex quadratic, CasADi's ``Opti("conic")`` transcribes the
     projection into a sparse QP solved in ~1 ms by **ProxQP** with primal-dual warm starting across adjacent Euler
     steps and control ticks.
+
+    Initial guess strategy
+    ----------------------
+    The first solve after a reset starts from the current state held still (zero actions: within the limits whatever
+    the proposal is, which a guess following a far-off proposal, such as the flow's initial noise, is not). Within a
+    control tick (the same ``x_init``; only the proposal is refined between flow steps) the last solution is reused as it
+    is; at a new tick it is the previous solution shifted by one step with zero jerk appended (the rest state it ends in
+    is a fixed point). The multipliers ``lam_g`` are warm started the same way. A solve that fails is restarted cold
+    from the state held still; if that fails too, the previous safe solution is the fallback (see above).
     """
 
-    def __init__(self, local_sim: SystemSimulator, config: Mapping[str, Any], *, horizon: int):
-        self.sim = local_sim
+    def __init__(self, simulator: KinematicCollisionSystem, config: Mapping[str, Any], *, horizon: int):
         # The chunk length is the flow policy's prediction horizon, not the expert's ``horizon``
-        self.tracked_horizon = self.N = int(horizon)
-        if self.N < 1:
+        if int(horizon) < 1:
             raise ValueError("'horizon' must be at least 1.")
-        self.terminal_velocity_weight = float(config.get("terminal_velocity_weight", 1.0))
-        if self.terminal_velocity_weight <= 0:
-            raise ValueError("'terminal_velocity_weight' must be positive.")
+        # The scalars of the validated config (planning/config.py), used as they are
+        self.terminal_velocity_weight = float(config["terminal_velocity_weight"])
         # How close to zero the rest velocity and acceleration of a reused trajectory must be
-        self.fallback_terminal_velocity_tol = float(config.get("fallback_terminal_velocity_tol", 1e-2))
-        if self.fallback_terminal_velocity_tol < 0:
-            raise ValueError("'fallback_terminal_velocity_tol' must be non-negative.")
-        self.max_consecutive_fallbacks = int(config.get("max_consecutive_fallbacks", 5))
-        if self.max_consecutive_fallbacks <= 0:
-            raise ValueError("'max_consecutive_fallbacks' must be positive.")
+        self.fallback_terminal_velocity_tol = float(config["fallback_terminal_velocity_tol"])
+        self.max_consecutive_fallbacks = int(config["max_consecutive_fallbacks"])
+        self.sim = simulator
+        self._graph = CasadiKinematicGraph(simulator, horizon)
+        self.tracked_horizon = self.N = self._graph.N
         self.rest_idx = list(self.sim.rest_state_indices)
         max_action = np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1)
 
-        self.opti = ca.Opti("conic")
-        self.X = self.opti.variable(self.sim.nx, self.N + 1)
-        self.U = self.opti.variable(self.sim.nu, self.N)
-        self.x0_param = self.opti.parameter(self.sim.nx)
-        self.u_ref_param = self.opti.parameter(self.sim.nu, self.N)
-
-        x_sym, u_sym = ca.SX.sym("x", self.sim.nx), ca.SX.sym("u", self.sim.nu)
-        step_fn = ca.Function("step", [x_sym, u_sym], [self.sim.casadi_dynamics(x_sym, u_sym)])
-        self.opti.subject_to(self.X[:, 0] == self.x0_param)
-        self.opti.subject_to(self.X[:, 1:] == step_fn.map(self.N)(self.X[:, :-1], self.U))
-        # vec() makes the comparisons element-wise; the per-dimension limits are repeated across the horizon
-        limits = np.repeat(max_action, self.N, axis=1)
-        self.opti.subject_to(ca.vec(self.U) >= ca.vec(-limits))
-        self.opti.subject_to(ca.vec(self.U) <= ca.vec(limits))
-        lower_bounds = np.asarray(self.sim.state_lower_bounds, dtype=float)
-        finite_lower = np.flatnonzero(np.isfinite(lower_bounds)).tolist()
-        if finite_lower:
-            lower = ca.repmat(ca.DM(lower_bounds[finite_lower]), 1, self.N)
-            self.opti.subject_to(ca.vec(self.X[finite_lower, 1:]) >= ca.vec(lower))
-        upper_bounds = np.asarray(self.sim.state_upper_bounds, dtype=float)
-        finite_upper = np.flatnonzero(np.isfinite(upper_bounds)).tolist()
-        if finite_upper:
-            upper = ca.repmat(ca.DM(upper_bounds[finite_upper]), 1, self.N)
-            self.opti.subject_to(ca.vec(self.X[finite_upper, 1:]) <= ca.vec(upper))
-
-        tracking = ca.sumsqr((self.U - self.u_ref_param) / ca.repmat(ca.DM(max_action), 1, self.N))
-        total_cost = tracking + self.terminal_velocity_weight * ca.sumsqr(self.X[self.rest_idx, self.N])
-
-        obstacles = getattr(self.sim, "obstacles", [])
-        if obstacles:
-            _, _, radii = self.sim.collision_spheres(np.zeros(self.sim.n))
-            self.num_collision_pairs = len(radii) * len(obstacles)
-        else:
-            self.num_collision_pairs = 0
-
-        if self.num_collision_pairs > 0:
-            P = self.num_collision_pairs
-            self.A_coll = self.opti.parameter(P * self.N, self.sim.n)
-            self.b_coll = self.opti.parameter(P * self.N)
-            self.slack = self.opti.variable(P * self.N)
-            self.opti.subject_to(self.slack >= 0.0)
-            lhs = ca.vertcat(
-                *[ca.mtimes(self.A_coll[k * P : (k + 1) * P, :], self.X[: self.sim.n, k + 1]) for k in range(self.N)]
-            )
-            self.opti.subject_to(lhs + self.slack >= self.b_coll)
-            total_cost = total_cost + 1e5 * ca.sumsqr(self.slack)
-
-        self.opti.minimize(total_cost)
-
-        # Consecutive solves differ little: the multipliers are warm started too (see CasadiPlanner)
-        self.opti.solver("proxqp", PROXQP_OPTIONS)
+        # Cost: track the proposed chunk (each action divided by its limit) and come to rest at the end of the horizon
+        self.u_ref_param = self._graph.parameter(self.sim.nu, self.N)
+        tracking = ca.sumsqr((self._graph.U - self.u_ref_param) / ca.repmat(ca.DM(max_action), 1, self.N))
+        self._graph.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(self._graph.X[self.rest_idx, self.N]))
         self.reset()
 
     def reset(self) -> None:
         """Signals the start of a new episode: nothing of the last one is reused."""
-        self._prev_lam_g: np.ndarray | None = None
         self._prev_X_sol: np.ndarray | None = None
         self._prev_U_sol: np.ndarray | None = None
         self._prev_x0: np.ndarray | None = None
         self._consecutive_fallback_count = 0
-        if self.num_collision_pairs > 0:
-            self.opti.set_initial(self.slack, 0.0)
-        # set_initial(..., lam_g, ...) is sticky on the Opti object
-        self.opti.set_initial(self.opti.lam_g, 0.0)
+        self._graph.reset()
 
     def next_chunk_guess(self) -> np.ndarray | None:
         """The previous solution's actions shifted by one step, zero actions appended (H, nu): the natural initial
@@ -149,13 +104,6 @@ class CasadiTrajectoryProjector:
         states[:, 0] = x0
         return states, np.zeros((self.sim.nu, self.N))
 
-    def _update_collision_halfspaces(self, q_ref: np.ndarray) -> None:
-        """Linearize obstacle half-spaces along ``q_ref`` (N, n)."""
-        if self.num_collision_pairs > 0:
-            A, b = self.sim.collision_halfspaces(q_ref)
-            self.opti.set_value(self.A_coll, A.reshape(-1, self.sim.n))
-            self.opti.set_value(self.b_coll, b.reshape(-1))
-
     def _revalidate_fallback(self, x0: np.ndarray, u_guess: np.ndarray) -> np.ndarray | None:
         """The states of ``u_guess`` applied from the actual ``x0`` if they respect the limits and end at rest (within
         ``fallback_terminal_velocity_tol``), else None: the cached plan was only verified from the state it was solved from."""
@@ -171,12 +119,15 @@ class CasadiTrajectoryProjector:
         collision_free = all(self.sim.is_collision_free(states[: self.sim.n, k]) for k in range(1, self.N + 1))
         return states if within_limits and at_rest and collision_free else None
 
-    def project(self, obs: np.ndarray, u_ref: np.ndarray) -> np.ndarray:
-        """The projected actions (H, nu) of the proposed chunk ``u_ref`` (H, nu); see the class docstring."""
+    def project(self, state: np.ndarray, u_ref: np.ndarray) -> np.ndarray:
+        """The projected actions (H, nu) of the proposed chunk ``u_ref`` (H, nu) from ``state``, the observed one of the
+        policy (the plant state itself unless the policy cannot see all of it); see the class docstring."""
         u_ref = np.asarray(u_ref, dtype=float)
         if u_ref.shape != (self.N, self.sim.nu):
             raise ValueError(f"u_ref must have shape {(self.N, self.sim.nu)}, got {u_ref.shape}.")
-        x0 = self.sim.invert_obs(obs)
+        x0 = self.sim.state_from_policy(state)
+        if x0.shape != (self.sim.nx,):
+            raise ValueError(f"state must have shape {(self.sim.nx,)}, got {x0.shape}.")
         # Within a control tick (same x0, only the proposal refined between flow steps) the last solution is reused as
         # is; at a new tick it is shifted by one step, with zero jerk appended (the rest state it ends in is a fixed point)
         is_new_control_tick = self._prev_x0 is None or not np.array_equal(x0, self._prev_x0)
@@ -188,40 +139,23 @@ class CasadiTrajectoryProjector:
             state_guess = np.hstack([self._prev_X_sol[:, 1:], self._prev_X_sol[:, -1:]])
             u_guess = np.hstack([self._prev_U_sol[:, 1:], np.zeros((self.sim.nu, 1))])
 
-        self.opti.set_value(self.x0_param, x0)
-        self.opti.set_value(self.u_ref_param, u_ref.T)
-        if self.num_collision_pairs > 0:
-            self._update_collision_halfspaces(self.sim.rollout_positions(x0, u_ref)[1:])
-        self.opti.set_initial(self.X, state_guess)
-        self.opti.set_initial(self.U, u_guess)
-        if self._prev_lam_g is not None:
-            self.opti.set_initial(self.opti.lam_g, self._prev_lam_g)
+        self._graph.set_state(x0)
+        self._graph.set_value(self.u_ref_param, u_ref.T)
+        if self._graph.num_collision_pairs > 0:
+            self._graph.update_collision_halfspaces(self.sim.rollout_positions(x0, u_ref)[1:])
+        self._graph.set_initial(state_guess, u_guess)
 
         try:
             try:
-                sol = self.opti.solve()
+                sol = self._graph.solve()
             except RuntimeError:
                 # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
                 # prediction: a cold restart resolves most of those
                 cold_states, cold_actions = self._hold_still_guess(x0)
-                self.opti.set_initial(self.X, cold_states)
-                self.opti.set_initial(self.U, cold_actions)
-                self.opti.set_initial(self.opti.lam_g, 0.0)
-                sol = self.opti.solve()
-            if self.num_collision_pairs > 0:
-                X_first = sol.value(self.X)
-                if not all(self.sim.is_collision_free(X_first[: self.sim.n, k]) for k in range(1, self.N + 1)):
-                    self._update_collision_halfspaces(X_first[: self.sim.n, 1:].T)
-                    self.opti.set_initial(self.X, X_first)
-                    self.opti.set_initial(self.U, sol.value(self.U))
-                    self.opti.set_initial(self.opti.lam_g, sol.value(self.opti.lam_g))
-                    try:
-                        sol = self.opti.solve()
-                    except RuntimeError:
-                        pass
-            self._prev_lam_g = sol.value(self.opti.lam_g)
-            self._prev_X_sol = sol.value(self.X)
-            self._prev_U_sol = sol.value(self.U)
+                self._graph.set_initial(cold_states, cold_actions, cold=True)
+                sol = self._graph.solve()
+            self._prev_X_sol = sol.states
+            self._prev_U_sol = sol.actions
             self._prev_x0 = x0
             self._consecutive_fallback_count = 0
             return self._prev_U_sol.T.copy()

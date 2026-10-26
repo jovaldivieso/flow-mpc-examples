@@ -4,14 +4,14 @@ from typing import Any, Callable, Mapping
 
 from systems.system import SystemSimulator
 from systems.franka_system import FrankaSystem
-from systems.triple_integrator_system import TripleIntegratorSystem
+from systems.point_mass_system import PointMassSystem
 
 SystemBuilder = Callable[[Mapping[str, Any]], SystemSimulator]
 
 # The systems the config can choose (``system``)
 SYSTEM_REGISTRY: dict[str, SystemBuilder] = {
     "franka": FrankaSystem,
-    "triple_integrator": TripleIntegratorSystem,
+    "triple_integrator": PointMassSystem,
 }
 
 

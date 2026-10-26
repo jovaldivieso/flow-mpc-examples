@@ -3,9 +3,36 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import numpy as np
 import torch
 
+from systems.system import SystemSimulator
+
 StructuredObservation = dict[str, torch.Tensor]
+
+
+def build_dataset_features(simulator: SystemSimulator, prediction_horizon: int) -> dict[str, Any]:
+    """The LeRobot features of ``simulator``'s dataset: what its policy observes and the expert's next
+    ``prediction_horizon`` planned actions flattened row by row."""
+    environment_names, state_names = simulator.environment_state_names, simulator.state_names
+    return {
+        "observation.environment_state": {"dtype": "float32", "shape": (len(environment_names),), "names": environment_names},
+        "observation.state": {"dtype": "float32", "shape": (len(state_names),), "names": state_names},
+        "action": {
+            "dtype": "float32",
+            "shape": (prediction_horizon * simulator.nu,),
+            "names": [f"{name}[t+{k}]" for k in range(prediction_horizon) for name in simulator.action_names],
+        },
+    }
+
+
+def format_dataset_frame(simulator: SystemSimulator, obs: np.ndarray, actions: np.ndarray) -> dict[str, np.ndarray]:
+    """An observation and the expert's planned actions ``(prediction_horizon, nu)`` in the LeRobot format (without
+    ``task``, which the caller adds)."""
+    actions_array = np.asarray(actions, dtype=float)
+    if actions_array.ndim != 2 or actions_array.shape[1] != simulator.nu:
+        raise ValueError(f"actions must have shape (prediction_horizon, {simulator.nu}), got {actions_array.shape}.")
+    return {**simulator.policy_observation(obs), "action": actions_array.reshape(-1).astype(np.float32)}
 
 
 def _tensor_field(sample: Mapping[str, Any], name: str) -> torch.Tensor:

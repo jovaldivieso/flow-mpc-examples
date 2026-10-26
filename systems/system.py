@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Mapping
+from typing import Any, Mapping
 
 import numpy as np
 
 
 DEFAULT_DONE_HOLD_STEPS = 5
-DEFAULT_INITIAL_STATE_SEED = 0
 
 
 class SystemSimulator(ABC):
@@ -15,25 +14,59 @@ class SystemSimulator(ABC):
 
     def __init__(self, config: Mapping[str, Any]):
         self.config = config
-        self.state: np.ndarray | None = None
-        self.time = 0
         self.dt = float(config.get("dt", 0.05))
-        initial_state_seed = config.get("initial_state_seed", DEFAULT_INITIAL_STATE_SEED)
-        if initial_state_seed is None:
-            initial_state_seed = DEFAULT_INITIAL_STATE_SEED
-        self._sampling_rng = np.random.default_rng(int(initial_state_seed))
-        self._rollout_done_counter = 0
-        self._early_rollout_termination_enabled = True
 
-        self.n: int = 0
-        self.nx: int = 0
-        self.nu: int = 0
-        self.obs_dim: int = 0
-        self.max_action: np.ndarray = np.empty(0)
-        self.state_lower_bounds: np.ndarray = np.empty(0)
-        self.state_upper_bounds: np.ndarray = np.empty(0)
-        self.goal: np.ndarray = np.empty(0)
-        self.randomize_goal: bool = False
+    # --- dimensions, limits and goal: what a concrete system must provide -------
+
+    @property
+    @abstractmethod
+    def n(self) -> int:
+        """Number of positions (joints or axes) of the state."""
+
+    @property
+    @abstractmethod
+    def nx(self) -> int:
+        """Dimension of the state."""
+
+    @property
+    @abstractmethod
+    def nu(self) -> int:
+        """Dimension of the action."""
+
+    @property
+    @abstractmethod
+    def obs_dim(self) -> int:
+        """Dimension of the observation ``[goal, state]`` the planners read."""
+
+    @property
+    @abstractmethod
+    def max_action(self) -> np.ndarray:
+        """The largest magnitude of every action component, ``(nu,)``."""
+
+    @property
+    @abstractmethod
+    def state_lower_bounds(self) -> np.ndarray:
+        """The lower limit of every state component, ``(nx,)`` (``-inf`` where there is none)."""
+
+    @property
+    @abstractmethod
+    def state_upper_bounds(self) -> np.ndarray:
+        """The upper limit of every state component, ``(nx,)`` (``inf`` where there is none)."""
+
+    @property
+    @abstractmethod
+    def goal(self) -> np.ndarray:
+        """The current goal vector."""
+
+    @goal.setter
+    @abstractmethod
+    def goal(self, value: np.ndarray) -> None:
+        """Replace the goal (``set_goal`` checks its shape first)."""
+
+    @property
+    @abstractmethod
+    def randomize_goal(self) -> bool:
+        """Whether ``randomize_goal_for_reset`` draws a new goal."""
 
     def randomize_goal_for_reset(self, rng: np.random.Generator) -> None:
         del rng
@@ -62,29 +95,18 @@ class SystemSimulator(ABC):
         end of its horizon; a system with derivative states must override this."""
         return ()
 
-    def reset_rollout_termination(self) -> None:
-        self._rollout_done_counter = 0
+    def collides(self, state: np.ndarray) -> bool:
+        """Ground truth: whether the system in ``state`` touches an obstacle (a system with no obstacles never does).
+        What evaluation counts as a collision, as opposed to the bounding spheres the planners keep clear."""
+        return False
 
-    def set_early_rollout_termination(self, enabled: bool) -> None:
-        enabled_flag = bool(enabled)
-        if enabled_flag != self._early_rollout_termination_enabled:
-            self._rollout_done_counter = 0
-        self._early_rollout_termination_enabled = enabled_flag
-
-    def should_terminate_rollout(self, state: np.ndarray) -> bool:
-        if not self._early_rollout_termination_enabled:
-            return False
-
+    @property
+    def done_hold_steps(self) -> int:
+        """How many consecutive steps ``is_done`` has to hold for a rollout to end (``RolloutTerminationTracker``)."""
         hold_steps = int(self.config.get("done_hold_steps", DEFAULT_DONE_HOLD_STEPS))
         if hold_steps <= 0:
             raise ValueError("'done_hold_steps' must be a positive integer.")
-
-        if self.is_done(state):
-            self._rollout_done_counter += 1
-        else:
-            self._rollout_done_counter = 0
-
-        return self._rollout_done_counter >= hold_steps
+        return hold_steps
 
     @abstractmethod
     def predict_next_state(self, state: np.ndarray, action: np.ndarray) -> np.ndarray:
@@ -103,11 +125,6 @@ class SystemSimulator(ABC):
         """Return the symbolic CasADi discrete-time step expression."""
 
     @abstractmethod
-    def get_dataset_features(self, prediction_horizon: int) -> dict[str, Any]:
-        """Return the LeRobot features dictionary for this system; the action is a chunk of
-        ``prediction_horizon`` actions."""
-
-    @abstractmethod
     def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
         """Return a random initial state without changing the goal."""
 
@@ -119,15 +136,6 @@ class SystemSimulator(ABC):
         """The state of the observation (the part before it is dropped)."""
         return np.asarray(obs, dtype=float)[self.obs_dim - self.nx :]
 
-    def reset_random(self) -> np.ndarray:
-        """Randomize goal (if enabled) and reset to a random valid initial state."""
-        self.randomize_goal_for_reset(self._sampling_rng)
-        return self.reset(self.random_initial_state(self._sampling_rng))
-
-    def reset_random_state_only(self) -> np.ndarray:
-        """Like ``reset_random()``, but keeps the current goal unchanged."""
-        return self.reset(self.random_initial_state(self._sampling_rng))
-
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
         """What the policy sees of an observation: the part before the state and the state, the two dataset features."""
         obs_array = np.asarray(obs, dtype=np.float32)
@@ -136,18 +144,30 @@ class SystemSimulator(ABC):
             "observation.state": obs_array[self.environment_dim :],
         }
 
+    @property
+    @abstractmethod
+    def environment_state_names(self) -> list[str]:
+        """Names of the components of ``policy_observation``'s ``observation.environment_state`` (dataset metadata)."""
+
+    @property
+    @abstractmethod
+    def state_names(self) -> list[str]:
+        """Names of the components of ``policy_observation``'s ``observation.state`` (dataset metadata)."""
+
+    @property
+    @abstractmethod
+    def action_names(self) -> list[str]:
+        """Names of the ``nu`` action components (dataset metadata)."""
+
+    def state_from_policy(self, state: np.ndarray) -> np.ndarray:
+        """The plant state of the ``observation.state`` the policy sees (``nx`` entries): the state itself unless the
+        policy cannot see all of it."""
+        return np.asarray(state, dtype=float)
+
     def observation_from_policy(self, environment_state: np.ndarray, state: np.ndarray) -> np.ndarray:
         """An observation ``[goal, state]`` that gives the policy observation (the inverse of ``policy_observation``,
         up to what the policy cannot see); here the policy sees the observation itself."""
         return np.concatenate([np.asarray(environment_state, dtype=float), np.asarray(state, dtype=float)])
-
-    def format_dataset_frame(self, obs: np.ndarray, actions: np.ndarray) -> dict[str, np.ndarray]:
-        """An observation and the expert's planned actions ``(prediction_horizon, nu)`` in the LeRobot format (without
-        ``task``, which the caller adds)."""
-        actions_array = np.asarray(actions, dtype=float)
-        if actions_array.ndim != 2 or actions_array.shape[1] != self.nu:
-            raise ValueError(f"actions must have shape (prediction_horizon, {self.nu}), got {actions_array.shape}.")
-        return {**self.policy_observation(obs), "action": actions_array.reshape(-1).astype(np.float32)}
 
     def rollout_positions(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
         """The positions ``(len(actions) + 1, n)`` of the plant applying ``actions`` from ``state``, row 0 the current one."""
@@ -157,35 +177,5 @@ class SystemSimulator(ABC):
         return np.array(states)[:, : self.n]
 
     def reset(self, initial_state: np.ndarray) -> np.ndarray:
-        """Reset system state and time step."""
-        self.state = np.asarray(initial_state, dtype=float).copy()
-        self.time = 0
-        self.reset_rollout_termination()
-        return self.state
-
-    def simulate(
-        self,
-        initial_state: np.ndarray,
-        policy_fn: Callable[[np.ndarray], np.ndarray],
-        num_steps: int,
-    ) -> dict[str, np.ndarray]:
-        """Simulate a trajectory."""
-        states, observations, actions = [], [], []
-        state = self.reset(initial_state)
-
-        for _ in range(num_steps):
-            obs = self.observe(state)
-            action = policy_fn(obs)
-            state = self.step(state, action)
-            states.append(state.copy())
-            observations.append(obs)
-            actions.append(action)
-
-            if self.should_terminate_rollout(state):
-                break
-
-        return {
-            "states": np.array(states),
-            "observations": np.array(observations),
-            "actions": np.array(actions),
-        }
+        """Start a rollout: a copy of ``initial_state``."""
+        return np.asarray(initial_state, dtype=float).copy()

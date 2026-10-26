@@ -16,8 +16,10 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
+from learning.data_utils import build_dataset_features
 from learning.dagger.rollouts import (
     RolloutWorkerSpec,
+    _setup_episode_start,
     apply_execution_noise,
     build_policy_action,
     collect_dagger_rollouts,
@@ -44,13 +46,14 @@ class _FakeSimulator:
         self.goal = np.array([0.0], dtype=float)
         self.nx = 1
         self.n = 1
+        self.nu = 1
         self.dt = 0.05
         self.max_action = np.array([1e9], dtype=float)
+        self.collision_threshold = collision_threshold
         self.goal_threshold = goal_threshold
         self.done_hold_steps = done_hold_steps
         self.state: np.ndarray | None = None
         self.step_call_count = 0
-        self._rollout_done_counter = 0
 
     @property
     def goal_dim(self) -> int:
@@ -67,11 +70,7 @@ class _FakeSimulator:
 
     def reset(self, state: np.ndarray) -> np.ndarray:
         self.state = np.asarray(state, dtype=float).copy()
-        self.reset_rollout_termination()
         return self.state.copy()
-
-    def reset_rollout_termination(self) -> None:
-        self._rollout_done_counter = 0
 
     def observe(self, state: np.ndarray) -> np.ndarray:
         return np.asarray(state, dtype=float).copy()
@@ -89,31 +88,14 @@ class _FakeSimulator:
     def is_done(self, state: np.ndarray) -> bool:
         return bool(np.asarray(state, dtype=float)[0] >= self.goal_threshold)
 
-    def should_terminate_rollout(self, state: np.ndarray) -> bool:
-        """Mirrors SystemSimulator.should_terminate_rollout's consecutive-hold-steps contract."""
-        if self.is_done(state):
-            self._rollout_done_counter += 1
-        else:
-            self._rollout_done_counter = 0
-        return self._rollout_done_counter >= self.done_hold_steps
-
-    def format_dataset_frame(self, obs: np.ndarray, plan: np.ndarray) -> dict[str, np.ndarray]:
-        """Mirrors FrankaSystem.format_dataset_frame: ONE mapping (no ``task`` -- the caller adds it).
-
-        The dataset action is the expert's planned actions (prediction_horizon, nu) flattened row by row.
-        """
-        return {
-            "observation.environment_state": self.goal.astype(np.float32),
-            "observation.state": np.asarray(obs, dtype=np.float32),
-            "action": np.asarray(plan, dtype=np.float32).reshape(-1),
-        }
+    def collides(self, state: np.ndarray) -> bool:
+        return bool(np.asarray(state, dtype=float)[0] >= self.collision_threshold)
 
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
         """Mirrors SystemSimulator.policy_observation: the dataset's two observation keys, float32."""
-        frame = self.format_dataset_frame(obs, np.zeros((1, self.n)))
         return {
-            "observation.environment_state": frame["observation.environment_state"],
-            "observation.state": frame["observation.state"],
+            "observation.environment_state": self.goal.astype(np.float32),
+            "observation.state": np.asarray(obs, dtype=np.float32),
         }
 
 
@@ -591,6 +573,24 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         self.assertEqual(metrics.timeout_failures, 1)
         self.assertEqual(metrics.solve_failures, 1)
 
+    def test_an_episode_that_touches_an_obstacle_fails_as_a_collision_even_at_the_goal(self) -> None:
+        # the state steps to 1.0, which is both at the goal and inside the obstacle
+        simulator = _FakeSimulator(goal_threshold=1.0, collision_threshold=1.0)
+
+        metrics = evaluate_policy_rollouts(
+            simulator=simulator,
+            num_episodes=2,
+            num_steps=3,
+            seed_start=0,
+            action_fn=lambda observation: np.array([1.0]),
+            initial_states=[[0.0], [-5.0]],
+        )
+
+        assert metrics is not None
+        self.assertEqual(metrics.collision_failures, 1)
+        self.assertEqual(metrics.timeout_failures, 1)  # the second never gets near
+        self.assertEqual(metrics.success_rate, 0.0)
+
     def test_successful_episodes_are_not_counted_as_any_failure(self) -> None:
         simulator = _FakeSimulator(goal_threshold=0.0)
         metrics = evaluate_policy_rollouts(
@@ -605,6 +605,45 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         self.assertEqual(metrics.success_rate, 1.0)
         self.assertEqual(metrics.timeout_failures, 0)
         self.assertEqual(metrics.solve_failures, 0)
+
+
+class SetupEpisodeStartTests(unittest.TestCase):
+    """Collection and evaluation start an episode through the one helper ``_setup_episode_start``."""
+
+    def setUp(self) -> None:
+        self.simulator = _FakeSimulator()
+        self.baseline = np.array([0.25])
+        self.simulator.set_goal(self.baseline)
+        self.states = [np.array([0.5]), np.array([0.6])]
+        self.goals = [np.array([0.7]), np.array([0.8])]
+
+    def _start(self, index: int, usable: int, goals: list, seed: int = 3):
+        return _setup_episode_start(self.simulator, index, usable, self.states, goals, self.baseline, seed)
+
+    def test_a_provided_episode_takes_its_state_and_its_goal_from_the_lists(self) -> None:
+        state = self._start(1, usable=2, goals=self.goals)
+
+        np.testing.assert_array_equal(state, [0.6])
+        np.testing.assert_array_equal(self.simulator.goal, [0.8])
+
+    def test_a_provided_state_without_goals_draws_the_goal_from_the_seed(self) -> None:
+        state = self._start(0, usable=2, goals=[], seed=3)
+        first_goal = self.simulator.goal.copy()
+        self._start(0, usable=2, goals=[], seed=3)
+
+        np.testing.assert_array_equal(state, [0.5])
+        np.testing.assert_array_equal(self.simulator.goal, first_goal)  # the same seed, the same goal
+        self.assertNotEqual(float(first_goal[0]), float(self.baseline[0]))
+
+    def test_an_episode_beyond_the_provided_ones_restores_the_baseline_goal_and_samples_a_start(self) -> None:
+        self.simulator.set_goal(np.array([9.0]))  # what an earlier explicit episode left behind
+
+        with mock.patch("learning.dagger.rollouts.sample_initial_state", return_value=np.array([0.1])) as sample:
+            state = self._start(2, usable=2, goals=self.goals, seed=5)
+
+        np.testing.assert_array_equal(state, [0.1])
+        np.testing.assert_array_equal(self.simulator.goal, self.baseline)
+        self.assertEqual(sample.call_args.args[1], 5)
 
 
 class ApplyExecutionNoiseTests(unittest.TestCase):
@@ -688,9 +727,9 @@ class BuildPolicyActionTests(unittest.TestCase):
 
 
 class DefaultFrameBuilderTests(unittest.TestCase):
-    """Without a frame_builder, collect_dagger_rollouts uses the simulator's
-    own format_dataset_frame -- ONE mapping per step (the arm is a single
-    robot) -- and adds the LeRobot ``task`` string: the simulator's
+    """Without a frame_builder, collect_dagger_rollouts formats frames with
+    data_utils.format_dataset_frame -- ONE mapping per step (the arm is a
+    single robot) -- and adds the LeRobot ``task`` string: the simulator's
     task_description if it has one, else "reach target".
     """
 
@@ -715,7 +754,7 @@ class DefaultFrameBuilderTests(unittest.TestCase):
         )
         return writer
 
-    def test_frames_come_from_the_simulators_dataset_frame_with_its_task_description(self) -> None:
+    def test_frames_are_the_formatted_dataset_frames_with_the_simulators_task_description(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
         simulator.task_description = "reach fake target"
 
@@ -779,7 +818,6 @@ class RolloutsWithTheArmTests(unittest.TestCase):
                 expert_mixing_beta=1.0,
                 prediction_horizon=PREDICTION_HORIZON,
                 policy_action_fn=None,
-                frame_builder=simulator.format_dataset_frame,
                 initial_states=[self.initial_state.tolist()],
                 goal_states=[self.goal.tolist()],
             )
@@ -787,7 +825,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         self.assertEqual(metrics.num_episodes, 1)
         self.assertEqual(len(writer.frames), 3)
         self.assertEqual(writer.episode_boundaries, [3])
-        features = simulator.get_dataset_features(PREDICTION_HORIZON)
+        features = build_dataset_features(simulator, PREDICTION_HORIZON)
         for frame in writer.frames:
             self.assertEqual(set(frame), set(features) | {"task"})
             for name, feature in features.items():

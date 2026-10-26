@@ -36,6 +36,42 @@ class PlannerConfig:
     fallback_terminal_velocity_tol: float = 1e-2
     max_consecutive_fallbacks: int = 5
 
+    def __post_init__(self) -> None:
+        if self.r_weight <= 0:
+            raise ConfigurationError("'R_weight' must be positive.")
+        if self.expert not in PlannerFactory.names():
+            raise ConfigurationError(f"'expert' must be one of {', '.join(PlannerFactory.names())}, got {self.expert!r}.")
+        if self.horizon <= 0:
+            raise ConfigurationError("'horizon' must be positive.")
+        if self.terminal_cost_multiplier <= 0:
+            raise ConfigurationError("'terminal_cost_multiplier' must be positive.")
+        if self.terminal_velocity_weight <= 0:
+            raise ConfigurationError("'terminal_velocity_weight' must be positive.")
+        if self.fallback_terminal_velocity_tol < 0:
+            raise ConfigurationError("'fallback_terminal_velocity_tol' must be non-negative.")
+        if self.max_consecutive_fallbacks <= 0:
+            raise ConfigurationError("'max_consecutive_fallbacks' must be positive.")
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> PlannerConfig:
+        """The planner settings of a (raw) config; keys it omits keep their defaults, wrong types and values are
+        rejected. ``Q_diag`` and ``R_diag`` stay empty when omitted: their lengths and defaults depend on the system, so
+        ``CasadiPlanner`` checks and completes them."""
+        defaults = cls()
+        return cls(
+            expert=str(config.get("expert", defaults.expert)),
+            horizon=_int(config, "horizon", defaults.horizon),
+            q_diag=_positive_vector(config["Q_diag"], key="Q_diag") if "Q_diag" in config else (),
+            r_weight=_float(config, "R_weight", defaults.r_weight),
+            r_diag=_positive_vector(config["R_diag"], key="R_diag") if "R_diag" in config else (),
+            terminal_cost_multiplier=_float(config, "terminal_cost_multiplier", defaults.terminal_cost_multiplier),
+            terminal_velocity_weight=_float(config, "terminal_velocity_weight", defaults.terminal_velocity_weight),
+            fallback_terminal_velocity_tol=_float(
+                config, "fallback_terminal_velocity_tol", defaults.fallback_terminal_velocity_tol
+            ),
+            max_consecutive_fallbacks=_int(config, "max_consecutive_fallbacks", defaults.max_consecutive_fallbacks),
+        )
+
 
 @dataclass(frozen=True)
 class OmplConfig:
@@ -162,10 +198,13 @@ def _vector(config: Mapping[str, Any], key: str, size: int, default: tuple[float
     return tuple(out)
 
 
-def _positive_vector(raw: Any, key: str, size: int) -> tuple[float, ...]:
+def _positive_vector(raw: Any, key: str, size: int | None = None) -> tuple[float, ...]:
+    """A list of positive numbers, of length ``size`` if given (else any, but not empty)."""
     if not isinstance(raw, list):
-        raise ConfigurationError(f"'{key}' must be a list of length {size}.")
-    if len(raw) != size:
+        raise ConfigurationError(f"'{key}' must be a list" + ("" if size is None else f" of length {size}") + ".")
+    if size is None and not raw:
+        raise ConfigurationError(f"'{key}' must not be empty.")
+    if size is not None and len(raw) != size:
         raise ConfigurationError(f"'{key}' must have length {size}, got {len(raw)}.")
 
     out: list[float] = []
@@ -222,48 +261,6 @@ def _limits(raw_config: Mapping[str, Any], key: str, default: tuple[float, ...] 
     if isinstance(raw, (int, float)) and not isinstance(raw, bool):
         raw = [float(raw)] * size
     return _positive_vector(raw, key, size)
-
-
-def _validate_planner(
-    config: Mapping[str, Any],
-    nx: int,
-    nu: int,
-) -> PlannerConfig:
-    r_weight = _float(config, "R_weight", 0.1)
-    if r_weight <= 0:
-        raise ConfigurationError("'R_weight' must be positive.")
-
-    raw_r_diag = config.get("R_diag")
-    if raw_r_diag is not None:
-        r_diag = _positive_vector(raw_r_diag, key="R_diag", size=nu)
-    else:
-        r_diag = tuple([r_weight] * nu)
-
-    planner = PlannerConfig(
-        expert=str(config.get("expert", "casadi")),
-        horizon=_int(config, "horizon", 20),
-        q_diag=_vector(config, "Q_diag", nx, tuple([10.0] * nx)),
-        r_weight=r_weight,
-        r_diag=r_diag,
-        terminal_cost_multiplier=_float(config, "terminal_cost_multiplier", 10.0),
-        terminal_velocity_weight=_float(config, "terminal_velocity_weight", 1.0),
-        fallback_terminal_velocity_tol=_float(config, "fallback_terminal_velocity_tol", 1e-2),
-        max_consecutive_fallbacks=_int(config, "max_consecutive_fallbacks", 5),
-    )
-
-    if planner.expert not in PlannerFactory.names():
-        raise ConfigurationError(f"'expert' must be one of {', '.join(PlannerFactory.names())}, got {planner.expert!r}.")
-    if planner.horizon <= 0:
-        raise ConfigurationError("'horizon' must be positive.")
-    if planner.terminal_cost_multiplier <= 0:
-        raise ConfigurationError("'terminal_cost_multiplier' must be positive.")
-    if planner.terminal_velocity_weight <= 0:
-        raise ConfigurationError("'terminal_velocity_weight' must be positive.")
-    if planner.fallback_terminal_velocity_tol < 0:
-        raise ConfigurationError("'fallback_terminal_velocity_tol' must be non-negative.")
-    if planner.max_consecutive_fallbacks <= 0:
-        raise ConfigurationError("'max_consecutive_fallbacks' must be positive.")
-    return planner
 
 
 def load_and_validate_system_config(config_path: str | Path) -> dict[str, Any]:
@@ -372,24 +369,22 @@ def validate_system_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
 
     if system == "franka":
         config_out.update(_franka_system(raw_config))
-        nx, nu = 3 * FRANKA_NUM_JOINTS, FRANKA_NUM_JOINTS
     else:
         config_out.update(_triple_integrator_system(raw_config))
-        nx, nu = 3 * config_out["dimension"], config_out["dimension"]
 
-    planner_cfg = _validate_planner(raw_config, nx=nx, nu=nu)
+    planner_cfg = PlannerConfig.from_mapping(raw_config)
     config_out.update(
         {
             **asdict(OmplConfig.from_mapping(raw_config)),
             "expert": planner_cfg.expert,
             "horizon": planner_cfg.horizon,
-            "Q_diag": list(planner_cfg.q_diag),
             "R_weight": planner_cfg.r_weight,
-            "R_diag": list(planner_cfg.r_diag),
             "terminal_cost_multiplier": planner_cfg.terminal_cost_multiplier,
             "terminal_velocity_weight": planner_cfg.terminal_velocity_weight,
             "fallback_terminal_velocity_tol": planner_cfg.fallback_terminal_velocity_tol,
             "max_consecutive_fallbacks": planner_cfg.max_consecutive_fallbacks,
+            **({"Q_diag": list(planner_cfg.q_diag)} if planner_cfg.q_diag else {}),
+            **({"R_diag": list(planner_cfg.r_diag)} if planner_cfg.r_diag else {}),
         }
     )
     return config_out

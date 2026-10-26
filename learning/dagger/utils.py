@@ -100,11 +100,11 @@ def print_rollout_metrics(label: str, prefix: str, metrics: DaggerEvalMetrics) -
         print(
             f"  {prefix}_success_by_source: config={config_display} random={random_display}"
         )
-    total_failures = metrics.timeout_failures + metrics.solve_failures
+    total_failures = metrics.timeout_failures + metrics.solve_failures + metrics.collision_failures
     if total_failures > 0:
         print(
             f"  {prefix}_failure_breakdown: timeout={metrics.timeout_failures} "
-            f"solve_failure={metrics.solve_failures} (of {total_failures} failures)"
+            f"solve_failure={metrics.solve_failures} collision={metrics.collision_failures} (of {total_failures} failures)"
         )
 
 

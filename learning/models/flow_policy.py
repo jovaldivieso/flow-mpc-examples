@@ -39,18 +39,6 @@ class FlowPolicy(ActionPolicy):
             action_scale=action_scale,
         )
 
-    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
-        """Load a checkpoint from either a bare FlowPolicy or a SafeFlowMPCPolicy wrapper."""
-        normalized_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith("inner_policy."):
-                key = key[len("inner_policy.") :]
-            elif key.startswith("projector."):
-                continue
-            key = key.replace("._orig_mod.", ".")
-            normalized_state_dict[key] = value
-        return super().load_state_dict(normalized_state_dict, strict=strict, assign=assign)
-
     def compute_loss(
         self,
         observation_dict: Mapping[str, torch.Tensor],
@@ -65,5 +53,5 @@ class FlowPolicy(ActionPolicy):
         return self.velocity_net.integrate(obs_cond)
 
     def reset(self) -> None:
-        """Keeps parity with other policy APIs that expose a reset hook."""
-        return None
+        """Start of a new episode: the network gets the same call, so a stateful layer would be cleared here."""
+        self.velocity_net.reset()

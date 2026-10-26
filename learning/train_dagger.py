@@ -28,6 +28,7 @@ from learning.config_loaders import (
 )
 from learning.dagger import DaggerConfig, DaggerTrainer
 from planning.config import load_and_validate_system_config
+from planning.ompl_planner import initialize_ompl
 
 """High-level CLI plumbing and orchestration for DAgger training.
 
@@ -240,6 +241,7 @@ def main() -> None:
         _summarize_cli_args(args),
     )
     validated = load_and_validate_system_config(args.expert_config)
+    initialize_ompl(validated["ompl_seed"])
     training_config = load_dagger_training_config(args.policy_config)
 
     def option(name: str, default: Any) -> Any:
@@ -287,14 +289,6 @@ def main() -> None:
     timestamp = time.time_ns()
     repo_id = default_repo_id(timestamp) if fresh else str(args.repo_id)
     dataset_root = default_dataset_root(timestamp) if fresh else Path(args.dataset_root)
-    trajectories, epochs, betas, training_curriculum, round_seeds = DaggerTrainer.schedules(
-        trajectories_per_iteration,
-        target_epochs_per_round,
-        expert_beta_per_iteration,
-        dagger_iterations,
-        training_curriculum_config,
-        round_seeds_config,
-    )
 
     experiment_dir = (args.checkpoint_dir or default_checkpoint_dir()) / args.experiment_name
     experiment_dir.mkdir(parents=True, exist_ok=True)
@@ -311,18 +305,18 @@ def main() -> None:
         dataset_root=dataset_root,
         start_with_aggregation=fresh,
         dagger_iterations=dagger_iterations,
-        trajectories_per_iteration=trajectories,
+        trajectories_per_iteration=trajectories_per_iteration,
         steps_per_trajectory=int(option("steps_per_trajectory", 150)),
         action_noise_std=float(option("action_noise_std", 0.0)),
         initial_states=initial_states,
         goal_states=goal_states,
-        training_curriculum=training_curriculum,
-        round_seeds=round_seeds,
+        training_curriculum=training_curriculum_config,
+        round_seeds=round_seeds_config,
         restart_round_seed=restart_round_seed,
         tolerance_overrides=tolerance_overrides,
         eval_tolerance_overrides=eval_tolerance_overrides,
-        expert_beta_per_iteration=betas,
-        target_epochs_per_round=epochs,
+        expert_beta_per_iteration=expert_beta_per_iteration,
+        target_epochs_per_round=target_epochs_per_round,
         eval_episodes=int(option("eval_episodes", 10)),
         eval_steps=option("eval_steps", None),
         eval_seed_start=int(option("eval_seed_start", 10000)),

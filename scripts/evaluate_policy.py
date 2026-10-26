@@ -24,20 +24,19 @@ from systems.seed_utils import (
     action_noise_seed_for_rollout,
     default_action_noise_seed_for_config,
 )
+from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from learning.config_loaders import UnetConfig
+from learning.data_utils import build_dataset_features
 from learning.dagger import apply_config_overrides, build_policy_action
 from learning.dagger.rollouts import apply_execution_noise
 from learning.dagger.utils import rng_for_seed_spec as _rng_for_seed_spec, sample_initial_state
 from learning.models.policy import ActionPolicy
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
-
-
-def is_observation_feature(feature_name: str) -> bool:
-    return feature_name.startswith("observation.") or ".observation." in feature_name
 
 
 def resolve_checkpoint_observation_dimensions(
@@ -46,7 +45,7 @@ def resolve_checkpoint_observation_dimensions(
     requested_policy_type: str,
 ) -> tuple[int, int]:
     """Resolve and validate checkpoint dimensions against the evaluation simulator."""
-    features = simulator.get_dataset_features(int(checkpoint.get("prediction_horizon", 1)))
+    features = build_dataset_features(simulator, int(checkpoint.get("prediction_horizon", 1)))
 
     # 'flow' and 'safeflow' share the exact same underlying network (safeflow
     # only wraps it with a CasADi projection at inference time), so a checkpoint
@@ -166,11 +165,12 @@ def rollout_planner(
     expert against the policy.
     """
     state = simulator.reset(initial_state)
+    termination = RolloutTerminationTracker(simulator)
     planner.reset()
     trajectory = [state.copy()]
     solve_times: list[float] = []
 
-    if simulator.should_terminate_rollout(state):
+    if termination.update(state):
         return np.asarray(trajectory), solve_times
 
     for _ in range(num_steps):
@@ -201,7 +201,7 @@ def rollout_planner(
         state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.should_terminate_rollout(state):
+        if termination.update(state):
             break
 
     return np.asarray(trajectory), solve_times
@@ -231,10 +231,11 @@ def rollout_policy(
             single call that produces the action
     """
     state = simulator.reset(initial_state)
+    termination = RolloutTerminationTracker(simulator)
     trajectory = [state.copy()]
     policy.reset()
     solve_times: list[float] = []
-    if simulator.should_terminate_rollout(state):
+    if termination.update(state):
         return np.asarray(trajectory), True, 0, False, solve_times
 
     for step in range(1, num_steps + 1):
@@ -265,7 +266,7 @@ def rollout_policy(
         state = simulator.step(state, executed_action)
         trajectory.append(state.copy())
 
-        if simulator.should_terminate_rollout(state):
+        if termination.update(state):
             return np.asarray(trajectory), True, step, False, solve_times
 
     return np.asarray(trajectory), False, len(trajectory) - 1, False, solve_times
@@ -359,7 +360,7 @@ def load_policy(
         if isinstance(flow_config_raw, Mapping):
             policy_kwargs["flow_init"] = flow_config_raw.get("safeflow_init", "previous_safe")
     policy = PolicyFactory.create(policy_type, **policy_kwargs)
-    policy.load_state_dict(state_dict)
+    load_policy_state_dict(policy, state_dict)
 
     policy.eval()
     policy.to(device)
@@ -368,11 +369,16 @@ def load_policy(
     return policy
 
 
+def checkpoint_policy_type(model_dir: str) -> str:
+    """The policy type a DAgger checkpoint was trained as."""
+    return torch.load(model_dir, map_location="cpu", weights_only=True)["policy_type"]
+
+
 def run_evaluation(
     policy_type: str,
     config: Mapping[str, Any],
     model_dir: str,
-    num_steps: int = 150,
+    num_steps: int = 125,
     seeds: list[int] | None = None,
     initial_states: Any | None = None,
     goal_states: Any | None = None,
@@ -396,9 +402,6 @@ def run_evaluation(
         simulator=simulator,
         goal_states=goal_states,
     )
-
-    if not os.path.exists(model_dir):
-        print(f"assuming '{model_dir}' is a Hugging Face Hub ID")
 
     device = torch.device(device_override) if device_override else get_inference_device()
     print(f"running inference on {device}")
@@ -486,9 +489,9 @@ def run_evaluation(
             initial_state = np.asarray(rollout_spec, dtype=float).copy()
         else:
             if explicit_goal:
-                initial_state = simulator.reset_random_state_only().copy()
+                initial_state = simulator.random_initial_state(_rng_for_seed_spec(torch_seed))
             else:
-                initial_state = simulator.reset_random().copy()
+                initial_state = sample_initial_state(simulator=simulator, seed_spec=torch_seed)
 
         if noise_seed_spec is not None:
             rollout_noise_seed = action_noise_seed_for_rollout(
@@ -531,6 +534,7 @@ def run_evaluation(
         expert_solve_time_mean = float(np.mean(expert_solve_times)) if expert_solve_times else None
         policy_solve_time_mean = float(np.mean(policy_solve_times)) if policy_solve_times else None
 
+        policy_collided = any(simulator.collides(state) for state in policy_trajectory)
         policy_final_state = policy_trajectory[-1]
         expert_final_state = expert_trajectory[-1]
         policy_goal_position_error, policy_goal_rotation_error = simulator.goal_errors(policy_final_state)
@@ -547,6 +551,7 @@ def run_evaluation(
                 "initial_state": initial_state,
                 "policy_reached_goal": reached_goal,
                 "policy_solve_failed": policy_solve_failed,
+                "policy_collided": policy_collided,
                 "policy_steps": max(len(policy_trajectory) - 1, 0),
                 "expert_steps": max(len(expert_trajectory) - 1, 0),
                 "policy_goal_position_error": policy_goal_position_error,
@@ -564,7 +569,7 @@ def run_evaluation(
     total_successes = sum(
         1
         for metric in per_seed_metrics
-        if metric["policy_reached_goal"]
+        if metric["policy_reached_goal"] and not metric["policy_collided"]
     )
     success_rate = (total_successes / total_runs) if total_runs > 0 else 0.0
     mean_policy_position_error = float(
@@ -616,11 +621,15 @@ def run_evaluation(
         np.mean([metric["policy_solve_failed"] for metric in per_seed_metrics])
         if total_runs > 0 else 0.0
     )
+    policy_collision_rate = (
+        np.mean([metric["policy_collided"] for metric in per_seed_metrics]) if total_runs > 0 else 0.0
+    )
     policy_timeout_rate = (
         np.mean(
             [
                 (not metric["policy_reached_goal"])
                 and (not metric["policy_solve_failed"])
+                and (not metric["policy_collided"])
                 for metric in per_seed_metrics
             ]
         )
@@ -628,6 +637,7 @@ def run_evaluation(
     )
     print(f"policy_timeout_rate: {policy_timeout_rate:.4f}")
     print(f"policy_solve_failure_rate: {policy_solve_failure_rate:.4f}")
+    print(f"policy_collision_rate: {policy_collision_rate:.4f}")
     print(f"mean_policy_steps: {mean_policy_steps:.3f}")
     print(f"mean_expert_steps: {mean_expert_steps:.3f}")
     print(f"mean_policy_goal_position_error: {mean_policy_position_error:.6f} m")
@@ -675,6 +685,7 @@ def run_evaluation(
         "success_rate": success_rate,
         "policy_timeout_rate": float(policy_timeout_rate),
         "policy_solve_failure_rate": float(policy_solve_failure_rate),
+        "policy_collision_rate": float(policy_collision_rate),
         "mean_policy_steps": mean_policy_steps,
         "mean_expert_steps": mean_expert_steps,
         "mean_policy_goal_position_error": mean_policy_position_error,
@@ -697,35 +708,35 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
+        "--model-dir",
+        type=str,
+        required=True,
+        help="DAgger checkpoint, e.g. outputs/train_dagger/<name>/flow_dagger_checkpoint.pt",
+    )
+    parser.add_argument(
         "--policy-type",
         type=str.lower,
         choices=["flow", "safeflow"],
-        required=True,
-        help="the type of policy architecture to evaluate",
+        default=None,
+        help="default: the checkpoint's own policy type",
     )
     parser.add_argument(
         "--config",
         type=str,
         default=os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml"),
-        help="path to the expert yaml config file (default: scripts/config/franka_casadi_config.yaml)",
-    )
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        required=True,
-        help="path to a local checkpoint or Hugging Face Hub model ID",
-    )
-    parser.add_argument(
-        "--num-steps",
-        type=int,
-        default=150,
-        help="maximum number of simulation steps",
+        help="expert yaml config (default: %(default)s)",
     )
     parser.add_argument(
         "--seeds",
         type=str,
-        default=None,
-        help="seed specification: int ('1') or list ('[1, 7]').",
+        default="[10000]",
+        help="seeds of the starts and goals, e.g. '[10000, 10001]' (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=125,
+        help="maximum steps per rollout (default: %(default)s)",
     )
     parser.add_argument(
         "--initial-states",
@@ -752,11 +763,7 @@ def main():
         "--tolerance-overrides",
         type=str,
         default=None,
-        help=(
-            "per-run override for the expert config's convergence tolerances, as a Python-literal "
-            "dict of the tolerance keys pos_tol and vel_tol, e.g. "
-            "'{\"pos_tol\": 0.02, \"vel_tol\": 0.1}'."
-        ),
+        help="dict of pos_tol / vel_tol overriding the config's, e.g. '{\"pos_tol\": 0.02, \"vel_tol\": 0.1}'",
     )
     parser.add_argument(
         "--action-noise-std",
@@ -779,17 +786,14 @@ def main():
     parser.add_argument(
         "--device",
         type=str,
-        default=None,
+        default="cpu",
         choices=["cpu", "cuda", "mps"],
-        help=(
-            "override automatic device selection. For a small policy network, CPU can "
-            "outperform mps/cuda due to per-call dispatch overhead dominating actual "
-            "compute -- use the printed solve-time benchmark to compare."
-        ),
+        help="device of the policy (default: %(default)s)",
     )
 
     args = parser.parse_args()
     config = load_and_validate_system_config(config_path=args.config)
+    initialize_ompl(config["ompl_seed"])
 
     tolerance_overrides = None
     if args.tolerance_overrides:
@@ -801,7 +805,7 @@ def main():
             parser.error("--tolerance-overrides must evaluate to a dict.")
 
     run_evaluation(
-        policy_type=args.policy_type,
+        policy_type=args.policy_type or checkpoint_policy_type(args.model_dir),
         config=config,
         model_dir=args.model_dir,
         num_steps=args.num_steps,

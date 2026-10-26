@@ -1,0 +1,50 @@
+# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm in a more cluttered environment: the 2 obstacles of
+# franka_ompl_casadi_config.yaml (the training environment) and a third, to evaluate how a policy trained there generalizes.
+# More obstacles make the MPC much slower from 4 on (the QP has a slack per sphere, obstacle and node).
+# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
+system: franka
+dt: 0.1
+# The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
+# chunk length, at most this) of its planned jerks.
+horizon: 20
+# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0]: Q_diag weights the squared
+# position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
+# terminal_cost_multiplier the terminal node's Q cost.
+Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
+         2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+         0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+# 1 / max_jerk^2
+R_diag: [4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3]
+terminal_cost_multiplier: 10.0
+# Limits of the arm [rad/s^2, rad/s^3]; joint position and velocity limits come from the URDF
+max_acceleration: 5.0
+max_jerk: 15.0
+
+# The expert planner (planning/planner_factory.py): ompl_casadi (the MPC with an OMPL RRT-Connect path as goal and first guess)
+expert: ompl_casadi
+
+# Settings of the OMPL path (ompl_casadi)
+ompl_speed: 0.5                 # rad/s the path is traversed at (its timing as the initial guess)
+ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner drove the arm away): plan a new path
+ompl_timeout: 5.0               # s per RRT-Connect solve
+ompl_seed: 0
+
+# Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
+pos_tol: 0.03
+vel_tol: 0.01
+
+# Random start configurations and goal poses (the TCP pose of a random configuration): minimum TCP-to-goal distance [m]
+min_start_goal_distance: 0.3
+
+# Spherical obstacles in the world frame [m]
+obstacles:
+  - position: [0.45, -0.12, 0.40]
+    radius: 0.08
+  - position: [0.45, 0.15, 0.48]
+    radius: 0.08
+  - position: [0.66, 0.02, 0.26]
+    radius: 0.07
+
+initial_state_seed: 0
+action_noise_seed: 0
+

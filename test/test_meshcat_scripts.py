@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import meshcat.geometry as g
 import numpy as np
 import pandas as pd
 import torch
@@ -22,7 +23,14 @@ from planning.casadi_planner import CasadiPlanner
 from planning.config import validate_system_config
 from scripts.evaluate_policy import load_policy
 from scripts.meshcat_dataset import episode_summary, load_episodes, plan_positions, read_frames
-from scripts.meshcat_utils import plan_tcp_points
+from scripts.meshcat_utils import (
+    TUBE_SIDES,
+    draw_collision_spheres,
+    draw_plan,
+    move_collision_spheres,
+    plan_tcp_points,
+    tube_geometry,
+)
 from scripts.meshcat_policy import rollout_policy
 from test.planner_fixtures import pose_goal
 
@@ -150,6 +158,74 @@ class DatasetViewerTests(unittest.TestCase):
 
         self.assertEqual(points.shape, (2, 3))
         np.testing.assert_allclose(points[1], self.simulator.tcp_placement(self.q + 0.1).translation)
+
+
+class _RecordingNode:
+    """Stands in for a Meshcat scene node: records what is set at each path."""
+
+    def __init__(self, objects: dict, transforms: dict, path: str = "") -> None:
+        self.objects, self.transforms, self.path = objects, transforms, path
+
+    def __getitem__(self, key) -> "_RecordingNode":
+        return _RecordingNode(self.objects, self.transforms, f"{self.path}/{key}")
+
+    def set_object(self, geometry, material=None) -> None:
+        self.objects[self.path] = geometry
+
+    def set_transform(self, matrix) -> None:
+        self.transforms[self.path] = np.asarray(matrix)
+
+    def delete(self) -> None:
+        self.objects.clear()
+
+
+class CollisionGeometryDrawingTests(unittest.TestCase):
+    def test_the_spheres_are_created_with_their_radii_and_move_to_the_centers(self) -> None:
+        objects, transforms = {}, {}
+        viz = type("Viewer", (), {"viewer": _RecordingNode(objects, transforms)})()
+        simulator = FrankaSystem(_config())
+        centers, _, radii = simulator.collision_spheres(Q_READY)
+
+        draw_collision_spheres(viz, radii)
+        move_collision_spheres(viz, centers)
+
+        self.assertEqual(len(objects), len(radii))
+        self.assertEqual(sorted(round(sphere.radius, 6) for sphere in objects.values()), sorted(np.round(radii, 6)))
+        for index, center in enumerate(centers):
+            np.testing.assert_allclose(transforms[f"/collision_spheres/{index}"][:3, 3], center)
+
+
+class ThickPathDrawingTests(unittest.TestCase):
+    def test_a_tube_surrounds_each_segment_at_its_radius_and_skips_empty_segments(self) -> None:
+        starts = np.array([[0.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 0.0]])
+        ends = np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 1.0], [0.0, 1.0, 2.0]])
+
+        geometry = tube_geometry(starts, ends, 0.01)
+
+        self.assertEqual(len(geometry.vertices), 2 * 2 * TUBE_SIDES)
+        self.assertEqual(len(geometry.faces), 2 * 2 * TUBE_SIDES)
+        first = geometry.vertices[: 2 * TUBE_SIDES].astype(float)
+        axis = np.array([1.0, 0.0, 0.0])
+        offsets = first - np.where(np.arange(2 * TUBE_SIDES)[:, None] < TUBE_SIDES, starts[0], ends[0])
+        np.testing.assert_allclose(offsets @ axis, 0.0, atol=1e-6)
+        np.testing.assert_allclose(np.linalg.norm(offsets, axis=1), 0.01, atol=1e-6)
+
+    def test_segment_colors_follow_the_kept_segments(self) -> None:
+        starts, ends = np.zeros((2, 3)), np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+
+        geometry = tube_geometry(starts, ends, 0.01, np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+
+        np.testing.assert_allclose(geometry.color, np.tile([0.0, 1.0, 0.0], (2 * TUBE_SIDES, 1)))
+
+    def test_a_plan_is_one_thick_mesh_and_a_single_point_removes_it(self) -> None:
+        objects, transforms = {}, {}
+        viz = type("Viewer", (), {"viewer": _RecordingNode(objects, transforms)})()
+
+        draw_plan(viz, "plan", np.array([[0.0, 0.0, 0.0], [0.1, 0.0, 0.0], [0.1, 0.1, 0.0]]), 0x00D0FF)
+        self.assertIsInstance(objects["/plan"], g.TriangularMeshGeometry)
+
+        draw_plan(viz, "plan", np.zeros((1, 3)), 0x00D0FF)
+        self.assertEqual(objects, {})
 
 
 class PolicyRolloutTests(unittest.TestCase):

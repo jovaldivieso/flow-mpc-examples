@@ -11,7 +11,13 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.config import ConfigurationError, OmplConfig, load_and_validate_system_config, validate_system_config
+from planning.config import (
+    ConfigurationError,
+    OmplConfig,
+    PlannerConfig,
+    load_and_validate_system_config,
+    validate_system_config,
+)
 from planning.planner_factory import PlannerFactory
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
@@ -128,6 +134,44 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
             validate_system_config(raw_config=raw_config)
 
 
+class PlannerConfigTests(unittest.TestCase):
+    """PlannerConfig parses and validates like OmplConfig: ``from_mapping`` reads, ``__post_init__`` checks."""
+
+    def test_defaults_and_the_r_diag_that_follows_the_r_weight(self) -> None:
+        planner = PlannerConfig.from_mapping({})
+
+        self.assertEqual((planner.expert, planner.horizon, planner.r_weight), ("casadi", 20, 0.1))
+        self.assertEqual((planner.q_diag, planner.r_diag), ((), ()))  # the planner completes them for its system
+        self.assertEqual(PlannerConfig.from_mapping({"R_weight": 0.3}).r_weight, 0.3)
+        self.assertEqual(PlannerConfig.from_mapping({"R_diag": [1.0, 2.0]}).r_diag, (1.0, 2.0))
+
+    def test_what_the_mapping_sets_is_read(self) -> None:
+        planner = PlannerConfig.from_mapping(
+            {"expert": "ompl_casadi", "horizon": 7, "Q_diag": [1.0] * 6, "terminal_cost_multiplier": 3.0,
+             "terminal_velocity_weight": 2.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9},
+        )
+
+        self.assertEqual((planner.expert, planner.horizon, planner.q_diag), ("ompl_casadi", 7, (1.0,) * 6))
+        self.assertEqual(
+            (planner.terminal_cost_multiplier, planner.terminal_velocity_weight, planner.fallback_terminal_velocity_tol,
+             planner.max_consecutive_fallbacks),
+            (3.0, 2.0, 0.5, 9),
+        )
+
+    def test_wrong_types_and_values_are_rejected(self) -> None:
+        for bad in ({"Q_diag": [1.0, 0.0]}, {"Q_diag": []}, {"Q_diag": 1.0}, {"R_diag": [1.0, 0.0]}, {"horizon": 2.5}, {"R_weight": "x"},
+                    {"R_weight": 0.0}, {"horizon": 0}, {"expert": "rrt"}, {"terminal_cost_multiplier": 0.0},
+                    {"terminal_velocity_weight": -1.0}, {"fallback_terminal_velocity_tol": -0.1},
+                    {"max_consecutive_fallbacks": 0}):
+            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
+                PlannerConfig.from_mapping(bad)
+
+    def test_a_planner_config_built_directly_is_validated_too(self) -> None:
+        for bad in ({"horizon": 0}, {"expert": "rrt"}, {"r_weight": 0.0}, {"max_consecutive_fallbacks": 0}):
+            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
+                PlannerConfig(**bad)
+
+
 class ExpertConfigValidationTests(unittest.TestCase):
     def test_shipped_expert_config_validates_and_revalidation_is_idempotent(self) -> None:
         # DaggerTrainer re-validates an already-validated config after merging
@@ -148,25 +192,22 @@ class ExpertConfigValidationTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config=raw_config)
 
-    def test_q_and_r_diagonals_must_match_the_state_and_action_dimensions(self) -> None:
+    def test_q_and_r_diagonals_are_positive_lists_whatever_their_length(self) -> None:
+        # Their lengths depend on the system, which is the planner's to check (test_casadi_planner)
         raw_config = _load_raw_config()
         raw_config["Q_diag"] = [1.0] * 13
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
-        raw_config = _load_raw_config()
-        raw_config["R_diag"] = [1.0] * 6
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
+        self.assertEqual(validate_system_config(raw_config=raw_config)["Q_diag"], [1.0] * 13)
         raw_config = _load_raw_config()
         raw_config["R_diag"] = [1.0] * 6 + [0.0]
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config=raw_config)
 
-    def test_r_diag_defaults_to_the_scalar_r_weight(self) -> None:
+    def test_omitted_diagonals_stay_out_of_the_validated_config(self) -> None:
         raw_config = _load_raw_config()
-        del raw_config["R_diag"]
+        del raw_config["Q_diag"], raw_config["R_diag"]
         raw_config["R_weight"] = 0.3
-        self.assertEqual(validate_system_config(raw_config=raw_config)["R_diag"], [0.3] * 7)
+        validated = validate_system_config(raw_config=raw_config)
+        self.assertEqual((validated["R_weight"], "Q_diag" in validated, "R_diag" in validated), (0.3, False, False))
 
     def test_joint_limits_are_broadcast_from_a_scalar_and_their_list_length_is_checked(self) -> None:
         for key in ("max_acceleration", "max_jerk"):

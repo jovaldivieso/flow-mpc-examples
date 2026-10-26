@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import copy
+from collections.abc import Mapping
 
-import numpy as np
+import torch
 
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.casadi_projector import CasadiTrajectoryProjector
+
+INNER_POLICY_PREFIX = "inner_policy."  # of the keys of a safe flow policy's state dict
 
 
 class PolicyFactory:
@@ -27,38 +29,34 @@ class PolicyFactory:
                     "to build its CasadiTrajectoryProjector."
                 )
             inner_policy = FlowPolicy(**flow_kwargs)
-            # This is deep-copied with the goal zeroed, once, here, rather
-            # than kept as a live reference into `simulator`: every
-            # constraint/cost this projector pipeline touches (dynamics,
-            # action/state bounds, terminal
-            # velocity) is built from the state invert_obs reconstructs
-            # from the observation, not from the goal or any absolute
-            # world position -- so the goal used here is never anything more
-            # than a fixed, self-consistent local anchor, not the live
-            # episode's actual goal. That means this policy never needs to
-            # track -- or be resynced to -- whatever simulator instance
-            # actually drives the live rollout (DAgger collection and
-            # evaluation each construct their own, separate from this one,
-            # every round/call). Deep-copying also protects a caller that
-            # passes the same simulator object for both policy construction
-            # and its own rollout from having that simulator's goal
-            # overwritten to zero out from under it.
-            #
-            # This equivalence would break if this projector ever gained a
-            # genuinely world-frame-referencing term (finite absolute
-            # position bounds, static obstacles, a goal-tracking cost) --
-            # anything added like that must take the real goal as an
-            # explicit input rather than reading it off this local_sim.
-            local_sim = copy.deepcopy(simulator)
-            local_sim.set_goal(np.zeros_like(local_sim.goal))
-
+            # The projector reads no goal of the simulator (its dynamics, limits and obstacles come from the system), so
+            # the simulator is shared with it and not copied.
             projector = CasadiTrajectoryProjector(
-                local_sim,
+                simulator,
                 dict(planner_config),
                 horizon=inner_policy.velocity_net.prediction_horizon,
             )
-            return SafeFlowMPCPolicy(inner_policy, projector, local_sim, **safeflow_options)
+            return SafeFlowMPCPolicy(inner_policy, projector, **safeflow_options)
         raise ValueError(
             f"Unknown policy type '{policy_type}'. "
             f"Supported policies: 'flow', 'safeflow'."
         )
+
+
+def load_policy_state_dict(
+    policy: ActionPolicy, state_dict: Mapping[str, torch.Tensor], strict: bool = True
+) -> torch.nn.modules.module._IncompatibleKeys:
+    """Load the weights of a checkpoint of either policy type into ``policy``, with PyTorch's own ``load_state_dict``.
+
+    A safe flow policy keeps its network behind ``inner_policy.``, a flow policy does not, and a checkpoint can come
+    from either (the two share their weights); the projector has none, and ``torch.compile`` leaves ``_orig_mod`` in the
+    names. The keys are mapped onto the ones ``policy`` itself uses first, so the loading, its hooks and its ``strict``
+    check are PyTorch's.
+    """
+    prefix = INNER_POLICY_PREFIX if isinstance(policy, SafeFlowMPCPolicy) else ""
+    network_keys = {
+        key.removeprefix(INNER_POLICY_PREFIX).replace("._orig_mod.", "."): value
+        for key, value in state_dict.items()
+        if not key.startswith("projector.")
+    }
+    return policy.load_state_dict({prefix + key: value for key, value in network_keys.items()}, strict=strict)

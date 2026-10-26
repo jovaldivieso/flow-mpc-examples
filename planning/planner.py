@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from systems.system import SystemSimulator
+from systems.kinematic_collision_system import KinematicCollisionSystem
 
 
 class PlannerSolveError(RuntimeError):
@@ -11,7 +11,7 @@ class PlannerSolveError(RuntimeError):
     pass
 
 
-def goal_configuration(simulator: SystemSimulator, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
+def goal_configuration(simulator: KinematicCollisionSystem, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
     """The configuration of ``goal`` nearest to ``q_reference``, or ``PlannerSolveError`` if there is none."""
     try:
         return simulator.goal_configuration(goal, q_reference)
@@ -32,7 +32,9 @@ class Plan:
     actions: np.ndarray | None = None
 
     def first_actions(self, rows: int) -> np.ndarray:
-        """The first ``rows`` actions; a plan that ends sooner goes on with zero actions."""
+        """The first ``rows`` actions; a plan that ends sooner goes on with zero actions. A path (no actions) has none."""
+        if self.actions is None:
+            raise ValueError("A path plan has no actions.")
         actions = np.asarray(self.actions, dtype=float)
         return np.vstack([actions, np.zeros((max(0, rows - len(actions)), actions.shape[1]))])[:rows]
 

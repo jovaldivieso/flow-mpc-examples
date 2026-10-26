@@ -2,21 +2,10 @@ import casadi as ca
 import numpy as np
 from typing import Any, Mapping
 
+from .casadi_graph import CasadiKinematicGraph
+from .initial_guess import InitialGuessGenerator
 from .planner import Plan, Planner, PlannerSolveError, goal_configuration
-from systems.system import SystemSimulator
-
-# Consecutive MPC/projection solves differ little: ProxQP warm-starts both primal and dual variables by default,
-# and expanding the mapped dynamics to SX keeps every solve fast.
-PROXQP_OPTIONS: dict[str, Any] = {
-    "expand": True,
-    "print_time": False,
-    "error_on_fail": False,
-    "proxqp": {
-        "verbose": False,
-        "eps_abs": 1e-8,
-        "eps_rel": 0.0,
-    },
-}
+from systems.kinematic_collision_system import KinematicCollisionSystem
 
 
 class CasadiPlanner(Planner):
@@ -24,7 +13,7 @@ class CasadiPlanner(Planner):
     CasADi model predictive control (ProxQP) in joint space.
 
     ``plan`` solves the quadratic program (QP) below from the current state, returns the planned joint positions over
-    the horizon, and keeps the solution ``(X, U, lam_g)`` as the primal-dual warm start of the next call.
+    the horizon, and keeps the solution as the primal-dual warm start of the next call.
 
     Problem (Direct Multiple Shooting, Horizon N)
     ---------------------------------------------
@@ -39,11 +28,8 @@ class CasadiPlanner(Planner):
                                             + alpha ||x_N - x_goal||_Q^2 + w_s ||S||_F^2
                              with Q = diag(Q_diag), R = diag(R_diag), alpha = terminal_cost_multiplier, w_s = 10^5.
 
-    Constraints              x_0 = x_init
-                             x_{k+1} = A_d x_k + B_d u_k                 triple integrator (``sim.casadi_dynamics``)
-                             -u_max <= u_k <= u_max                      jerk limits, k = 0 .. N-1
-                             x_lower <= x_k <= x_upper                   position, velocity, acceleration limits, k = 1 .. N
-                             A_coll,k q_k + s_k >= b_coll,k,  s_k >= 0   linearized sphere-obstacle half-spaces, k = 1 .. N
+    Constraints              as in ``CasadiKinematicGraph``: the initial state, the triple-integrator dynamics, the
+                             jerk and state limits, and the linearized sphere-obstacle half-spaces.
 
     Solver Choice (``Opti("conic")`` + ``proxqp``)
     ----------------------------------------------
@@ -54,130 +40,85 @@ class CasadiPlanner(Planner):
     ``(X, U, lam_g)`` keeps each solve around 1--5 ms (vs. 50--100 ms for an interior-point NLP solver like IPOPT).
     If the first QP pass penetrates a spherical obstacle, one SQP re-linearization pass around the solved trajectory
     refines the half-spaces.
+
+    Initial guess strategy
+    ----------------------
+    A solve starts from ``initial_plan`` (a joint-position plan), else from the plan of the optional
+    ``initial_guess_generator`` (a global planner, e.g. an OMPL path), else from the previous solution shifted by one
+    step, else from the current state held still. A plan of the generator ends at the goal configuration, which then
+    replaces the one of the inverse kinematics; and if the solve that started from a plan fails, the plan is the
+    solution (counted in ``trajectory_fallbacks``).
     """
 
     def _resolve_r_diag(self, config: Mapping[str, Any]) -> np.ndarray:
+        """``R_diag`` (nu entries), else ``R_weight`` for every action dimension."""
         raw_r_diag = config.get("R_diag")
-        if raw_r_diag is not None:
-            if not isinstance(raw_r_diag, list) or len(raw_r_diag) != self.sim.nu:
-                raise ValueError(f"'R_diag' must be a list of length nu={self.sim.nu}.")
-            for idx, value in enumerate(raw_r_diag):
-                if not isinstance(value, (int, float)) or float(value) <= 0:
-                    raise ValueError(f"'R_diag[{idx}]' must be a positive number.")
-            return np.asarray(raw_r_diag, dtype=float)
+        if raw_r_diag is None:
+            return np.full(self.sim.nu, float(config["R_weight"]))
+        if len(raw_r_diag) != self.sim.nu:
+            raise ValueError(f"'R_diag' length must equal simulator action dimension nu={self.sim.nu}, got {len(raw_r_diag)}.")
+        return np.asarray(raw_r_diag, dtype=float)
 
-        r_weight = config.get("R_weight", 0.1)
-        if not isinstance(r_weight, (int, float)) or float(r_weight) <= 0:
-            raise ValueError("'R_weight' must be a positive number.")
-        return np.full(self.sim.nu, float(r_weight), dtype=float)
-
-    def __init__(self, simulator: SystemSimulator, config: Mapping[str, Any]):
-        self.sim = simulator
-        self.N = config.get("horizon", 20)
-        self.n_joints = simulator.n
-        self.terminal_cost_multiplier = float(config.get("terminal_cost_multiplier", 10.0))
-
-        if self.N <= 0:
-            raise ValueError("'horizon' must be a positive integer.")
-        if self.terminal_cost_multiplier <= 0:
-            raise ValueError("'terminal_cost_multiplier' must be positive.")
-
-        q_diag = config.get("Q_diag", [10.0] * self.sim.nx)
-        if len(q_diag) != self.sim.nx:
+    def __init__(
+        self,
+        simulator: KinematicCollisionSystem,
+        config: Mapping[str, Any],
+        initial_guess_generator: InitialGuessGenerator | None = None,
+    ):
+        # The scalars of the validated config (planning/config.py) are used as they are; only what depends on the
+        # system's dimensions is checked (and completed) here
+        self.terminal_cost_multiplier = float(config["terminal_cost_multiplier"])
+        q_diag = config.get("Q_diag", [10.0] * simulator.nx)
+        if len(q_diag) != simulator.nx:
             raise ValueError(
-                f"'Q_diag' length must equal simulator state dimension nx={self.sim.nx}, got {len(q_diag)}."
+                f"'Q_diag' length must equal simulator state dimension nx={simulator.nx}, got {len(q_diag)}."
             )
+        self.sim = simulator
+        self._graph = CasadiKinematicGraph(simulator, config["horizon"])
+        self.N = self._graph.N
+        self.n_joints = simulator.n
         self.Q = np.diag(q_diag)
         self.R = np.diag(self._resolve_r_diag(config))
+        self.initial_guess_generator = initial_guess_generator
 
         # The last solution (the warm start of the next solve) and what the current goal needs
         self.last_X_sol: np.ndarray | None = None
         self.last_U_sol: np.ndarray | None = None
-        self._prev_lam_g: np.ndarray | None = None
         self._goal: np.ndarray | None = None
         self.goal_configuration: np.ndarray | None = None
         self.optimizations = 0  # NLP solves since the planner was built
-
-        self.opti = ca.Opti("conic")
-        self.X = self.opti.variable(self.sim.nx, self.N + 1)
-        self.U = self.opti.variable(self.sim.nu, self.N)
-        self.x0_param = self.opti.parameter(self.sim.nx)
-        self.goal_param = self.opti.parameter(self.sim.nx)
-
-        # Dynamics: X[:, 1:] = f(X[:, :-1], U), the step function mapped over the horizon
-        x_sym = ca.SX.sym("x", self.sim.nx)
-        u_sym = ca.SX.sym("u", self.sim.nu)
-        step_fn = ca.Function("step", [x_sym, u_sym], [self.sim.casadi_dynamics(x_sym, u_sym)])
-        self.opti.subject_to(self.X[:, 1:] == step_fn.map(self.N)(self.X[:, :-1], self.U))
-        self.opti.subject_to(self.X[:, 0] == self.x0_param)
-
-        # Joint jerk limits. vec() forces element-wise inequality (CasADi reads a non-square matrix comparison
-        # as a PSD constraint); the per-joint limits are repeated across the horizon to match its column-major order.
-        max_action = np.broadcast_to(np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1), (self.sim.nu, self.N))
-        self.opti.subject_to(ca.vec(self.U) >= ca.vec(-max_action))
-        self.opti.subject_to(ca.vec(self.U) <= ca.vec(max_action))
-
-        # State limits at the nodes 1 .. N (node 0 is the current state); skip infinite bounds (e.g. TripleIntegratorSystem positions)
-        lower_bounds = np.asarray(self.sim.state_lower_bounds, dtype=float)
-        finite_lower = np.flatnonzero(np.isfinite(lower_bounds)).tolist()
-        if finite_lower:
-            lower = ca.repmat(ca.DM(lower_bounds[finite_lower]), 1, self.N)
-            self.opti.subject_to(ca.vec(self.X[finite_lower, 1:]) >= ca.vec(lower))
-        upper_bounds = np.asarray(self.sim.state_upper_bounds, dtype=float)
-        finite_upper = np.flatnonzero(np.isfinite(upper_bounds)).tolist()
-        if finite_upper:
-            upper = ca.repmat(ca.DM(upper_bounds[finite_upper]), 1, self.N)
-            self.opti.subject_to(ca.vec(self.X[finite_upper, 1:]) <= ca.vec(upper))
+        self.fallbacks = 0  # solves that failed from a plan, for which the plan was the solution
 
         # Cost: distance to the goal state and effort over the horizon, and the terminal distance
-        error = self.X - ca.repmat(self.goal_param, 1, self.N + 1)
+        self.goal_param = self._graph.parameter(self.sim.nx)
+        error = self._graph.X - ca.repmat(self.goal_param, 1, self.N + 1)
         running = ca.sum2(ca.sum1(ca.mtimes(self.Q, error[:, :-1]) * error[:, :-1])) + ca.sum2(
-            ca.sum1(ca.mtimes(self.R, self.U) * self.U)
+            ca.sum1(ca.mtimes(self.R, self._graph.U) * self._graph.U)
         )
         terminal = ca.mtimes(error[:, -1].T, ca.mtimes(self.Q * self.terminal_cost_multiplier, error[:, -1]))
-        total_cost = running + terminal
-
-        # Linearized spherical-obstacle half-space constraints A_coll @ q_k + slack >= b_coll at nodes 1 .. N
-        obstacles = getattr(self.sim, "obstacles", [])
-        if obstacles:
-            _, _, radii = self.sim.collision_spheres(np.zeros(self.n_joints))
-            self.num_collision_pairs = len(radii) * len(obstacles)
-        else:
-            self.num_collision_pairs = 0
-
-        if self.num_collision_pairs > 0:
-            P = self.num_collision_pairs
-            self.A_coll = self.opti.parameter(P * self.N, self.n_joints)
-            self.b_coll = self.opti.parameter(P * self.N)
-            self.slack = self.opti.variable(P * self.N)
-            self.opti.subject_to(self.slack >= 0.0)
-            lhs = ca.vertcat(
-                *[ca.mtimes(self.A_coll[k * P : (k + 1) * P, :], self.X[: self.n_joints, k + 1]) for k in range(self.N)]
-            )
-            self.opti.subject_to(lhs + self.slack >= self.b_coll)
-            total_cost = total_cost + 1e5 * ca.sumsqr(self.slack)
-
-        self.opti.minimize(total_cost)
-        self.opti.solver("proxqp", PROXQP_OPTIONS)
+        self._graph.minimize(running + terminal)
 
     def reset(self) -> None:
         """Signals the start of a new episode."""
         self.last_X_sol = None
         self.last_U_sol = None
-        self._prev_lam_g = None
         self._goal = None
         self.goal_configuration = None
-        self.opti.set_initial(self.X, 0.0)
-        self.opti.set_initial(self.U, 0.0)
-        if self.num_collision_pairs > 0:
-            self.opti.set_initial(self.slack, 0.0)
-        # set_initial(..., lam_g, ...) is sticky on the Opti object: without this the first solve of the new episode
-        # would warm start from the final multipliers of the previous, unrelated one.
-        self.opti.set_initial(self.opti.lam_g, 0.0)
+        if self.initial_guess_generator is not None:
+            self.initial_guess_generator.reset()
+        self._graph.reset()
 
     @property
     def statistics(self) -> dict[str, int]:
-        return {"trajectory_optimizations": self.optimizations}
+        """The NLP solves since the planner was built (``trajectory_optimizations``) and, with an initial guess
+        generator, its own counters and the solves that failed from its plan (``trajectory_fallbacks``)."""
+        if self.initial_guess_generator is None:
+            return {"trajectory_optimizations": self.optimizations}
+        return {
+            **self.initial_guess_generator.statistics,
+            "trajectory_optimizations": self.optimizations,
+            "trajectory_fallbacks": self.fallbacks,
+        }
 
     def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
         """The plan from the state of ``observation``: the planned joint positions (N + 1 rows, row 0 the current
@@ -186,11 +127,20 @@ class CasadiPlanner(Planner):
         goal = np.asarray(observation[: self.sim.goal_dim], dtype=float)
         if self._goal is None or not np.allclose(goal, self._goal):
             self._begin_goal(goal)
-        if initial_plan is None:
-            initial_plan = self._initial_plan(observation, x0)
+        if initial_plan is None and self.initial_guess_generator is not None:
+            last_positions = None if self.last_X_sol is None else self.last_X_sol[: self.n_joints].T
+            initial_plan = self.initial_guess_generator.initial_plan(observation, x0[: self.n_joints], last_positions)
+            if initial_plan is not None:
+                self.goal_configuration = initial_plan.positions[-1].copy()  # the plan ends at the goal configuration
         if self.goal_configuration is None:
-            self.goal_configuration = self._goal_configuration(x0)
-        self._solve(x0, initial_plan)
+            self.goal_configuration = goal_configuration(self.sim, self._goal, x0[: self.n_joints])
+        try:
+            self._solve(x0, initial_plan)
+        except PlannerSolveError:
+            if self.initial_guess_generator is None or initial_plan is None:
+                raise
+            self.fallbacks += 1
+            self.last_X_sol, self.last_U_sol = self._states_through(x0, initial_plan)
         return Plan(positions=self.last_X_sol[: self.n_joints].T.copy(), actions=self.last_U_sol.T.copy())
 
     def _begin_goal(self, goal: np.ndarray) -> None:
@@ -199,27 +149,13 @@ class CasadiPlanner(Planner):
         self.goal_configuration = None
         self.last_X_sol = None
         self.last_U_sol = None
-
-    def _initial_plan(self, observation: np.ndarray, x0: np.ndarray) -> Plan | None:
-        """A plan the next solve starts from; none means the previous solution, or the state held still. A subclass can
-        supply one of its own."""
-        return None
-
-    def _goal_configuration(self, x0: np.ndarray) -> np.ndarray:
-        """The configuration of the goal nearest to the current one."""
-        return goal_configuration(self.sim, self._goal, x0[: self.n_joints])
-
-    def _update_collision_halfspaces(self, q_ref: np.ndarray) -> None:
-        """Linearize obstacle half-spaces along ``q_ref`` (N, n_joints)."""
-        if self.num_collision_pairs > 0:
-            A, b = self.sim.collision_halfspaces(q_ref)
-            self.opti.set_value(self.A_coll, A.reshape(-1, self.n_joints))
-            self.opti.set_value(self.b_coll, b.reshape(-1))
+        if self.initial_guess_generator is not None:
+            self.initial_guess_generator.begin_goal()
 
     def _solve(self, x0: np.ndarray, initial_plan: Plan | None) -> None:
         """Solve the NLP from ``x0`` and keep the solution."""
-        self.opti.set_value(self.x0_param, x0)
-        self.opti.set_value(self.goal_param, np.concatenate([self.goal_configuration, np.zeros(2 * self.n_joints)]))
+        self._graph.set_state(x0)
+        self._graph.set_value(self.goal_param, np.concatenate([self.goal_configuration, np.zeros(2 * self.n_joints)]))
 
         if initial_plan is not None:
             states_guess, actions_guess = self._states_through(x0, initial_plan)
@@ -230,48 +166,29 @@ class CasadiPlanner(Planner):
             states_guess, actions_guess = self._states_through(
                 x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1)))
             )
-        self._set_initial(states_guess, actions_guess)
-        self._update_collision_halfspaces(states_guess[: self.n_joints, 1:].T)
-        if self._prev_lam_g is not None:
-            self.opti.set_initial(self.opti.lam_g, self._prev_lam_g)
+        self._graph.set_initial(states_guess, actions_guess)
+        self._graph.update_collision_halfspaces(states_guess[: self.n_joints, 1:].T)
 
         try:
-            sol = self.opti.solve()
+            sol = self._graph.solve()
         except RuntimeError:
             # A warm start can leave the solver stuck at a locally infeasible point once the actual state has drifted from
             # what the previous solve predicted (execution noise, or during DAgger the actions of a still untrained
             # policy). A cold restart from the current state held still resolves far more of those than giving up.
             cold_states, cold_actions = self._states_through(x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1))))
-            self._set_initial(cold_states, cold_actions)
-            self._update_collision_halfspaces(cold_states[: self.n_joints, 1:].T)
-            self.opti.set_initial(self.opti.lam_g, 0.0)
+            self._graph.set_initial(cold_states, cold_actions, cold=True)
+            self._graph.update_collision_halfspaces(cold_states[: self.n_joints, 1:].T)
             try:
-                sol = self.opti.solve()
+                sol = self._graph.solve()
             except RuntimeError as exc:
                 raise PlannerSolveError(
                     "CasADi planner solve failed (both warm-started and cold-restarted). "
                     f"Current state estimate: {x0.tolist()}, goal configuration: {self.goal_configuration.tolist()}."
                 ) from exc
 
-        if self.num_collision_pairs > 0:
-            X_first = sol.value(self.X)
-            if not all(self.sim.is_collision_free(X_first[: self.n_joints, k]) for k in range(1, self.N + 1)):
-                self._set_initial(X_first, sol.value(self.U))
-                self._update_collision_halfspaces(X_first[: self.n_joints, 1:].T)
-                self.opti.set_initial(self.opti.lam_g, sol.value(self.opti.lam_g))
-                try:
-                    sol = self.opti.solve()
-                except RuntimeError:
-                    pass
-
-        self.last_X_sol = sol.value(self.X)
-        self.last_U_sol = sol.value(self.U)
-        self._prev_lam_g = sol.value(self.opti.lam_g)
+        self.last_X_sol = sol.states
+        self.last_U_sol = sol.actions
         self.optimizations += 1
-
-    def _set_initial(self, states: np.ndarray, actions: np.ndarray) -> None:
-        self.opti.set_initial(self.X, states)
-        self.opti.set_initial(self.U, actions)
 
     def _states_through(self, x0: np.ndarray, plan: Plan) -> tuple[np.ndarray, np.ndarray]:
         """The states (nx, N + 1) and actions (nu, N) of the plant moving through the configurations of ``plan`` (its

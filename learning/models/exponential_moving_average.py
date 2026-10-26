@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterator, Mapping
+from collections.abc import Generator, Mapping
 
 import torch
 from torch import nn
@@ -44,7 +44,7 @@ class ExponentialMovingAverage:
         self.shadow = {name: tensor.detach().clone() for name, tensor in state_dict.items()}
 
     @contextlib.contextmanager
-    def averaged_weights(self, module: nn.Module) -> Iterator[None]:
+    def averaged_weights(self, module: nn.Module) -> Generator[None]:
         """Run the module with the averaged weights, then put its own weights back."""
         own = {name: tensor.detach().clone() for name, tensor in module.state_dict().items()}
         module.load_state_dict(self.shadow)

@@ -77,32 +77,29 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         self.simulator = FrankaSystem(config)
         self.projector = CasadiTrajectoryProjector(self.simulator, config, horizon=HORIZON)
         self.state0 = _rest_state(self.simulator)
-        self.obs0 = self.simulator.observe(self.state0)
         self.q_ref = _zero_chunk()
 
-    def _perturbed_obs(self, offset: float) -> np.ndarray:
+    def _perturbed_state(self, offset: float) -> np.ndarray:
         # Perturb joint positions only: leaves the certified-zero terminal velocity untouched
         state = self.state0.copy()
         state[: self.simulator.n] += offset
-        return self.simulator.observe(state)
+        return state
 
     def test_falls_back_to_last_safe_trajectory_when_one_exists(self) -> None:
-        self.projector.project(self.obs0, self.q_ref)
+        self.projector.project(self.state0, self.q_ref)
         self.assertIsNotNone(self.projector._prev_U_sol)
         # Matches project()'s own fallback padding: the shifted plan's
         # extra final slot is zero action (holds the certified-at-rest
         # terminal state), not a duplicate of the last applied action.
         shifted_actions = np.hstack([self.projector._prev_U_sol[:, 1:], np.zeros((self.simulator.nu, 1))])
-        perturbed_obs = self._perturbed_obs(0.005)
-        expected_plan = self.projector._revalidate_fallback(
-            self.simulator.invert_obs(perturbed_obs), shifted_actions
-        )
+        perturbed_state = self._perturbed_state(0.005)
+        expected_plan = self.projector._revalidate_fallback(perturbed_state, shifted_actions)
         self.assertIsNotNone(expected_plan)
 
-        self.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            fallback_chunk = self.projector.project(perturbed_obs, self.q_ref)
+            fallback_chunk = self.projector.project(perturbed_state, self.q_ref)
 
         np.testing.assert_allclose(fallback_chunk, shifted_actions.T)
         self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
@@ -114,9 +111,9 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # paper-faithful fallback action here. Must fail loudly rather than
         # silently returning the unverified, unprojected proposal.
         self.projector.reset()
-        self.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with self.assertRaises(PlannerSolveError):
-            self.projector.project(self.obs0, self.q_ref)
+            self.projector.project(self.state0, self.q_ref)
 
     def test_consecutive_fallbacks_stay_at_rest_instead_of_drifting_away(self) -> None:
         # Regression test for padding the fallback's extra control slot with
@@ -127,12 +124,12 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # not the same-tick reuse-as-is branch) must keep the fallback's own
         # terminal velocity bounded, not drifting further away with each
         # additional fallback.
-        self.projector.project(self.obs0, self.q_ref)
-        self.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector.project(self.state0, self.q_ref)
+        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
-                self.projector.project(self._perturbed_obs(0.001 * i), self.q_ref)
+                self.projector.project(self._perturbed_state(0.001 * i), self.q_ref)
         terminal_velocity = self.projector._prev_X_sol[self.projector.rest_idx, self.projector.N]
         # Not 0.0 to machine precision: the terminal-rest condition is a
         # soft cost, so the cached solve only ever settles *close to*
@@ -150,14 +147,14 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # max_consecutive_fallbacks bounds it: one more consecutive fallback
         # than the default (5) must raise rather than be accepted.
         self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
-        self.projector.project(self.obs0, self.q_ref)
-        self.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector.project(self.state0, self.q_ref)
+        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
-                self.projector.project(self._perturbed_obs(0.001 * i), self.q_ref)
+                self.projector.project(self._perturbed_state(0.001 * i), self.q_ref)
             with self.assertRaises(PlannerSolveError):
-                self.projector.project(self._perturbed_obs(0.006), self.q_ref)
+                self.projector.project(self._perturbed_state(0.006), self.q_ref)
 
     def test_repeated_same_tick_calls_do_not_each_consume_the_fallback_budget(self) -> None:
         # select_action() calls project() once per flow/Euler denoising step
@@ -167,12 +164,12 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # far more of them than max_consecutive_fallbacks allows must not
         # raise, as long as it's genuinely the same tick throughout.
         self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
-        self.projector.project(self.obs0, self.q_ref)
-        self.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector.project(self.state0, self.q_ref)
+        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for _ in range(20):  # far more than max_consecutive_fallbacks (5)
-                self.projector.project(self.obs0, self.q_ref)
+                self.projector.project(self.state0, self.q_ref)
         self.assertEqual(self.projector._consecutive_fallback_count, 0)
 
 
@@ -208,7 +205,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_projection_of_a_resting_reference_at_rest_stays_put(self) -> None:
         self.projector.reset()
         state = _rest_state(self.simulator)
-        projected = self.projector.project(self.simulator.observe(state), _zero_chunk())
+        projected = self.projector.project(state, _zero_chunk())
         np.testing.assert_allclose(projected, _zero_chunk(), atol=1e-3)
 
     def test_projected_chunks_are_feasible_for_the_plant_even_for_infeasible_proposals(self) -> None:
@@ -221,7 +218,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
             self.projector.reset()
             u_ref = rng.normal(0.0, scale, (HORIZON, simulator.nu)) * simulator.max_action
 
-            projected = self.projector.project(simulator.observe(x0), u_ref)
+            projected = self.projector.project(x0, u_ref)
 
             self.assertEqual(projected.shape, u_ref.shape)
             self.assertTrue(np.all(np.abs(projected) <= simulator.max_action + tolerance), scale)
@@ -241,7 +238,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
             self.projector.reset()
             noise = np.random.default_rng(seed).normal(size=(HORIZON, simulator.nu)) * simulator.max_action
 
-            projected = self.projector.project(simulator.observe(state), noise)
+            projected = self.projector.project(state, noise)
 
             self.assertEqual(projected.shape, noise.shape)
 
@@ -256,7 +253,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         proposal = _zero_chunk()
         proposal[:, joint] = simulator.max_action[joint]
 
-        projector.project(simulator.observe(state), proposal)
+        projector.project(state, proposal)
 
         self.assertLessEqual(projector._prev_X_sol[joint].max(), upper + 1e-6)
 
@@ -268,7 +265,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         reference = CasadiPlanner(simulator, self.config).plan(simulator.observe(state)).actions[:HORIZON]
         self.projector.reset()
 
-        projected = self.projector.project(simulator.observe(state), reference)
+        projected = self.projector.project(state, reference)
 
         np.testing.assert_allclose(projected, reference, atol=0.15 * simulator.max_action.max())
 
@@ -276,7 +273,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
         self.assertIsNone(projector.next_chunk_guess())
         state = _rest_state(self.simulator)
-        projected = projector.project(self.simulator.observe(state), _moving_chunk())
+        projected = projector.project(state, _moving_chunk())
 
         guess = projector.next_chunk_guess()
 
@@ -289,39 +286,32 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_a_chunk_of_the_wrong_shape_is_rejected(self) -> None:
         state = _rest_state(self.simulator)
         with self.assertRaises(ValueError):
-            self.projector.project(self.simulator.observe(state), _zero_chunk().T)
+            self.projector.project(state, _zero_chunk().T)
 
     def test_short_horizon_constructs_and_solves(self) -> None:
         projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=2)
         state = _rest_state(self.simulator)
-        projected = projector.project(self.simulator.observe(state), _zero_chunk(2))
+        projected = projector.project(state, _zero_chunk(2))
         self.assertEqual(projected.shape, (2, self.simulator.nu))
 
     def test_the_projector_ignores_the_goal_of_the_simulator_it_was_built_on(self) -> None:
-        # Goal-anchor independence (see PolicyFactory): invert_obs drops the goal, and no projector
-        # cost or constraint reads it, so a zeroed goal must not change the projection.
+        # The projector takes no goal, and no projector cost or constraint reads it, so whatever goal the simulator
+        # holds (here none that is a pose at all) must not change the projection.
         simulator = FrankaSystem(self.config)
-        local_sim = FrankaSystem(self.config)
-        local_sim.set_goal(np.zeros_like(local_sim.goal))
-        projector = CasadiTrajectoryProjector(local_sim, self.config, horizon=HORIZON)
+        other = FrankaSystem(self.config)
+        other.set_goal(np.zeros_like(other.goal))
+        projector = CasadiTrajectoryProjector(other, self.config, horizon=HORIZON)
         reference = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
         state = _rest_state(simulator)
         u_ref = np.random.default_rng(5).normal(0.0, 0.3, (HORIZON, simulator.nu)) * simulator.max_action
         np.testing.assert_allclose(
-            projector.project(simulator.observe(state), u_ref),
-            reference.project(simulator.observe(state), u_ref),
+            projector.project(state, u_ref),
+            reference.project(state, u_ref),
             atol=1e-6,
         )
 
-    def test_invalid_projector_config_is_rejected(self) -> None:
-        for key, value in (
-            ("terminal_velocity_weight", 0.0),
-            ("fallback_terminal_velocity_tol", -1.0),
-            ("max_consecutive_fallbacks", 0),
-        ):
-            with self.subTest(key=key):
-                with self.assertRaises(ValueError):
-                    CasadiTrajectoryProjector(self.simulator, {**self.config, key: value}, horizon=HORIZON)
+    def test_a_projector_needs_a_horizon(self) -> None:
+        # Its scalar settings are validated when the config is loaded (test_planner_config)
         with self.assertRaises(ValueError):
             CasadiTrajectoryProjector(self.simulator, self.config, horizon=0)
 
@@ -337,7 +327,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         self.assertFalse(obs_sim.is_collision_free(rollout_q[-1]))
 
         projector = CasadiTrajectoryProjector(obs_sim, obs_config, horizon=HORIZON)
-        projected = projector.project(obs_sim.observe(state), proposal)
+        projected = projector.project(state, proposal)
         projected_q = obs_sim.rollout_positions(state, projected)
         for q in projected_q[1:]:
             self.assertTrue(obs_sim.is_collision_free(q), "projected trajectory collided with obstacle")

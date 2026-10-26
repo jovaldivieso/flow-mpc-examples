@@ -105,6 +105,9 @@ class TemporalUnet(nn.Module):
 
         self.final_conv = nn.Sequential(Conv1dBlock(dim, dim, kernel_size=5), nn.Conv1d(dim, transition_dim, 1))
 
+    def reset(self) -> None:
+        """Start of a new episode. Convolutions and norms keep no state between calls, so there is nothing to clear."""
+
     def forward(self, x: Tensor, time: Tensor, cond: Tensor) -> Tensor:
         """x (batch, horizon, transition), time (batch,), cond (batch, cond_dim) -> (batch, horizon, transition)."""
         x = x.transpose(1, 2)

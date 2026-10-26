@@ -7,7 +7,7 @@ Observation o = [g, x] (obs_dim = 33), what the planners read. The policy sees t
 T_rel = T_tcp^-1 T_goal as [p_rel, R_rel] with p_rel = R^T (p_d - p) and R_rel = R^T R_d (``policy_observation``, the same
 12-number encoding): the LeRobot frame stores it as ``observation.environment_state`` and x as ``observation.state``.
 
-Kinematic model: inherits the triple-integrator plant from ``TripleIntegratorSystem`` with SafeFlowMPC's FR3 limits (the
+Kinematic model: inherits the triple-integrator plant from ``TripleIntegratorBase`` with SafeFlowMPC's FR3 limits (the
 joint position limits narrowed by ``JOINT_LIMIT_MARGIN``, the velocity limits scaled by ``VELOCITY_LIMIT_SCALE``,
 acceleration and jerk limits from the config). No masses or torques: a joint tracking controller is assumed to
 follow the motion.
@@ -18,26 +18,20 @@ The goal is reached when the TCP is within ``pos_tol`` of the goal position and 
 not tested (``goal_errors`` reports it).
 """
 
-import functools
-from pathlib import Path
 from typing import Any, Mapping
 
+import coal
 import numpy as np
 import pinocchio as pin
-import xacro
-from pinocchio.robot_wrapper import RobotWrapper
-from xacro import substitution_args
 
-from .franka_kinematics import IK_TOLERANCE, FrankaKinematics
-from .triple_integrator_system import SAMPLING_ATTEMPTS, TripleIntegratorSystem
+from .franka_kinematics import franka_kinematics
+from .franka_model import Q_READY, TCP_FRAME, build_model, build_robot
+from .triple_integrator import SAMPLING_ATTEMPTS, TripleIntegratorBase
 
 FRANKA_NUM_JOINTS = 7
 FRANKA_DEFAULT_MAX_ACCELERATION = (5.0,) * 7
 FRANKA_DEFAULT_MAX_JERK = (15.0,) * 7
 
-# SafeFlowMPC's joint limits: positions 3 degrees inside the description's, velocities at 92 %
-JOINT_LIMIT_MARGIN = np.deg2rad(3.0)
-VELOCITY_LIMIT_SCALE = 0.92
 # Random start/goal configurations stay inside the joint margins, within SAMPLING_RADIUS of Q_READY, with the TCP in
 # WORKSPACE_BOUNDS in front of the base and every joint frame at least FLOOR_CLEARANCE above the floor (z = 0)
 JOINT_SAMPLING_MARGIN = 0.1
@@ -45,111 +39,73 @@ SAMPLING_RADIUS = 1.0
 WORKSPACE_BOUNDS = ((0.2, 0.8), (-0.6, 0.6), (0.1, 0.8))
 FLOOR_CLEARANCE = 0.1
 
-# Official franka_description, pinned as a git submodule
-FRANKA_DESCRIPTION = Path(__file__).resolve().parents[1] / "third_party" / "franka_description"
-XACRO_PATH = FRANKA_DESCRIPTION / "robots" / "fr3" / "fr3.urdf.xacro"
-
-# xacro resolves $(find pkg) via ament_index_python (ROS-only, not on PyPI)
-substitution_args._eval_find = lambda pkg: str(FRANKA_DESCRIPTION)
-
-# The finger joints are locked at this opening, the hand and fingers are fixed geometry
-FINGER_OPEN = 0.04
-FINGER_JOINTS = ("fr3_finger_joint1", "fr3_finger_joint2")
-Q_READY = np.array([0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4])
-TCP_FRAME = "fr3_hand_tcp"
-# A pose the inverse kinematics does not reach from the first start is tried from random configurations
-IK_ATTEMPTS = 30
-IK_SOLUTIONS = 5
 POSE_COMPONENTS = ["x", "y", "z"] + [f"R{i}{j}" for i in range(3) for j in range(3)]
 POSE_DIM = len(POSE_COMPONENTS)
 
 
-@functools.lru_cache(maxsize=None)
-def _urdf() -> str:
-    return xacro.process_file(XACRO_PATH, mappings={"hand": "true"}).toxml()
-
-
-def _finger_locks(full_model: pin.Model) -> tuple[list[int], np.ndarray]:
-    """Ids of the finger joints and the full 9-D configuration (arm at its ready pose, fingers open) they are locked at."""
-    ids = [full_model.getJointId(name) for name in FINGER_JOINTS]
-    return ids, np.concatenate([Q_READY, [FINGER_OPEN] * len(FINGER_JOINTS)])
-
-
-def build_model() -> pin.Model:
-    """The 7-DoF FR3 with the finger joints locked open and the limits of SafeFlowMPC (kinematics only)."""
-    full = pin.buildModelFromXML(_urdf())
-    ids, reference = _finger_locks(full)
-    model = pin.buildReducedModel(full, ids, reference)
-    model.lowerPositionLimit = model.lowerPositionLimit + JOINT_LIMIT_MARGIN
-    model.upperPositionLimit = model.upperPositionLimit - JOINT_LIMIT_MARGIN
-    model.velocityLimit = VELOCITY_LIMIT_SCALE * model.velocityLimit
-    return model
-
-
-@functools.lru_cache(maxsize=None)
-def franka_kinematics() -> FrankaKinematics:
-    """The CasADi kinematics of the TCP (forward kinematics and IK), built once per process for every user."""
-    model = build_model()
-    return FrankaKinematics(model, model.getFrameId(TCP_FRAME))
-
-
-def build_robot() -> RobotWrapper:
-    """The 7-DoF FR3 with collision and visual geometry (for Meshcat), the hand and fingers fixed on the last joint."""
-    urdf = _urdf()
-    # meshes are package://franka_description/..., resolved from the clone's parent
-    pkg = [str(FRANKA_DESCRIPTION.parent)]
-    full = pin.buildModelFromXML(urdf)
-    visual = pin.buildGeomFromUrdfString(full, urdf, pin.GeometryType.VISUAL, package_dirs=pkg)
-    collision = pin.buildGeomFromUrdfString(full, urdf, pin.GeometryType.COLLISION, package_dirs=pkg)
-    ids, reference = _finger_locks(full)
-    model, (collision, visual) = pin.buildReducedModel(full, [collision, visual], ids, reference)
-    return RobotWrapper(model, collision, visual)
-
-
-class FrankaSystem(TripleIntegratorSystem):
+class FrankaSystem(TripleIntegratorBase):
     """Triple-integrator 7-joint FR3 with jerk as the action; the goal is a TCP pose."""
 
     task_description = "reach target pose"
 
     def __init__(self, config: Mapping[str, Any]):
-        # Call SystemSimulator.__init__ first, then configure the 7-DoF FR3 bounds on TripleIntegratorSystem
-        super(TripleIntegratorSystem, self).__init__(config)
-        self.model = build_model()
-        self.data = self.model.createData()
-        self._robot: RobotWrapper | None = None
-        self.tcp_id = self.model.getFrameId(TCP_FRAME)
-        self.kinematics = franka_kinematics()
-        n = self.model.nv
+        model = build_model()
+        n = model.nv
         if n != FRANKA_NUM_JOINTS:
             raise ValueError(f"Expected {FRANKA_NUM_JOINTS} joints, the reduced franka_description has {n}.")
-
+        kinematics = franka_kinematics()
+        ready_position, ready_rotation = kinematics.fk(Q_READY)
         per_joint = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (n,)).copy()
-        self._init_triple_integrator(
+        super().__init__(
+            config,
             n=n,
-            lower_position=self.model.lowerPositionLimit,
-            upper_position=self.model.upperPositionLimit,
-            max_velocity=self.model.velocityLimit,
+            lower_position=model.lowerPositionLimit,
+            upper_position=model.upperPositionLimit,
+            max_velocity=model.velocityLimit,
             max_acceleration=per_joint("max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION),
             max_jerk=per_joint("max_jerk", FRANKA_DEFAULT_MAX_JERK),
-            default_goal=self.pose_vector(self.tcp_placement(Q_READY)),
+            default_goal=np.concatenate([np.array(ready_position).ravel(), np.array(ready_rotation).ravel()]),
             default_min_distance=0.25,
             default_pos_tol=0.03,
             default_vel_tol=0.05,
         )
-        self.obs_dim = POSE_DIM + self.nx
-        self._cached_goal: np.ndarray | None = None
+        self.model = model
+        self.data = model.createData()
+        self.kinematics = kinematics
+        self.tcp_id = model.getFrameId(TCP_FRAME)
+        self._mesh_collision: tuple | None = None  # (obstacles, geometry model, geometry data), built on first use
+        self._cached_goal: np.ndarray | None = None  # the goal whose joint configuration is cached, and that configuration
         self._cached_q_goal: np.ndarray | None = None
 
     @property
     def environment_dim(self) -> int:
         return POSE_DIM + self.n
 
-    @property
-    def robot(self) -> RobotWrapper:
-        """Model with collision and visual geometry, built on first use (for Meshcat)."""
-        if self._robot is None:
-            self._robot = build_robot()
-        return self._robot
+    def reset(self, initial_state: np.ndarray) -> np.ndarray:
+        """Reset for a new rollout. The cached joint configuration of the goal is dropped, so one rollout never reuses
+        what was solved for another."""
+        state = super().reset(initial_state)
+        self._cached_goal = None
+        self._cached_q_goal = None
+        return state
+
+    def collides(self, state: np.ndarray) -> bool:
+        """True if a collision mesh of the arm (the real geometry, hand and fingers included) touches an obstacle. The
+        bounding spheres of the planners cover the meshes, so this is the ground truth they approximate."""
+        key = tuple((tuple(position), radius) for position, radius in self.obstacles)
+        if self._mesh_collision is None or self._mesh_collision[0] != key:
+            geometry_model = build_robot().collision_model
+            robot_objects = len(geometry_model.geometryObjects)
+            for index, (position, radius) in enumerate(self.obstacles):
+                geometry_model.addGeometryObject(pin.GeometryObject(f"obstacle{index}", 0, pin.SE3(np.eye(3), position), coal.Sphere(radius)))
+                for robot_object in range(robot_objects):
+                    geometry_model.addCollisionPair(pin.CollisionPair(robot_object, robot_objects + index))
+            self._mesh_collision = (key, geometry_model, pin.GeometryData(geometry_model))
+        _, geometry_model, geometry_data = self._mesh_collision
+        return bool(
+            self.obstacles
+            and pin.computeCollisions(self.model, self.data, geometry_model, geometry_data, np.asarray(state, dtype=float)[: self.n], True)
+        )
 
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
         """The goal pose in the TCP frame (``T_tcp^-1 T_goal``), the joint configuration error ``q_goal - q``, and the
@@ -210,61 +166,32 @@ class FrankaSystem(TripleIntegratorSystem):
         return self.kinematics.collision_spheres(np.asarray(q, dtype=float)[: self.n])
 
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray = Q_READY) -> np.ndarray:
-        """The joint configuration of the ``goal`` pose: ``q_reference`` if it already is one, else the inverse
-        kinematics solution from ``Q_READY`` (or the nearest to ``Q_READY`` from ``q_reference`` and random starts).
-        Raises ``RuntimeError`` if none converges."""
+        """The collision-free joint configuration of the ``goal`` pose (cached per goal)."""
         pose = self.vector_pose(goal)
         q_ref = np.clip(q_reference, self.kinematics.lower, self.kinematics.upper)
-        goal_vec = np.concatenate([pose.translation, pose.rotation.ravel(order="F")])
-        if float(self.kinematics._ik_cost(q_ref, goal_vec)) <= IK_TOLERANCE**2 and self.is_collision_free(q_ref):
+        if self.kinematics.reaches_pose(q_ref, pose.translation, pose.rotation) and self.is_collision_free(q_ref):
             return q_ref
         if self._cached_goal is not None and np.array_equal(goal, self._cached_goal):
             return self._cached_q_goal.copy()
-        for q_seed in (Q_READY, q_ref):
-            try:
-                solution = self.kinematics.inverse_kinematics(pose.translation, pose.rotation, q_seed)
-                if self.is_collision_free(solution):
-                    self._cached_goal, self._cached_q_goal = np.asarray(goal, dtype=float).copy(), solution.copy()
-                    return solution
-            except RuntimeError:
-                pass
-        rng = np.random.default_rng(0)
-        found: list[np.ndarray] = []
-        for _ in range(IK_ATTEMPTS):
-            try:
-                q_start = rng.uniform(self.model.lowerPositionLimit, self.model.upperPositionLimit)
-                candidate = self.kinematics.inverse_kinematics(pose.translation, pose.rotation, q_start)
-                if self.is_collision_free(candidate):
-                    found.append(candidate)
-            except RuntimeError:
-                continue
-            if len(found) == IK_SOLUTIONS:
-                break
-        if not found:
-            raise RuntimeError("Inverse kinematics did not converge from any start; the pose may be unreachable.")
-        solution = min(found, key=lambda q: float(np.linalg.norm(q - Q_READY)))
+        solution = self.kinematics.solve_ik(pose.translation, pose.rotation, q_ref, self.is_collision_free)
         self._cached_goal, self._cached_q_goal = np.asarray(goal, dtype=float).copy(), solution.copy()
         return solution
 
-    # --- dataset and sampling ------------------------------------------------
+    # --- dataset metadata and sampling ---------------------------------------
 
-    def get_dataset_features(self, prediction_horizon: int) -> dict[str, Any]:
-        features = super().get_dataset_features(prediction_horizon)
-        features["observation.environment_state"] = {
-            "dtype": "float32",
-            "shape": (self.environment_dim,),
-            "names": [f"goal_in_tcp.{component}" for component in POSE_COMPONENTS]
-            + [f"goal_rel.{name}" for name in self._coordinate_names()],
-        }
-        features["observation.state"] = {
-            "dtype": "float32",
-            "shape": (self.nx,),
-            "names": [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self._coordinate_names()],
-        }
-        return features
-
-    def _coordinate_names(self) -> list[str]:
+    @property
+    def coordinate_names(self) -> list[str]:
         return list(self.model.names[1:])
+
+    @property
+    def environment_state_names(self) -> list[str]:
+        return [f"goal_in_tcp.{component}" for component in POSE_COMPONENTS] + [
+            f"goal_rel.{name}" for name in self.coordinate_names
+        ]
+
+    @property
+    def state_names(self) -> list[str]:
+        return [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self.coordinate_names]
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
         """Random arm configuration near ``Q_READY`` inside the joint limits, in front of the base and above the floor."""

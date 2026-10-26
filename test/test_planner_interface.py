@@ -13,7 +13,7 @@ from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.casadi_planner import CasadiPlanner
 from planning.planner_factory import PlannerFactory
-from planning.ompl_casadi_planner import OmplCasadiPlanner
+from planning.ompl_initial_guess import OmplInitialGuess
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, Planner
 from test.planner_fixtures import pinned_config
@@ -33,7 +33,7 @@ class PlannerInterfaceTests(unittest.TestCase):
         return [
             CasadiPlanner(self.simulator, self.config),
             OmplPlanner(self.simulator, self.config),
-            OmplCasadiPlanner(self.simulator, self.config),
+            PlannerFactory.create("ompl_casadi", self.simulator, self.config),
         ]
 
     def test_the_abstract_interface_cannot_be_instantiated(self) -> None:
@@ -60,7 +60,7 @@ class PlannerInterfaceTests(unittest.TestCase):
                 planner.reset()
 
     def test_the_factory_builds_the_planner_of_every_name(self) -> None:
-        expected = {"casadi": CasadiPlanner, "ompl_casadi": OmplCasadiPlanner}
+        expected = {"casadi": CasadiPlanner, "ompl_casadi": CasadiPlanner}
 
         self.assertEqual(set(PlannerFactory.names()), set(expected))
         for name, planner_class in expected.items():
@@ -87,10 +87,17 @@ class PlannerInterfaceTests(unittest.TestCase):
         np.testing.assert_array_equal(plan.first_actions(4), [[0.0, 1.0], [2.0, 3.0], [0.0, 0.0], [0.0, 0.0]])
         np.testing.assert_array_equal(plan.first_actions(1), [[0.0, 1.0]])
 
+    def test_a_path_has_no_actions_to_label_with(self) -> None:
+        with self.assertRaises(ValueError):
+            Plan(positions=np.zeros((3, 2))).first_actions(2)
+
     def test_a_planner_keeps_no_statistics_unless_it_says_so(self) -> None:
         self.assertEqual(OmplPlanner(self.simulator, self.config).statistics, {})
         self.assertEqual(CasadiPlanner(self.simulator, self.config).statistics, {"trajectory_optimizations": 0})
-        self.assertIn("ompl_paths", OmplCasadiPlanner(self.simulator, self.config).statistics)
+        ompl_casadi = PlannerFactory.create("ompl_casadi", self.simulator, self.config)
+        self.assertIn("ompl_paths", ompl_casadi.statistics)
+        self.assertIsInstance(ompl_casadi.initial_guess_generator, OmplInitialGuess)
+        self.assertIsNone(CasadiPlanner(self.simulator, self.config).initial_guess_generator)
 
 
 if __name__ == "__main__":

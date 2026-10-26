@@ -14,6 +14,8 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from planning.casadi_planner import CasadiPlanner
+from systems.rollout_termination import RolloutTerminationTracker
+from planning.initial_guess import InitialGuessGenerator
 from planning.planner import Plan, PlannerSolveError
 from test.planner_fixtures import pose_goal
 
@@ -49,15 +51,15 @@ def _first_action(planner: CasadiPlanner, simulator: FrankaSystem, state: np.nda
 def _initial_guess(planner: CasadiPlanner, observation: np.ndarray, initial_plan: Plan | None = None):
     """The (states (nx, N + 1), actions (nu, N)) the planner starts its solve from."""
     guessed = {}
-    original = planner.opti.set_initial
+    original = planner._graph.opti.set_initial
 
     def recording_set_initial(variable, value):
         guessed[id(variable)] = np.asarray(value)
         return original(variable, value)
 
-    planner.opti.set_initial = recording_set_initial
+    planner._graph.opti.set_initial = recording_set_initial
     planner.plan(observation, initial_plan)
-    return guessed[id(planner.X)], guessed[id(planner.U)]
+    return guessed[id(planner._graph.X)], guessed[id(planner._graph.U)]
 
 
 def _start_near_the_ready_pose(simulator: FrankaSystem) -> np.ndarray:
@@ -84,7 +86,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
         first_action = _first_action(planner, simulator, state)
         self.assertIsNotNone(planner.last_X_sol)
 
-        real_solve = planner.opti.solve
+        real_solve = planner._graph.opti.solve
         calls = {"count": 0}
 
         def failing_once():
@@ -93,7 +95,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
                 raise RuntimeError("forced warm-start failure")
             return real_solve()
 
-        planner.opti.solve = failing_once
+        planner._graph.opti.solve = failing_once
         state = simulator.step(state, first_action)
         try:
             second_action = _first_action(planner, simulator, state)
@@ -107,7 +109,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
         simulator, planner, _ = _build()
         state = simulator.reset(_start_near_the_ready_pose(simulator))
         planner.reset()
-        planner.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        planner._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with self.assertRaises(PlannerSolveError):
             planner.plan(simulator.observe(state))
 
@@ -142,14 +144,16 @@ class PlannerBehaviorTests(unittest.TestCase):
     def test_closed_loop_mpc_reaches_a_nearby_goal_and_comes_to_rest(self) -> None:
         simulator, planner, _ = _build(pos_tol=0.005, vel_tol=0.05)
         simulator.set_goal(pose_goal(simulator, Q_READY))
+        state = simulator.reset(_start_near_the_ready_pose(simulator))
+        termination = RolloutTerminationTracker(simulator)
+        steps = 0
+        for steps in range(1, 81):
+            state = simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
+            if termination.update(state):
+                break
 
-        def first_action(observation: np.ndarray) -> np.ndarray:
-            return planner.plan(observation).actions[0]
-
-        trajectory = simulator.simulate(_start_near_the_ready_pose(simulator), first_action, num_steps=80)
-
-        self.assertTrue(simulator.is_done(trajectory["states"][-1]), "MPC did not reach the goal")
-        self.assertLess(len(trajectory["actions"]), 80, "episode should terminate early on the goal")
+        self.assertTrue(simulator.is_done(state), "MPC did not reach the goal")
+        self.assertLess(steps, 80, "episode should terminate early on the goal")
 
     def test_the_plan_starts_at_the_state_and_its_first_step_is_the_optimal_action(self) -> None:
         simulator, planner, _ = _build()
@@ -193,7 +197,7 @@ class PlannerBehaviorTests(unittest.TestCase):
         planner.reset()
         self.assertIsNone(planner.last_X_sol)
         self.assertIsNone(planner.last_U_sol)
-        self.assertIsNone(planner._prev_lam_g)
+        self.assertIsNone(planner._graph._multipliers)
         self.assertIsNone(planner.goal_configuration)
 
     def test_the_plan_stays_inside_the_joint_limits_however_far_the_goal_is_beyond_them(self) -> None:
@@ -201,7 +205,7 @@ class PlannerBehaviorTests(unittest.TestCase):
         state = simulator.reset(_start_near_the_ready_pose(simulator))
         beyond = simulator.state_upper_bounds[: simulator.n] + 0.5
 
-        with mock.patch.object(planner, "_goal_configuration", return_value=beyond):
+        with mock.patch("planning.casadi_planner.goal_configuration", return_value=beyond):
             plan = planner.plan(simulator.observe(state))
 
         self.assertTrue(np.all(plan.positions <= simulator.state_upper_bounds[: simulator.n] + 1e-6))
@@ -215,17 +219,22 @@ class PlannerBehaviorTests(unittest.TestCase):
 
         self.assertEqual(planner.statistics, {"trajectory_optimizations": 2})
 
-    def test_invalid_planner_config_is_rejected(self) -> None:
+    def test_q_and_r_diagonals_must_match_the_state_and_action_dimensions(self) -> None:
+        # The config does not know the system's dimensions; its scalar settings are validated when it is loaded
         simulator, _, validated = _build()
-        for key, value in (
-            ("horizon", 0),
-            ("terminal_cost_multiplier", 0.0),
-            ("Q_diag", [1.0] * 13),
-            ("R_diag", [1.0] * 6),
-        ):
+        for key, value in (("Q_diag", [1.0] * 13), ("R_diag", [1.0] * 6)):
             with self.subTest(key=key):
                 with self.assertRaises(ValueError):
                     CasadiPlanner(simulator, {**validated, key: value})
+
+    def test_omitted_diagonals_default_to_the_weights_of_the_dimensions(self) -> None:
+        simulator, _, validated = _build()
+        omitted = {key: value for key, value in validated.items() if key not in ("Q_diag", "R_diag")}
+
+        planner = CasadiPlanner(simulator, {**omitted, "R_weight": 0.3})
+
+        np.testing.assert_array_equal(planner.Q, 10.0 * np.eye(simulator.nx))
+        np.testing.assert_array_equal(planner.R, 0.3 * np.eye(simulator.nu))
 
 
 class GoalConfigurationTests(unittest.TestCase):
@@ -329,9 +338,9 @@ class InitialPlanTests(unittest.TestCase):
     def test_closed_loop_mpc_detours_around_a_spherical_obstacle_between_start_and_goal(self) -> None:
         # Place a sphere directly at the TCP position of the midpoint configuration between start and goal
         q_start = Q_READY.copy()
-        q_start[0] = -0.45
+        q_start[0] = -0.6
         q_goal = Q_READY.copy()
-        q_goal[0] = 0.45
+        q_goal[0] = 0.6
         mid_q = 0.5 * (q_start + q_goal)
         sim_free, _, _ = _build()
         obs_pos = sim_free.tcp_position(mid_q).tolist()
@@ -346,11 +355,100 @@ class InitialPlanTests(unittest.TestCase):
         self.assertTrue(simulator.is_collision_free(q_goal))
         self.assertFalse(simulator.is_collision_free(mid_q))
 
-        start_state = np.concatenate([q_start, np.zeros(2 * simulator.n)])
-        trajectory = simulator.simulate(start_state, lambda obs: planner.plan(obs).actions[0], num_steps=80)
-        for state in trajectory["states"]:
+        state = simulator.reset(np.concatenate([q_start, np.zeros(2 * simulator.n)]))
+        termination = RolloutTerminationTracker(simulator)
+        for _ in range(80):
+            state = simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
             self.assertTrue(simulator.is_collision_free(state), "MPC collided with the spherical obstacle")
-        self.assertTrue(simulator.is_done(trajectory["states"][-1]), "MPC did not reach the goal around the obstacle")
+            if termination.update(state):
+                break
+        self.assertTrue(simulator.is_done(state), "MPC did not reach the goal around the obstacle")
+
+
+class _StubGenerator(InitialGuessGenerator):
+    """Hands the planner a fixed plan and records what it is told."""
+
+    def __init__(self, plan: Plan | None) -> None:
+        self.plan = plan
+        self.calls: list[str] = []
+        self.last_positions_seen: list = []
+
+    def reset(self) -> None:
+        self.calls.append("reset")
+
+    def begin_goal(self) -> None:
+        self.calls.append("begin_goal")
+
+    def initial_plan(self, observation, q, last_positions):
+        self.calls.append("initial_plan")
+        self.last_positions_seen.append(last_positions)
+        return self.plan
+
+
+class InitialGuessGeneratorTests(unittest.TestCase):
+    """CasadiPlanner takes a global strategy (``InitialGuessGenerator``) instead of being subclassed for one."""
+
+    def _planner_and_state(self, plan_to_goal: bool = True):
+        simulator, _, validated = _build()
+        state = simulator.reset(_start_near_the_ready_pose(simulator))
+        q_goal = simulator.goal_configuration(simulator.goal, state[: simulator.n])
+        positions = np.linspace(state[: simulator.n], q_goal, 12)
+        generator = _StubGenerator(Plan(positions=positions) if plan_to_goal else None)
+        return simulator, CasadiPlanner(simulator, dict(validated), initial_guess_generator=generator), generator, state, q_goal
+
+    def test_the_end_of_the_generators_plan_is_the_goal_configuration_the_solve_starts_from_the_plan(self) -> None:
+        simulator, planner, generator, state, q_goal = self._planner_and_state()
+        # a goal configuration the inverse kinematics would not give: the plan's end must win
+        generator.plan = Plan(positions=np.linspace(state[: simulator.n], q_goal + 0.01, 12))
+
+        planner.plan(simulator.observe(state))
+
+        np.testing.assert_allclose(planner.goal_configuration, q_goal + 0.01)
+        self.assertEqual(generator.calls[:2], ["begin_goal", "initial_plan"])
+
+    def test_the_generator_hears_of_new_goals_and_resets_and_sees_the_last_solution(self) -> None:
+        simulator, planner, generator, state, _ = self._planner_and_state(plan_to_goal=False)
+
+        planner.plan(simulator.observe(state))
+        planner.plan(simulator.observe(state))
+        planner.reset()
+
+        self.assertEqual(generator.calls, ["begin_goal", "initial_plan", "initial_plan", "reset"])
+        self.assertIsNone(generator.last_positions_seen[0])  # the first solve of a goal has no previous solution
+        self.assertEqual(generator.last_positions_seen[1].shape, (planner.N + 1, simulator.n))
+
+    def test_a_failed_solve_from_the_generators_plan_returns_the_plan_and_is_counted(self) -> None:
+        simulator, planner, generator, state, _ = self._planner_and_state()
+
+        with mock.patch.object(planner, "_solve", side_effect=PlannerSolveError("forced")):
+            plan = planner.plan(simulator.observe(state))
+
+        self.assertEqual(planner.fallbacks, 1)
+        self.assertEqual(plan.positions.shape, (planner.N + 1, simulator.n))
+        self.assertEqual(planner.statistics["trajectory_fallbacks"], 1)
+
+    def test_without_a_generator_a_failed_solve_raises_and_the_statistics_have_no_fallbacks(self) -> None:
+        simulator, planner, _ = _build()
+        state = simulator.reset(_start_near_the_ready_pose(simulator))
+
+        with mock.patch.object(planner, "_solve", side_effect=PlannerSolveError("forced")):
+            with self.assertRaises(PlannerSolveError):
+                planner.plan(simulator.observe(state))
+        self.assertEqual(planner.statistics, {"trajectory_optimizations": 0})
+
+    def test_the_planner_and_the_projector_compose_the_problem_skeleton(self) -> None:
+        from planning.casadi_graph import CasadiKinematicGraph
+        from planning.casadi_projector import CasadiTrajectoryProjector
+
+        simulator, planner, validated = _build()
+        projector = CasadiTrajectoryProjector(simulator, validated, horizon=5)
+
+        for problem in (planner, projector):
+            self.assertIsInstance(problem._graph, CasadiKinematicGraph)
+            self.assertNotIsInstance(problem, CasadiKinematicGraph)
+        for name in ("update_collision_halfspaces", "set_initial", "set_state", "minimize", "solve"):
+            self.assertNotIn(name, vars(CasadiPlanner))
+            self.assertNotIn(name, vars(CasadiTrajectoryProjector))
 
 
 if __name__ == "__main__":

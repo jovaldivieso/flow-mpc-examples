@@ -6,8 +6,10 @@
 Starts and goals are sampled from the seeds like the DAgger evaluation does (--seeds). At every step the policy's
 predicted action chunk is drawn as the TCP path of the motion it leads to (cyan) and, with --show-expert, the plan the
 expert would make from the very same state (green): the two are the network's output and the label it is trained on.
-The executed action is the first row of the policy's chunk. --no-viewer prints the outcome of every rollout only
-(reached, collision, timeout, solve failure).
+The TCP path actually executed so far is drawn in yellow.
+The executed action is the first row of the policy's chunk. --show-collision-geometry draws the bounding spheres of the
+robot, which the planners and the safety filter keep clear of the obstacles. --no-viewer prints the outcome of every
+rollout only (reached, collision, timeout, solve failure).
 """
 
 import argparse
@@ -23,18 +25,22 @@ import numpy as np
 import torch
 from pinocchio.visualize import MeshcatVisualizer
 
+from systems.rollout_termination import RolloutTerminationTracker
 from systems.system_factory import SystemFactory
 from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
+from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
-from .evaluate_policy import load_policy
-from .meshcat_utils import action_tcp_points, draw_frame, draw_obstacles, draw_plan
+from .evaluate_policy import checkpoint_policy_type, load_policy
+from .meshcat_utils import action_tcp_points, draw_collision_spheres, draw_frame, draw_obstacles, draw_plan, load_robot, move_collision_spheres
 
 POLICY_COLOR = 0x00D0FF
 EXPERT_COLOR = 0x20D040
+EXECUTED_COLOR = 0xFFD000
+EXECUTED_RADIUS = 0.003  # m, a bit thicker than the plans so it stays visible under their starts
 
 
 class PolicyRollout(NamedTuple):
@@ -55,12 +61,13 @@ def rollout_policy(
 ) -> PolicyRollout:
     """Closed loop: the first row of the policy's chunk is executed; the expert (if any) only plans from each visited state."""
     state = dyn.reset(initial_state)
+    termination = RolloutTerminationTracker(dyn)
     policy.reset()
     if planner is not None:
         planner.reset()
     states, chunks, expert_plans = [state.copy()], [], []
     outcome, detail = "timeout", ""
-    if dyn.should_terminate_rollout(state):
+    if termination.update(state):
         outcome = "reached"
     for _ in range(0 if outcome == "reached" else num_steps):
         observation = dyn.observe(state)
@@ -79,10 +86,10 @@ def rollout_policy(
         chunks.append(chunk)
         state = dyn.step(state, chunk[0])
         states.append(state.copy())
-        if not dyn.is_collision_free(state):
+        if dyn.collides(state):
             outcome = "collision"
             break
-        if dyn.should_terminate_rollout(state):
+        if termination.update(state):
             outcome = "reached"
             break
     shape = (0, 0, dyn.nu)
@@ -105,16 +112,18 @@ def main() -> None:
     parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
     parser.add_argument("--show-expert", action="store_true", help="also plan with the expert from every visited state and draw its plan")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu", help="device of the policy (default: %(default)s)")
+    parser.add_argument("--show-collision-geometry", action="store_true", help="draw the bounding spheres the planners and the safety filter keep clear of the obstacles, on the robot")
     parser.add_argument("--no-viewer", action="store_true", help="print the outcomes only")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
     args = parser.parse_args()
 
     config = load_and_validate_system_config(args.config)
+    initialize_ompl(config["ompl_seed"])
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})
     device = torch.device(args.device)
     dyn = SystemFactory.create(config["system"], config)
-    policy_type = args.policy_type or torch.load(args.model_dir, map_location="cpu", weights_only=True)["policy_type"]
+    policy_type = args.policy_type or checkpoint_policy_type(args.model_dir)
     policy = load_policy(policy_type, args.model_dir, dyn, config, device)
     planner = PlannerFactory.create(config["expert"], dyn, config) if args.show_expert else None
     seeds = [int(s) for s in ast.literal_eval(args.seeds)]
@@ -137,7 +146,7 @@ def main() -> None:
         return
 
     if config["system"] == "franka":
-        robot = dyn.robot
+        robot = load_robot()
         viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
         viz.initViewer(open=True)
         viz.loadViewerModel()
@@ -150,15 +159,23 @@ def main() -> None:
         viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
         show = lambda state: viz.viewer["point"].set_transform(tf.translation_matrix(dyn.tcp_position(state[: dyn.n])))
     draw_obstacles(viz, dyn.obstacles)
+    if args.show_collision_geometry:
+        draw_collision_spheres(viz, dyn.collision_spheres(rollouts[0][2].states[0][: dyn.n])[2])
+        show_robot = show
+        show = lambda state: (show_robot(state), move_collision_spheres(viz, dyn.collision_spheres(state[: dyn.n])[0]))
     print("Playing the rollouts in a loop (Ctrl+C to stop): goal frame/ball = goal TCP, cyan line = the policy's chunk"
-          + (", green line = the expert's plan from the same state" if args.show_expert else ""))
+          + (", green line = the expert's plan from the same state" if args.show_expert else "")
+          + ", yellow line = the TCP path executed so far"
+          + (", blue spheres = the collision spheres" if args.show_collision_geometry else ""))
     try:
         while True:
             for seed, goal, rollout in rollouts:
                 print(f"seed {seed}: {rollout.outcome} after {len(rollout.chunks)} steps")
                 viz.viewer["goal"].set_transform(dyn.goal_transform(goal))
+                executed_tcp = np.array([dyn.tcp_position(state[: dyn.n]) for state in rollout.states])
                 for index, state in enumerate(rollout.states):
                     show(state)
+                    draw_plan(viz, "executed_path", executed_tcp[: index + 1], EXECUTED_COLOR, EXECUTED_RADIUS)
                     if index < len(rollout.chunks):
                         draw_plan(viz, "policy_plan", action_tcp_points(dyn, state, rollout.chunks[index]), POLICY_COLOR)
                         if rollout.expert_plans is not None and not np.isnan(rollout.expert_plans[index]).any():

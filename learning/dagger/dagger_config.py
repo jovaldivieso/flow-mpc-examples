@@ -9,8 +9,22 @@ import numpy as np
 from learning.config_loaders import FlowConfig, UnetConfig
 
 
+def _per_round(values: list[Any], rounds: int, name: str) -> list[Any]:
+    """One value per round: a single value is repeated for every round, else there must be exactly one per round."""
+    if len(values) == 1:
+        return list(values) * rounds if rounds else list(values)
+    if len(values) != rounds:
+        raise ValueError(f"'{name}' must contain one value or exactly one per round ({rounds}), got {len(values)}.")
+    return list(values)
+
+
 @dataclass(frozen=True)
 class DaggerConfig:
+    """The resolved settings of a DAgger run. The per-round lists (``trajectories_per_iteration``,
+    ``expert_beta_per_iteration``, ``target_epochs_per_round``, and ``training_curriculum`` and ``round_seeds`` when
+    given) are taken as they come, with one value for all rounds or one per round, and are expanded here to one value
+    per round."""
+
     experiment_config: dict[str, Any]
     repo_id: str
     dataset_root: Path
@@ -52,26 +66,20 @@ class DaggerConfig:
     def __post_init__(self) -> None:
         if self.dagger_iterations < 0:
             raise ValueError("'dagger_iterations' must be non-negative.")
-        if len(self.trajectories_per_iteration) not in {1, self.dagger_iterations}:
-            raise ValueError(
-                "'trajectories_per_iteration' must contain one or one value per round."
-            )
+        rounds = self.dagger_iterations
+        for name in ("trajectories_per_iteration", "expert_beta_per_iteration", "target_epochs_per_round"):
+            object.__setattr__(self, name, _per_round(getattr(self, name), rounds, name))
+        for name in ("training_curriculum", "round_seeds"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, _per_round(getattr(self, name), rounds, name))
         if any(v <= 0 for v in self.trajectories_per_iteration):
             raise ValueError("Trajectory targets must be positive.")
         if self.steps_per_trajectory <= 0:
             raise ValueError("'steps_per_trajectory' must be positive.")
         if self.action_noise_std < 0 or self.eval_action_noise_std < 0:
             raise ValueError("Action noise must be non-negative.")
-        if len(self.expert_beta_per_iteration) not in {1, self.dagger_iterations}:
-            raise ValueError(
-                "'expert_beta_per_iteration' must contain one or one value per round."
-            )
         if any(not 0.0 <= v <= 1.0 for v in self.expert_beta_per_iteration):
             raise ValueError("Expert beta values must be in [0, 1].")
-        if len(self.target_epochs_per_round) not in {1, self.dagger_iterations}:
-            raise ValueError(
-                "'target_epochs_per_round' must contain one or one value per round."
-            )
         if any(v <= 0 for v in self.target_epochs_per_round):
             raise ValueError("Epoch targets must be positive.")
         if self.eval_episodes < 0 or (
@@ -82,19 +90,10 @@ class DaggerConfig:
             raise ValueError("Batch size and learning rate must be positive.")
         if self.max_train_steps is not None and self.max_train_steps <= 0:
             raise ValueError("Max train steps must be positive.")
-        if self.training_curriculum is not None:
-            if len(self.training_curriculum) != self.dagger_iterations:
-                raise ValueError(
-                    "'training_curriculum' must contain exactly one entry per DAgger round "
-                    f"({self.dagger_iterations}), got {len(self.training_curriculum)}."
-                )
-            if any(mode not in {"random", "config"} for mode in self.training_curriculum):
-                raise ValueError("'training_curriculum' entries must be 'random' or 'config'.")
-        if self.round_seeds is not None and len(self.round_seeds) != self.dagger_iterations:
-            raise ValueError(
-                "'round_seeds' must contain exactly one entry per DAgger round "
-                f"({self.dagger_iterations}), got {len(self.round_seeds)}."
-            )
+        if self.training_curriculum is not None and any(
+            mode not in {"random", "config"} for mode in self.training_curriculum
+        ):
+            raise ValueError("'training_curriculum' entries must be 'random' or 'config'.")
         if self.tolerance_overrides is not None and any(
             value <= 0 for value in self.tolerance_overrides.values()
         ):

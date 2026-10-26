@@ -6,8 +6,6 @@ from collections.abc import Mapping
 import torch
 from torch import nn
 
-DEFAULT_POLICY_TYPE = "flow"
-
 
 class ActionPolicy(nn.Module, ABC):
     """Abstract base class for all continuous-action imitation learning policies."""

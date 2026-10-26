@@ -15,7 +15,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.planner import PlannerSolveError
 from planning.casadi_projector import CasadiTrajectoryProjector
@@ -102,45 +102,29 @@ def _zero_the_network(policy: SafeFlowMPCPolicy) -> None:
             param.zero_()
 
 
-class GoalAnchorIndependenceTests(unittest.TestCase):
-    """Root-cause fix for the same staleness issue a since-removed
-    sync_simulator() hook used to patch around: PolicyFactory.create now
-    gives SafeFlowMPCPolicy its own private, goal-zeroed dynamics objects
-    instead of live references into whatever simulator built it, so there
-    is nothing left to keep in sync with rollout collection's or
-    evaluate_current_policy's own separately-constructed simulators.
-
-    This is correct, not just convenient, because every constraint/cost
-    CasadiTrajectoryProjector enforces -- dynamics, action/state bounds,
-    terminal velocity -- is built
-    from the state invert_obs reconstructs from the observation, which
-    carries no goal; the goal used there is never anything more than a
-    fixed, self-consistent local anchor. See learning/models/policy_factory.py's
-    comment for the one way this could stop being true (a future
-    world-frame-referencing term).
+class SharedSimulatorTests(unittest.TestCase):
+    """The projector of a safe flow policy shares the simulator it was built for (no private copy): it reads no goal of
+    it, because every constraint and cost it enforces -- dynamics, action/state bounds, terminal velocity, obstacles --
+    is built from the system and from the state of the observation, which carries no goal.
     """
 
-    def test_local_sim_has_zeroed_goal_regardless_of_source_simulator(self) -> None:
+    def test_the_projector_uses_the_simulator_it_was_given(self) -> None:
         simulator = _build_simulator(goal=GOAL)
+
         policy = _build_safe_flow_policy(simulator)
 
-        np.testing.assert_allclose(policy.local_sim.goal, np.zeros(12))
-        # projector.sim and local_sim must still be the same object
-        # (both are PolicyFactory.create's own copy) -- a projector never
-        # needs a goal of its own, separate from local_sim's.
-        self.assertIs(policy.projector.sim, policy.local_sim)
+        self.assertIs(policy.projector.sim, simulator)
+        self.assertFalse(hasattr(policy, "simulator"))  # the policy only hands the projector the state it observes
 
-    def test_construction_does_not_mutate_the_source_simulator(self) -> None:
+    def test_construction_neither_copies_nor_changes_the_simulator(self) -> None:
         simulator = _build_simulator(goal=GOAL)
-        policy = _build_safe_flow_policy(simulator)
+        kinematics_before = simulator.kinematics
 
-        # The deep copy must fully isolate local_sim from the simulator
-        # that built it -- a caller that passes the same simulator object
-        # for both policy construction and its own rollout (some
-        # evaluate_policy.py call sites do) must not find its goal silently
-        # zeroed out from under it.
-        self.assertIsNot(policy.local_sim, simulator)
+        with mock.patch("copy.deepcopy", side_effect=AssertionError("the simulator must not be deep-copied")):
+            _build_safe_flow_policy(simulator)
+
         np.testing.assert_allclose(simulator.goal, GOAL)
+        self.assertIs(simulator.kinematics, kinematics_before)
 
     def test_select_action_is_invariant_to_which_goal_the_source_simulator_holds(self) -> None:
         # The actual mathematical property the whole redesign relies on,
@@ -184,8 +168,7 @@ class TerminalConditionSupportTests(unittest.TestCase):
         state0[simulator.n + 4] = 3.0
         # sanity: braking takes more than the single planned step
         self.assertGreater(np.max(state0[simulator.n : 2 * simulator.n] / (simulator.max_acceleration * simulator.dt)), 1.0)
-        obs0 = simulator.observe(state0)
-        q_safe = projector.project(obs0, _zero_chunk(horizon))
+        q_safe = projector.project(state0, _zero_chunk(horizon))
         self.assertEqual(q_safe.shape, (horizon, simulator.n))
 
 
@@ -204,7 +187,7 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
         from learning.dagger.rollouts import rollout_policy_with_action_fn
 
         simulator = _build_simulator()
-        initial_state = simulator.reset_random()
+        initial_state = _rest_state(simulator)
 
         def failing_action_fn(observation: np.ndarray) -> np.ndarray:
             raise PlannerSolveError("forced failure for test")
@@ -231,8 +214,8 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
 
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator)
-        policy.projector.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
-        initial_state = simulator.reset_random()
+        policy.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        initial_state = _rest_state(simulator)
 
         reached_goal, steps_taken, failure_reason = rollout_policy_with_action_fn(
             simulator=simulator,
@@ -257,7 +240,7 @@ class SelectActionBatchSizeGuardTests(unittest.TestCase):
 
     @staticmethod
     def _build_observation_dict(simulator) -> dict[str, torch.Tensor]:
-        state = simulator.reset_random()
+        state = _rest_state(simulator)
         return _policy_input(simulator, state)
 
     def test_single_row_batch_succeeds(self) -> None:
@@ -284,8 +267,7 @@ class SelectActionBatchSizeGuardTests(unittest.TestCase):
 
 class PolicyFactorySafeFlowTests(unittest.TestCase):
     """PolicyFactory.create("safeflow", ...) wires an inner FlowPolicy, a
-    CasadiTrajectoryProjector and the policy's own goal-zeroed copy of the
-    simulator into one single-arm SafeFlowMPCPolicy.
+    CasadiTrajectoryProjector into one single-arm SafeFlowMPCPolicy.
     """
 
     def test_requires_simulator_and_planner_config(self) -> None:
@@ -304,7 +286,7 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
 
         self.assertEqual(policy.projector.N, HORIZON)
         self.assertEqual(policy.projector.tracked_horizon, HORIZON)
-        self.assertIsInstance(policy.local_sim, FrankaSystem)
+        self.assertIsInstance(policy.projector.sim, FrankaSystem)
         # What the terminal come-to-rest cost reads: the arm's joint velocities and accelerations, state = [q, v, a].
         self.assertEqual(policy.projector.rest_idx, list(range(7, 21)))
 
@@ -321,7 +303,7 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
 
 class SelectActionProjectionTests(unittest.TestCase):
     """select_action integrates the flow over the chunk of actions:
-    every Euler step hands the projector the flat observation and the
+    every Euler step hands the projector the observed state and the
     current proposal, the projection is the flow's next state, and the
     returned chunk is the last projection.
     """
@@ -331,15 +313,15 @@ class SelectActionProjectionTests(unittest.TestCase):
         real_project = policy.projector.project
         calls: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-        def recording_project(obs: np.ndarray, q_ref: np.ndarray) -> np.ndarray:
-            q_safe = real_project(obs, q_ref)
-            calls.append((obs.copy(), q_ref.copy(), q_safe.copy()))
+        def recording_project(state: np.ndarray, q_ref: np.ndarray) -> np.ndarray:
+            q_safe = real_project(state, q_ref)
+            calls.append((state.copy(), q_ref.copy(), q_safe.copy()))
             return q_safe
 
         policy.projector.project = recording_project
         return calls
 
-    def test_every_euler_step_projects_the_flat_observation_and_the_proposed_chunk(self) -> None:
+    def test_every_euler_step_projects_the_observed_state_and_the_proposed_chunk(self) -> None:
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator, flow_init="gaussian")
         observation_dict = _rest_observation_dict(simulator)
@@ -355,11 +337,11 @@ class SelectActionProjectionTests(unittest.TestCase):
         action = policy.select_action(observation_dict)
 
         self.assertEqual(len(calls), policy.inner_policy.velocity_net.num_inference_steps)
-        # the projector gets the observation [goal, state] rebuilt from what the policy saw
-        expected_observation = simulator.observe(_rest_state(simulator))
-        for obs, q_ref, _ in calls:
-            self.assertEqual(obs.shape, (simulator.obs_dim,))
-            np.testing.assert_allclose(obs, expected_observation, atol=1e-5)
+        # the projector gets the state the policy saw
+        expected_state = _rest_state(simulator)
+        for state, q_ref, _ in calls:
+            self.assertEqual(state.shape, (simulator.nx,))
+            np.testing.assert_allclose(state, expected_state, atol=1e-5)
             self.assertEqual(q_ref.shape, (HORIZON, simulator.nu))
         np.testing.assert_allclose(calls[0][1], expected_x0[0].numpy() * simulator.max_action, rtol=1e-5, atol=1e-4)
         np.testing.assert_allclose(calls[1][1], calls[0][2], rtol=1e-5, atol=1e-5)
@@ -375,7 +357,7 @@ class SelectActionProjectionTests(unittest.TestCase):
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator)
         state = _rest_state(simulator)
-        policy.projector.project(simulator.observe(state), _zero_chunk())
+        policy.projector.project(state, _zero_chunk())
         self.assertIsNotNone(policy.projector._prev_U_sol)
 
         with mock.patch.object(policy.inner_policy, "reset") as inner_reset:
@@ -445,7 +427,7 @@ class FlowInitializationTests(unittest.TestCase):
         simulator = _build_simulator()
         policy, calls = self._policy_and_calls(simulator, flow_init="previous_safe")
         state = _rest_state(simulator)
-        policy.projector.project(simulator.observe(state), _zero_chunk())
+        policy.projector.project(state, _zero_chunk())
         policy.reset()
         calls.clear()
 
@@ -459,32 +441,57 @@ class FlowInitializationTests(unittest.TestCase):
 
 
 class StateDictInterchangeTests(unittest.TestCase):
-    """'flow' and 'safeflow' checkpoints are interchangeable (see
-    scripts/evaluate_policy.py's _POLICY_TYPE_EQUIVALENCE): a SafeFlowMPCPolicy's
-    state dict is its inner FlowPolicy's behind an ``inner_policy.`` prefix
-    (the projector is no nn.Module, so it contributes nothing), and either
-    kind of policy loads either kind of checkpoint.
+    """'flow' and 'safeflow' checkpoints are interchangeable: a SafeFlowMPCPolicy's state dict is its inner
+    FlowPolicy's behind an ``inner_policy.`` prefix (the projector is no nn.Module, so it contributes nothing), and
+    ``load_policy_state_dict`` loads either kind of checkpoint into either kind of policy through PyTorch's own,
+    strict, ``load_state_dict`` -- which neither policy overrides.
     """
 
-    def test_flow_and_safeflow_state_dicts_load_into_each_other(self) -> None:
+    def _policies(self):
         simulator = _build_simulator()
         safe_policy = _build_safe_flow_policy(simulator)
         flow_policy = FlowPolicy(
             action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
             prediction_horizon=HORIZON, num_inference_steps=2,
         )
+        return safe_policy, flow_policy
+
+    def test_neither_policy_overrides_load_state_dict(self) -> None:
+        self.assertIs(SafeFlowMPCPolicy.load_state_dict, torch.nn.Module.load_state_dict)
+        self.assertIs(FlowPolicy.load_state_dict, torch.nn.Module.load_state_dict)
+
+    def test_flow_and_safeflow_state_dicts_load_into_each_other(self) -> None:
+        safe_policy, flow_policy = self._policies()
         flow_state_dict = {name: value.clone() for name, value in flow_policy.state_dict().items()}
         safe_state_dict = {name: value.clone() for name, value in safe_policy.state_dict().items()}
         self.assertEqual(set(safe_state_dict), {f"inner_policy.{name}" for name in flow_state_dict})
 
         # a bare flow checkpoint into the safeflow policy ...
-        safe_policy.load_state_dict(flow_state_dict)
+        load_policy_state_dict(safe_policy, flow_state_dict)
         for name, value in flow_state_dict.items():
             torch.testing.assert_close(safe_policy.state_dict()[f"inner_policy.{name}"], value)
         # ... and a safeflow checkpoint into the bare flow policy
-        flow_policy.load_state_dict(safe_state_dict)
+        load_policy_state_dict(flow_policy, safe_state_dict)
         for name, value in safe_state_dict.items():
             torch.testing.assert_close(flow_policy.state_dict()[name.removeprefix("inner_policy.")], value)
+
+    def test_the_loading_is_strict_and_a_checkpoint_of_its_own_keys_loads_natively(self) -> None:
+        safe_policy, flow_policy = self._policies()
+        own = {name: value.clone() for name, value in safe_policy.state_dict().items()}
+
+        safe_policy.load_state_dict(own)  # PyTorch's own loading, no remapping needed
+        with self.assertRaises(RuntimeError):  # strict: an unknown key is an error, not silently dropped
+            load_policy_state_dict(flow_policy, {**own, "inner_policy.unexpected": torch.zeros(1)})
+        with self.assertRaises(RuntimeError):  # and so is a missing one
+            load_policy_state_dict(safe_policy, dict(list(own.items())[1:]))
+
+    def test_keys_saved_while_the_network_was_torch_compiled_and_projector_keys_are_mapped(self) -> None:
+        safe_policy, _ = self._policies()
+        saved = {name.replace("velocity_net.", "velocity_net._orig_mod.", 1): value.clone() for name, value in safe_policy.state_dict().items()}
+        saved["projector.stale"] = torch.zeros(1)
+        self.assertTrue(any("_orig_mod" in name for name in saved))
+
+        load_policy_state_dict(safe_policy, saved)
 
 
 if __name__ == "__main__":

@@ -18,23 +18,26 @@ import numpy as np
 from pinocchio.visualize import MeshcatVisualizer
 
 from systems.franka_system import FrankaSystem
+from systems.rollout_termination import RolloutTerminationTracker
 from systems.seed_utils import action_noise_rng_for_rollout, default_action_noise_seed_for_config
 from learning.dagger.rollouts import apply_execution_noise
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
+from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
-from .meshcat_utils import draw_frame, draw_obstacles, draw_tcp_paths
+from .meshcat_utils import draw_frame, draw_obstacles, draw_tcp_paths, load_robot
 
 
 def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
     """One closed-loop expert rollout; stops at the goal or when the planner fails."""
     state = dyn.reset(initial_state)
+    termination = RolloutTerminationTracker(dyn)
     planner.reset()
     states, actions, solve_times = [state.copy()], [], []
     outcome = "timeout"
-    if dyn.should_terminate_rollout(state):
+    if termination.update(state):
         outcome = "reached"
     for _ in range(0 if outcome == "reached" else num_steps):
         t0 = time.time()
@@ -48,10 +51,10 @@ def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarra
         state = dyn.step(state, executed)
         states.append(state.copy())
         actions.append(executed)
-        if not dyn.is_collision_free(state):
+        if dyn.collides(state):
             outcome = "collision"
             break
-        if dyn.should_terminate_rollout(state):
+        if termination.update(state):
             outcome = "reached"
             break
     return {"states": np.array(states), "actions": np.array(actions).reshape(-1, dyn.nu), "solve_times": solve_times, "outcome": outcome}
@@ -95,6 +98,7 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_and_validate_system_config(args.config)
+    initialize_ompl(config["ompl_seed"])
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})
     seeds = [int(s) for s in ast.literal_eval(args.seeds)] if args.seeds else list(range(args.num_traj))
@@ -131,7 +135,7 @@ def main() -> None:
     if args.no_viewer:
         return
 
-    robot = dyn.robot
+    robot = load_robot()
     viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
     viz.initViewer(open=True)
     viz.loadViewerModel()

@@ -17,7 +17,7 @@ from planning.config import validate_system_config
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from systems.seed_utils import default_action_noise_seed_for_config
-from learning.data_utils import create_collate_fn
+from learning.data_utils import build_dataset_features, create_collate_fn
 from learning.models.exponential_moving_average import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy
 from learning.models.policy_factory import PolicyFactory
@@ -87,31 +87,6 @@ class DaggerTrainer:
         self.obs_feature_names: list[str] = []
         self.state_dim = self.action_dim = self.prediction_horizon = 0
 
-    @staticmethod
-    def schedules(
-        trajectories: list[int],
-        epochs: list[float],
-        betas: list[float],
-        rounds: int,
-        training_curriculum: list[str] | None = None,
-        round_seeds: list[int] | None = None,
-    ) -> tuple[list[int], list[float], list[float], list[str] | None, list[int] | None]:
-        def expand(values: list[Any], name: str) -> list[Any]:
-            if len(values) == 1:
-                return values if rounds == 0 else values * rounds
-            if len(values) != rounds:
-                raise ValueError(
-                    f"{name} must contain one or exactly {rounds} values."
-                )
-            return values
-        return (
-            expand(trajectories, "trajectories-per-iteration"),
-            expand(epochs, "target-epochs-per-round"),
-            expand(betas, "expert-beta-per-iteration"),
-            expand(training_curriculum, "training-curriculum") if training_curriculum is not None else None,
-            expand(round_seeds, "round-seeds") if round_seeds is not None else None,
-        )
-
     def setup(self) -> None:
         set_seed(self.cfg.seed)
         self.seeded_config = with_seeded_initial_state_config(
@@ -136,7 +111,7 @@ class DaggerTrainer:
                 f"The policy's 'prediction_horizon' ({self.prediction_horizon}) must not exceed the expert's 'horizon' "
                 f"({expert_horizon}): the expert's plan labels the policy's targets."
             )
-        features = self.simulator.get_dataset_features(self.prediction_horizon)
+        features = build_dataset_features(self.simulator, self.prediction_horizon)
         if self.cfg.dataset_root.exists():
             existing_meta = LeRobotDatasetMetadata(repo_id=self.cfg.repo_id, root=self.cfg.dataset_root)
             _validate_resumable_dataset_schema(existing_meta.features, features)
@@ -383,24 +358,6 @@ class DaggerTrainer:
             print_rollout_metrics(label, "eval", metrics)
         return metrics
 
-    def persist_round_summary(
-        self,
-        round_index: int,
-        train_loss: float | None,
-        eval_metrics: DaggerEvalMetrics | None,
-        aggregation_metrics: DaggerEvalMetrics | None = None,
-        latest_checkpoint: str | None = None,
-        iteration_checkpoint: str | None = None,
-    ) -> None:
-        self.save_round_summary(
-            round_index=round_index,
-            train_loss=train_loss,
-            eval_metrics=eval_metrics,
-            aggregation_metrics=aggregation_metrics,
-            latest_checkpoint=latest_checkpoint,
-            iteration_checkpoint=iteration_checkpoint,
-        )
-
     def save_round_summary(
         self,
         round_index: int,
@@ -424,94 +381,11 @@ class DaggerTrainer:
         entry: dict[str, Any] = {
             "round": int(round_index),
             "train_loss": train_loss,
-            "aggregation_success_rate": (
-                aggregation_metrics.success_rate
-                if aggregation_metrics is not None
-                else None
-            ),
-            "eval_success_rate": (
-                eval_metrics.success_rate
-                if eval_metrics is not None
-                else None
-            ),
-            "eval_mean_steps": (
-                eval_metrics.mean_steps
-                if eval_metrics is not None
-                else None
-            ),
-            "eval_min_steps": (
-                eval_metrics.min_steps
-                if eval_metrics is not None
-                else None
-            ),
-            "eval_max_steps": (
-                eval_metrics.max_steps
-                if eval_metrics is not None
-                else None
-            ),
-            "eval_num_episodes": (
-                eval_metrics.num_episodes
-                if eval_metrics is not None
-                else None
-            ),
-            "eval_success_by_source": {
-                "config": {
-                    "successes": (
-                        eval_metrics.config_successes
-                        if eval_metrics is not None
-                        else 0
-                    ),
-                    "total": (
-                        eval_metrics.config_num_episodes
-                        if eval_metrics is not None
-                        else 0
-                    ),
-                    "rate": (
-                        100.0 * eval_metrics.config_successes / eval_metrics.config_num_episodes
-                        if eval_metrics is not None and eval_metrics.config_num_episodes > 0
-                        else None
-                    ),
-                },
-                "random": {
-                    "successes": (
-                        eval_metrics.random_successes
-                        if eval_metrics is not None
-                        else 0
-                    ),
-                    "total": (
-                        eval_metrics.random_num_episodes
-                        if eval_metrics is not None
-                        else 0
-                    ),
-                    "rate": (
-                        100.0 * eval_metrics.random_successes / eval_metrics.random_num_episodes
-                        if eval_metrics is not None and eval_metrics.random_num_episodes > 0
-                        else None
-                    ),
-                },
-            },
-            "eval_failure_breakdown": {
-                "timeout": (
-                    eval_metrics.timeout_failures
-                    if eval_metrics is not None
-                    else 0
-                ),
-                "solve_failure": (
-                    eval_metrics.solve_failures
-                    if eval_metrics is not None
-                    else 0
-                ),
-            },
+            "aggregation_success_rate": aggregation_metrics.success_rate if aggregation_metrics is not None else None,
+            **(eval_metrics.to_dict() if eval_metrics is not None else DaggerEvalMetrics.not_evaluated()),
         }
         if aggregation_metrics is not None:
-            entry["aggregation_failures"] = {
-                "attempted_episodes": aggregation_metrics.attempted_episodes,
-                "discarded_episodes": aggregation_metrics.discarded_episodes,
-                "planner_failures": aggregation_metrics.planner_failures,
-                "policy_solve_fallbacks": aggregation_metrics.policy_solve_fallbacks,
-            }
-            if aggregation_metrics.expert_statistics:
-                entry["expert_statistics"] = dict(aggregation_metrics.expert_statistics)
+            entry.update(aggregation_metrics.collection_summary())
         if latest_checkpoint is not None or iteration_checkpoint is not None:
             entry["checkpoints"] = {
                 "latest": str(latest_checkpoint) if latest_checkpoint is not None else None,
@@ -597,7 +471,7 @@ class DaggerTrainer:
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_iter_000.pt"
             self.save_checkpoints(0)
-            self.persist_round_summary(
+            self.save_round_summary(
                 round_index=0,
                 train_loss=None,
                 eval_metrics=initial,
@@ -653,7 +527,7 @@ class DaggerTrainer:
             print(f"Aggregation execution policy: expert_beta={round_beta:.3f}")
 
             if self.cfg.start_with_aggregation and not self.cfg.dataset_root.exists():
-                features = simulator.get_dataset_features(self.prediction_horizon)
+                features = build_dataset_features(simulator, self.prediction_horizon)
                 writer = LeRobotDataset.create(
                     repo_id=self.cfg.repo_id,
                     fps=int(1 / simulator.dt),
@@ -662,7 +536,7 @@ class DaggerTrainer:
                 )
             else:
                 existing_meta = LeRobotDatasetMetadata(repo_id=self.cfg.repo_id, root=self.cfg.dataset_root)
-                _validate_resumable_dataset_schema(existing_meta.features, simulator.get_dataset_features(self.prediction_horizon))
+                _validate_resumable_dataset_schema(existing_meta.features, build_dataset_features(simulator, self.prediction_horizon))
                 writer = LeRobotDataset.resume(
                     repo_id=self.cfg.repo_id,
                     root=self.cfg.dataset_root,
@@ -672,7 +546,6 @@ class DaggerTrainer:
                 def action_fn(obs: np.ndarray) -> np.ndarray:
                     return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
 
-                frames = simulator.format_dataset_frame
                 self._sync_rollout_policy()
                 metrics = collect_dagger_rollouts(
                     simulator=simulator,
@@ -691,7 +564,6 @@ class DaggerTrainer:
                     restart_initial_state_round=self.cfg.restart_round_seed,
                     policy_action_fn=action_fn,
                     policy_reset_fn=self.rollout_policy.reset,
-                    frame_builder=frames,
                     num_workers=self.cfg.num_workers,
                     worker_spec=self._worker_spec(
                         collection_config,
@@ -733,7 +605,7 @@ class DaggerTrainer:
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / f"flow_dagger_iter_{index:03d}.pt"
             self.save_checkpoints(training_round=index)
-            self.persist_round_summary(
+            self.save_round_summary(
                 round_index=index,
                 train_loss=train_loss,
                 eval_metrics=eval_metrics,

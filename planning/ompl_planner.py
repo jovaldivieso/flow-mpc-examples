@@ -7,10 +7,19 @@ from ompl import base as ob
 from ompl import geometric as og
 from ompl import util as ou
 
-from systems.system import SystemSimulator
+from systems.kinematic_collision_system import KinematicCollisionSystem
 from planning.planner import Plan, Planner, PlannerSolveError, goal_configuration
 
-ou.setLogLevel(ou.LogLevel.LOG_ERROR)
+def initialize_ompl(seed: int, log_level: ou.LogLevel = ou.LogLevel.LOG_ERROR) -> None:
+    """Set OMPL's process-wide random seed and log level.
+
+    OMPL keeps both globally, and accepts its seed only before its generator is first used (a later call prints an
+    error and keeps the old seed). Call this once, at the entry point of the application (or of a worker process),
+    before any planner is built: ``OmplPlanner`` itself does not touch OMPL's global state.
+    """
+    ou.setLogLevel(log_level)
+    ou.RNG.setSeed(int(seed))
+
 
 # Fraction of the largest joint range between two validity checks along a motion
 VALIDITY_RESOLUTION = 0.01
@@ -25,22 +34,15 @@ class OmplPlanner(Planner):
     simplifier and traversed at the constant joint-space speed ``ompl_speed`` (rad/s), one configuration per control
     period.
 
-    OMPL's random generator is process-wide and accepts its seed only before it is first used, so ``ompl_seed`` is
-    applied once, when the first planner of the process is built.
+    The planner is stateless regarding OMPL's global environment: its random seed (``ompl_seed``) and log level are set
+    by ``initialize_ompl``, which the entry point of the application calls once.
     """
 
-    _rng_is_seeded = False
-
-    def __init__(self, simulator: SystemSimulator, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: KinematicCollisionSystem, config: Mapping[str, Any]) -> None:
         self.sim = simulator
         self.n_joints = simulator.n
         self.timeout = float(config["ompl_timeout"])
-        self.seed = int(config["ompl_seed"])
         self.speed = float(config["ompl_speed"])
-        # A later call would only make OMPL print an error and keep the old seed
-        if not OmplPlanner._rng_is_seeded:
-            ou.RNG.setSeed(self.seed)
-            OmplPlanner._rng_is_seeded = True
 
     def reset(self) -> None:
         """Planning from scratch every time: there is nothing to forget."""
@@ -53,12 +55,12 @@ class OmplPlanner(Planner):
         lower, upper = self.sim.path_lower, self.sim.path_upper
         if np.any(q_start < lower) or np.any(q_start > upper):
             raise PlannerSolveError("OMPL: the start configuration is out of bounds.")
-        if getattr(self.sim, "obstacles", []) and not self.sim.is_collision_free(q_start):
+        if self.sim.obstacles and not self.sim.is_collision_free(q_start):
             raise PlannerSolveError("OMPL: the start configuration is in collision.")
         q_goal = goal_configuration(self.sim, observation[: self.sim.goal_dim], q_start)
         if np.any(q_goal < lower) or np.any(q_goal > upper):
             raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
-        if getattr(self.sim, "obstacles", []) and not self.sim.is_collision_free(q_goal):
+        if self.sim.obstacles and not self.sim.is_collision_free(q_goal):
             raise PlannerSolveError("OMPL: the goal configuration is in collision.")
         path = self._connect(q_start, [q_goal], lower, upper)
         path[0] = q_start
@@ -87,7 +89,7 @@ class OmplPlanner(Planner):
             bounds.setHigh(joint, float(upper[joint]))
         space.setBounds(bounds)
         space_information = ob.SpaceInformation(space)
-        has_obstacles = bool(getattr(self.sim, "obstacles", []))
+        has_obstacles = bool(self.sim.obstacles)
 
         def is_valid(state: ob.State) -> bool:
             if not space_information.satisfiesBounds(state):

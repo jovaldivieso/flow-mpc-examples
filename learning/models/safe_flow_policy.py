@@ -8,7 +8,6 @@ import torch
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy, observation_features
 from planning.casadi_projector import CasadiTrajectoryProjector
-from systems.system import SystemSimulator
 
 FLOW_INITIALIZATIONS = ("previous_safe", "gaussian")
 
@@ -23,47 +22,23 @@ class SafeFlowMPCPolicy(ActionPolicy):
 
     With ``flow_init="previous_safe"`` the integration does not start from Gaussian noise but from the previous
     tick's safe actions (shifted by one step), or, on the first tick of an episode, from zero actions.
+
+    The projector takes the state the policy observes (``observation.state``) and nothing of the goal. The state dict is
+    the inner policy's behind the ``inner_policy.`` prefix, which ``load_policy_state_dict`` maps checkpoint keys onto.
     """
 
     def __init__(
         self,
         inner_policy: FlowPolicy,
         projector: CasadiTrajectoryProjector,
-        local_sim: SystemSimulator,
         flow_init: str = "previous_safe",
     ) -> None:
         super().__init__()
         if flow_init not in FLOW_INITIALIZATIONS:
             raise ValueError(f"'flow_init' must be one of {FLOW_INITIALIZATIONS}, got {flow_init!r}.")
         self.inner_policy = inner_policy
-        # This is PolicyFactory.create's own private, goal-zeroed copy: the projector reads no goal, so it is never a
-        # live simulator reference and has nothing to keep in sync with whatever simulator drives a rollout.
-        self.local_sim = local_sim
         self.projector = projector
         self.flow_init = flow_init
-
-    def load_state_dict(
-        self,
-        state_dict: Mapping[str, torch.Tensor],
-        strict: bool = True,
-        assign: bool = False,
-    ):
-        """Load either a SafeFlowMPCPolicy checkpoint or a bare FlowPolicy checkpoint.
-
-        Strips a leading ``inner_policy.`` prefix if present (a checkpoint saved from a SafeFlowMPCPolicy), otherwise
-        takes keys as-is (a plain FlowPolicy checkpoint) -- ``projector`` never appears in a state dict since
-        ``CasadiTrajectoryProjector`` isn't an nn.Module. Delegates to ``self.inner_policy.load_state_dict``
-        directly rather than ``super().load_state_dict``: PyTorch's recursive module loading calls each submodule's
-        private ``_load_from_state_dict`` hook, not its public ``load_state_dict`` override, so going through
-        ``super()`` would silently skip FlowPolicy's own key remapping.
-        """
-        inner_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith("inner_policy."):
-                inner_state_dict[key[len("inner_policy.") :]] = value
-            elif not key.startswith("projector."):
-                inner_state_dict[key] = value
-        return self.inner_policy.load_state_dict(inner_state_dict, strict=strict, assign=assign)
 
     def reset(self) -> None:
         self.inner_policy.reset()
@@ -78,18 +53,12 @@ class SafeFlowMPCPolicy(ActionPolicy):
     ) -> torch.Tensor:
         return self.inner_policy.compute_loss(observation_dict, actions)
 
-    def _extract_ego_observation(self, observation_dict: Mapping[str, torch.Tensor]) -> np.ndarray:
-        """The observation ``[goal, state]`` the projector expects, rebuilt from the policy observation (batch of one)."""
-        environment_state = observation_dict["observation.environment_state"][0].detach().cpu().numpy()
-        state = observation_dict["observation.state"][0].detach().cpu().numpy()
-        return self.local_sim.observation_from_policy(environment_state, state)
-
     def _initial_chunk(self) -> np.ndarray | None:
         """The safe actions the flow integration starts from, or None for Gaussian noise."""
         if self.flow_init == "gaussian":
             return None
         chunk = self.projector.next_chunk_guess()
-        return np.zeros((self.projector.tracked_horizon, self.local_sim.nu)) if chunk is None else chunk
+        return np.zeros((self.projector.tracked_horizon, self.inner_policy.velocity_net.action_dim)) if chunk is None else chunk
 
     @torch.no_grad()
     def select_action(self, observation_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
@@ -97,7 +66,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
         net = inner.velocity_net
         obs_cond = observation_features(observation_dict)
         batch_size = obs_cond.shape[0]
-        # self.local_sim/self.projector serve exactly one system, so the batch must hold exactly its one row (see
+        # self.projector serves exactly one system, so the batch must hold exactly its one row (see
         # build_policy_action, the only caller, which always builds exactly one) -- not checking this would let a
         # batch of the wrong size silently leave every row past the first unprojected or crash with an opaque
         # IndexError instead of failing clearly.
@@ -107,7 +76,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
                 "this policy was constructed for a single system. The batch must contain exactly one row."
             )
         device = obs_cond.device
-        ego_obs_np = self._extract_ego_observation(observation_dict)
+        state = observation_dict["observation.state"][0].detach().cpu().numpy().astype(float)
 
         # net.predict_velocity operates in FlowVelocityNet's normalized space (see FlowVelocityNet.compute_loss /
         # integrate), but the projector compares physical actions, so x stays normalized throughout (that's what the
@@ -125,7 +94,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
             pred_velocity = net.predict_velocity(x.flatten(1), obs_cond, t_tensor)
             pred_velocity = pred_velocity.view(batch_size, net.prediction_horizon, net.action_dim)
             proposal = (x + dt * pred_velocity)[0].detach().cpu().numpy() * scale
-            safe = self.projector.project(ego_obs_np, proposal)
+            safe = self.projector.project(state, proposal)
             x = torch.tensor(safe / scale, device=device, dtype=x.dtype).unsqueeze(0)
 
         # Back to physical units, matching FlowPolicy.select_action's own return convention

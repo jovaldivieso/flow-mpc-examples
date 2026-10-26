@@ -12,7 +12,8 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
-from planning.ompl_planner import OmplPlanner
+from ompl import util as ou
+from planning.ompl_planner import OmplPlanner, initialize_ompl
 from planning.planner import Plan, Planner, PlannerSolveError
 from test.planner_fixtures import pinned_config
 
@@ -62,13 +63,16 @@ class OmplPlannerTests(unittest.TestCase):
         upper = self.simulator.state_upper_bounds[:N]
         self.assertTrue(np.all(self.path >= lower - 1e-9) and np.all(self.path <= upper + 1e-9))
 
-    def test_the_ompl_seed_is_applied_once_per_process(self) -> None:
-        # OMPL accepts its seed only before the generator is first used; a later call prints an error and does nothing
-        with mock.patch.object(OmplPlanner, "_rng_is_seeded", False), mock.patch("planning.ompl_planner.ou.RNG") as rng:
+    def test_initialize_ompl_sets_the_seed_and_the_log_level_and_building_a_planner_does_not(self) -> None:
+        with mock.patch("planning.ompl_planner.ou.RNG") as rng, mock.patch("planning.ompl_planner.ou.setLogLevel") as log:
             OmplPlanner(self.simulator, {**self.config, "ompl_seed": 7})
-            OmplPlanner(self.simulator, {**self.config, "ompl_seed": 9})
+            rng.setSeed.assert_not_called()
+            log.assert_not_called()
+
+            initialize_ompl(7)
 
         rng.setSeed.assert_called_once_with(7)
+        log.assert_called_once_with(ou.LogLevel.LOG_ERROR)
 
     def test_replanning_gives_a_valid_path_again(self) -> None:
         again = self.planner.plan(self.observation).positions

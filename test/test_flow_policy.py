@@ -12,7 +12,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import observation_features
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
 
 
 def _build_policy(action_scale=None) -> FlowPolicy:
@@ -262,12 +262,58 @@ class FlowPolicyLearnsAConditionalMappingTests(unittest.TestCase):
         self.assertLess(matched_error, 0.4 * shuffled_error)
 
 
+class ResetContractTests(unittest.TestCase):
+    def test_a_policy_reset_goes_down_to_the_unet(self) -> None:
+        policy = _build_policy()
+
+        with mock.patch.object(policy.velocity_net, "reset", wraps=policy.velocity_net.reset) as net_reset, \
+                mock.patch.object(policy.velocity_net.unet, "reset", wraps=policy.velocity_net.unet.reset) as unet_reset:
+            policy.reset()
+
+        net_reset.assert_called_once_with()
+        unet_reset.assert_called_once_with()
+
+    def test_every_level_has_a_reset_that_returns_nothing(self) -> None:
+        policy = _build_policy()
+        for module in (policy, policy.velocity_net, policy.velocity_net.unet):
+            self.assertIsNone(module.reset())
+
+
+class FlowTimeSamplingTests(unittest.TestCase):
+    def test_the_flow_times_are_sampled_on_the_cpu_and_copied_without_waiting_for_the_host(self) -> None:
+        net = _build_policy().velocity_net
+        copies: list[dict] = []
+        original_to = torch.Tensor.to
+
+        def spy(tensor, *args, **kwargs):
+            copies.append(kwargs)
+            return original_to(tensor, *args, **kwargs)
+
+        with mock.patch.object(torch.Tensor, "to", spy):
+            net.compute_loss(torch.zeros(5, 6), torch.zeros(5, 4, 2))
+
+        self.assertTrue(any(kwargs.get("non_blocking") is True for kwargs in copies))
+
+    def test_the_sampler_is_built_once_and_the_loss_stays_reproducible(self) -> None:
+        net = _build_policy().velocity_net
+        sampler = net._flow_time_distribution
+        obs, actions = torch.zeros(5, 6), torch.randn(5, 4, 2)
+
+        torch.manual_seed(3)
+        first = net.compute_loss(obs, actions)
+        torch.manual_seed(3)
+        second = net.compute_loss(obs, actions)
+
+        self.assertIs(net._flow_time_distribution, sampler)
+        torch.testing.assert_close(first, second)
+
+
 class LegacyCheckpointTests(unittest.TestCase):
     def test_keys_saved_while_the_network_was_torch_compiled_still_load(self) -> None:
         policy = _build_policy()
         legacy = {name.replace("net.", "net._orig_mod.", 1): value.clone() for name, value in policy.state_dict().items()}
         self.assertTrue(any("_orig_mod" in name for name in legacy))
-        _build_policy().load_state_dict(legacy)
+        load_policy_state_dict(_build_policy(), legacy)
 
 
 class PolicyFactoryTests(unittest.TestCase):
