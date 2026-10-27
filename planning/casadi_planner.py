@@ -10,10 +10,10 @@ from systems.kinematic_collision_system import KinematicCollisionSystem
 
 class CasadiPlanner(Planner):
     """
-    CasADi model predictive control (ProxQP) in joint space.
+    CasADi model predictive control (FATROP) in joint space.
 
     ``plan`` solves the quadratic program (QP) below from the current state, returns the planned joint positions over
-    the horizon, and keeps the solution as the primal-dual warm start of the next call.
+    the horizon, and keeps the solution as the warm start of the next call.
 
     Problem (Direct Multiple Shooting, Horizon N)
     ---------------------------------------------
@@ -21,7 +21,7 @@ class CasadiPlanner(Planner):
     Action (nu = n)          u_k = j_k: joint jerks.
     Goal                     x_goal = [q_goal, 0, 0]: goal configuration at rest (from ``FrankaKinematics`` IK).
     Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
-                             present) slack S = [s_1 .. s_N] (P, N) with P = n_spheres * n_obstacles.
+                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by all obstacles.
     Parameters               x_init, x_goal, and linearized obstacle half-spaces (A_coll, b_coll).
 
     Cost                     min_{X, U, S}  sum_{k=0..N-1} ( ||x_k - x_goal||_Q^2 + ||u_k||_R^2 )
@@ -31,15 +31,16 @@ class CasadiPlanner(Planner):
     Constraints              as in ``CasadiKinematicGraph``: the initial state, the triple-integrator dynamics, the
                              jerk and state limits, and the linearized sphere-obstacle half-spaces.
 
-    Solver Choice (``Opti("conic")`` + ``proxqp``)
-    ----------------------------------------------
-    Because the triple-integrator dynamics, box limits, and 1st-order Taylor obstacle half-spaces
-    ``n^T J_s(q_ref,k) q_k >= b_k`` are all affine in ``(X, U, S)`` and the cost is convex quadratic, CasADi transcribes
-    the problem into a sparse conic QP (``1/2 w^T H w + g^T w`` s.t. ``a_low <= A w <= a_high``) solved by **ProxQP**
-    (augmented-Lagrangian primal-dual QP solver). Expanding the mapped ``SX`` graph (``expand: True``) and warm-starting
-    ``(X, U, lam_g)`` keeps each solve around 1--5 ms (vs. 50--100 ms for an interior-point NLP solver like IPOPT).
-    If the first QP pass penetrates a spherical obstacle, one SQP re-linearization pass around the solved trajectory
-    refines the half-spaces.
+    Solver Choice (``Opti`` + ``fatrop``)
+    -------------------------------------
+    The triple-integrator dynamics, box limits, and 1st-order Taylor obstacle half-spaces ``n^T J_s(q_ref,k) q_k >= b_k``
+    are all affine in ``(X, U, S)`` and the cost is convex quadratic, so the problem is a convex QP with the stage
+    structure of an optimal control problem. **FATROP** (an interior point method with a Riccati recursion over the
+    stages) solves it in time linear in the horizon, and in the number of obstacles: the slack is one per sphere, so
+    more obstacles only add half-space rows to a stage, where one slack per sphere-obstacle pair made a QP solver
+    like ProxQP slow down a hundredfold from 4 obstacles on. See ``CasadiKinematicGraph`` for the layout
+    FATROP needs. If the first pass penetrates a spherical obstacle, one re-linearization pass around the solved
+    trajectory refines the half-spaces.
 
     Initial guess strategy
     ----------------------
@@ -176,7 +177,7 @@ class CasadiPlanner(Planner):
             # what the previous solve predicted (execution noise, or during DAgger the actions of a still untrained
             # policy). A cold restart from the current state held still resolves far more of those than giving up.
             cold_states, cold_actions = self._states_through(x0, Plan(positions=np.tile(x0[: self.n_joints], (2, 1))))
-            self._graph.set_initial(cold_states, cold_actions, cold=True)
+            self._graph.set_initial(cold_states, cold_actions)
             self._graph.update_collision_halfspaces(cold_states[: self.n_joints, 1:].T)
             try:
                 sol = self._graph.solve()

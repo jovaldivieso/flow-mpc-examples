@@ -11,7 +11,7 @@ from systems.kinematic_collision_system import KinematicCollisionSystem
 
 class CasadiTrajectoryProjector:
     """
-    CasADi (ProxQP) projection of the flow policy's proposed action chunk onto the safe set (SafeFlowMPC, Oelerich et
+    CasADi (FATROP) projection of the flow policy's proposed action chunk onto the safe set (SafeFlowMPC, Oelerich et
     al., 2026).
 
     ``project`` takes the current state (as the policy observes it, see ``SystemSimulator.state_from_policy``) and a
@@ -24,7 +24,7 @@ class CasadiTrajectoryProjector:
     -------------------------------------------------
     State & Action           as in ``CasadiPlanner`` (x_k = [q_k, v_k, a_k], u_k = j_k).
     Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
-                             present) slack S = [s_1 .. s_N] (P, N) with P = n_spheres * n_obstacles.
+                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by all obstacles.
     Parameters               x_init, u_ref, and linearized obstacle half-spaces (A_coll, b_coll) evaluated along the
                              rollout of u_ref from x_init.
 
@@ -42,13 +42,13 @@ class CasadiTrajectoryProjector:
     The task goal is not part of the problem: the projector never reads the goal of its ``simulator`` (only the dynamics,
     the limits and the obstacles), so it can share the simulator of the rollout instead of holding a copy of its own.
 
-    Solver Choice (``Opti("conic")`` + ``proxqp``)
-    ----------------------------------------------
+    Solver Choice (``Opti`` + ``fatrop``)
+    -------------------------------------
     During flow ODE integration, ``project`` is called at every Euler step, so solver latency dominates inference time.
-    Because the triple-integrator dynamics, state/action box limits, and linearized obstacle half-spaces are affine and
-    the tracking + terminal-rest objective is strictly convex quadratic, CasADi's ``Opti("conic")`` transcribes the
-    projection into a sparse QP solved in ~1 ms by **ProxQP** with primal-dual warm starting across adjacent Euler
-    steps and control ticks.
+    The triple-integrator dynamics, state/action box limits, and linearized obstacle half-spaces are affine and the
+    tracking + terminal-rest objective is strictly convex quadratic, so the projection is a convex QP with the stage
+    structure of an optimal control problem, solved in a few ms by **FATROP** (see ``CasadiKinematicGraph``) started from
+    the previous solution across adjacent Euler steps and control ticks.
 
     Initial guess strategy
     ----------------------
@@ -56,7 +56,7 @@ class CasadiTrajectoryProjector:
     the proposal is, which a guess following a far-off proposal, such as the flow's initial noise, is not). Within a
     control tick (the same ``x_init``; only the proposal is refined between flow steps) the last solution is reused as it
     is; at a new tick it is the previous solution shifted by one step with zero jerk appended (the rest state it ends in
-    is a fixed point). The multipliers ``lam_g`` are warm started the same way. A solve that fails is restarted cold
+    is a fixed point). A solve that fails is restarted cold
     from the state held still; if that fails too, the previous safe solution is the fallback (see above).
     """
 
@@ -98,7 +98,7 @@ class CasadiTrajectoryProjector:
 
     def _hold_still_guess(self, x0: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Stay at the current positions at rest: within the limits whatever the proposal is, which a guess following
-        a far-off proposal (e.g. the flow's initial noise) is not, and IPOPT often fails from there."""
+        a far-off proposal (e.g. the flow's initial noise) is not, and the solver often fails from there."""
         states = np.zeros((self.sim.nx, self.N + 1))
         states[: self.sim.n, :] = x0[: self.sim.n, None]
         states[:, 0] = x0
@@ -152,7 +152,7 @@ class CasadiTrajectoryProjector:
                 # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
                 # prediction: a cold restart resolves most of those
                 cold_states, cold_actions = self._hold_still_guess(x0)
-                self._graph.set_initial(cold_states, cold_actions, cold=True)
+                self._graph.set_initial(cold_states, cold_actions)
                 sol = self._graph.solve()
             self._prev_X_sol = sol.states
             self._prev_U_sol = sol.actions
