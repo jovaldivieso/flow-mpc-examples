@@ -17,7 +17,7 @@ from systems.rollout_termination import RolloutTerminationTracker
 from planning.ompl_initial_guess import OmplInitialGuess
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
-from test.planner_fixtures import pinned_config, pose_goal
+from test.planner_fixtures import initial_guess, pinned_config, pose_goal
 
 N = 7
 SEED = 3  # a start and goal pair far enough apart for the MPC to plan a long motion
@@ -80,14 +80,11 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         path = self.guess.path_planner.plan(observation)
 
         with mock.patch.object(self.guess.path_planner, "plan", return_value=path):
-            guessed = {}
-            original = self.planner._graph.opti.set_initial
-            self.planner._graph.opti.set_initial = lambda variable, value: (guessed.update({id(variable): np.asarray(value)}), original(variable, value))[1]
-            self.planner.plan(observation)
+            states, _ = initial_guess(self.planner, observation)
 
         np.testing.assert_array_equal(self.planner.goal_configuration, path.positions[-1])
         ahead = path.positions[1 : self.planner.N + 1]  # a path shorter than the horizon is held at its end
-        np.testing.assert_allclose(guessed[id(self.planner._graph.X)][:N, 1 : 1 + len(ahead)], ahead.T, atol=1e-9)
+        np.testing.assert_allclose(states[:N, 1 : 1 + len(ahead)], ahead.T, atol=1e-9)
 
     def test_later_solves_start_from_the_previous_solution_and_plan_no_new_path(self) -> None:
         state = self.simulator.reset(self.start)

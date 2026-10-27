@@ -6,7 +6,8 @@
 Every rollout samples its start and goal from the expert config exactly like the DAgger collection and the evaluation do
 (seeded), runs the expert for --num-steps and prints per trajectory: reached the goal, final error,
 and how smooth the commanded jerks are and how much the arm detours (joint and TCP path length relative to the straight line). Then all TCP paths are drawn (green = reached the goal,
-orange = did not) and the trajectories are played back with the moving arm. --no-viewer prints the statistics only.
+orange = did not) and the trajectories are played back with the moving arm. --show-collision-geometry draws the bounding
+spheres of the robot, which the planners keep clear of the obstacles. --no-viewer prints the statistics only.
 """
 
 import argparse
@@ -27,7 +28,7 @@ from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
-from .meshcat_utils import draw_frame, draw_obstacles, draw_tcp_paths, load_robot
+from .meshcat_utils import draw_collision_spheres, draw_frame, draw_obstacles, draw_tcp_paths, load_robot, move_collision_spheres
 
 
 def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarray, num_steps: int, noise_std: float, noise_rng) -> dict:
@@ -93,6 +94,7 @@ def main() -> None:
     parser.add_argument("--num-steps", type=int, default=250, help="maximum steps per rollout (default: %(default)s)")
     parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
     parser.add_argument("--action-noise-std", type=float, default=0.0, help="execution noise on the expert's action [rad/s^3], like DAgger collection (default: %(default)s)")
+    parser.add_argument("--show-collision-geometry", action="store_true", help="draw the bounding spheres the planners keep clear of the obstacles, on the robot")
     parser.add_argument("--no-viewer", action="store_true", help="print the statistics only")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
     args = parser.parse_args()
@@ -143,14 +145,20 @@ def main() -> None:
     tcp_paths = [np.array([dyn.tcp_placement(s[: dyn.n]).translation for s in r[2]["states"]]) for r in results]
     draw_tcp_paths(viz, tcp_paths, [r[1][:3] for r in results], reached)
     draw_frame(viz, "goal")
-    print("\nPlaying the rollouts in a loop (Ctrl+C to stop): green path = reached the goal, orange = did not")
+    show = lambda state: viz.display(state[: dyn.n])
+    if args.show_collision_geometry:
+        draw_collision_spheres(viz, dyn.collision_spheres(results[0][2]["states"][0][: dyn.n])[2])
+        show_robot = show
+        show = lambda state: (show_robot(state), move_collision_spheres(viz, dyn.collision_spheres(state[: dyn.n])[0]))
+    print("\nPlaying the rollouts in a loop (Ctrl+C to stop): green path = reached the goal, orange = did not"
+          + (", blue spheres = the collision spheres" if args.show_collision_geometry else ""))
     try:
         while True:
             for (seed, goal, rollout, stats), path in zip(results, tcp_paths):
                 print(f"seed {seed}: {rollout['outcome']}")
                 viz.viewer["goal"].set_transform(dyn.goal_transform(goal))
                 for state in rollout["states"]:
-                    viz.display(state[: dyn.n])
+                    show(state)
                     time.sleep(dyn.dt / args.speed)
                 time.sleep(1.0)
     except KeyboardInterrupt:

@@ -280,7 +280,7 @@ class ResetContractTests(unittest.TestCase):
 
 
 class FlowTimeSamplingTests(unittest.TestCase):
-    def test_the_flow_times_are_sampled_on_the_cpu_and_copied_without_waiting_for_the_host(self) -> None:
+    def test_the_flow_times_are_sampled_on_the_cpu_and_the_copy_to_the_device_blocks(self) -> None:
         net = _build_policy().velocity_net
         copies: list[dict] = []
         original_to = torch.Tensor.to
@@ -292,7 +292,9 @@ class FlowTimeSamplingTests(unittest.TestCase):
         with mock.patch.object(torch.Tensor, "to", spy):
             net.compute_loss(torch.zeros(5, 6), torch.zeros(5, 4, 2))
 
-        self.assertTrue(any(kwargs.get("non_blocking") is True for kwargs in copies))
+        # A non_blocking copy of the temporary reads freed host memory on MPS and yields flow times of ~1e22
+        self.assertTrue(copies)
+        self.assertFalse(any(kwargs.get("non_blocking") for kwargs in copies))
 
     def test_the_sampler_is_built_once_and_the_loss_stays_reproducible(self) -> None:
         net = _build_policy().velocity_net

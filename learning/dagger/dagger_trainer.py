@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import gc
 from collections import Counter
+from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
@@ -157,6 +158,8 @@ class DaggerTrainer:
         )
         # The rollouts and checkpoints for inference use the averaged weights
         self.ema = ExponentialMovingAverage(self.policy)
+        if self.cfg.init_checkpoint is not None:
+            self._load_init_checkpoint(self.cfg.init_checkpoint)
 
         self.cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,6 +184,28 @@ class DaggerTrainer:
             print("Mode: fresh DAgger collection before any offline pretraining")
         else:
             print("Mode: resume from existing expert dataset")
+
+    def _load_init_checkpoint(self, path: Path) -> None:
+        """Start from the weights, EMA and optimizer state of a checkpoint of the same architecture."""
+        assert self.policy is not None and self.optimizer is not None and self.ema is not None
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        expected = {
+            "policy_type": self.cfg.policy_type,
+            "state_dim": self.state_dim,
+            "action_dim": self.action_dim,
+            "prediction_horizon": self.prediction_horizon,
+            "unet": {"dim": self.cfg.unet.dim, "dim_mults": list(self.cfg.unet.dim_mults)},
+        }
+        for key, value in expected.items():
+            if checkpoint[key] != value:
+                raise ValueError(f"Cannot start from {path}: its '{key}' is {checkpoint[key]}, this run's is {value}.")
+        for name in ("model_state_dict", "ema_model_state_dict"):
+            if not all(torch.isfinite(t).all() for t in checkpoint[name].values() if t.is_floating_point()):
+                raise ValueError(f"Cannot start from {path}: its '{name}' has non-finite weights.")
+        self.policy.load_state_dict(checkpoint["model_state_dict"])
+        self.ema.load_state_dict(checkpoint["ema_model_state_dict"])
+        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        print(f"Initialized from {path} (iteration {checkpoint['iteration']})")
 
     def train_policy_steps(self, dataloader: DataLoader, num_steps: int) -> float:
         if self.policy is None or self.optimizer is None or self.device is None:

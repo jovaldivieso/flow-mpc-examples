@@ -53,3 +53,19 @@ def rest_state(simulator: FrankaSystem) -> np.ndarray:
 def pose_goal(simulator: FrankaSystem, q: np.ndarray) -> np.ndarray:
     """The goal pose of the TCP in the configuration ``q``."""
     return simulator.pose_vector(simulator.tcp_placement(q))
+
+
+def initial_guess(planner, observation: np.ndarray, initial_plan=None) -> tuple[np.ndarray, np.ndarray]:
+    """The (states (nx, N + 1), actions (nu, N)) a ``CasadiPlanner`` starts its first solve of ``plan`` from."""
+    graph = planner._graph
+    guessed = {}
+    solve = graph.opti.solve
+
+    def recording_solve():
+        if not guessed:
+            guessed["states"], guessed["actions"] = (np.asarray(graph.opti.debug.value(v, graph.opti.initial())) for v in (graph.X, graph.U))
+        return solve()
+
+    graph.opti.solve = recording_solve
+    planner.plan(observation, initial_plan)
+    return guessed["states"], guessed["actions"]

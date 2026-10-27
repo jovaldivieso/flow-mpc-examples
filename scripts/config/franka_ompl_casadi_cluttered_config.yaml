@@ -1,6 +1,8 @@
-# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm in a more cluttered environment: the 2 obstacles of
-# franka_ompl_casadi_config.yaml (the training environment) and a third, to evaluate how a policy trained there generalizes.
-# More obstacles make the MPC much slower from 4 on (the QP has a slack per sphere, obstacle and node).
+# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm in a more cluttered environment: 5 obstacles in front
+# of the robot at different depths (x), left-right displacements (y) and heights (z): the 2 obstacles of
+# franka_ompl_casadi_config.yaml (the training environment) and 3 more, to evaluate how a policy trained there generalizes.
+# Each of the 3 is touched by 10-30% of the episodes collected in the training environment, and about half of those
+# episodes touch at least one of the 5.
 # State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
 system: franka
 dt: 0.1
@@ -42,7 +44,11 @@ obstacles:
     radius: 0.08
   - position: [0.45, 0.15, 0.48]
     radius: 0.08
-  - position: [0.66, 0.02, 0.26]
+  - position: [0.40, -0.30, 0.30]
+    radius: 0.07
+  - position: [0.62, 0.05, 0.55]
+    radius: 0.07
+  - position: [0.30, 0.28, 0.45]
     radius: 0.07
 
 initial_state_seed: 0

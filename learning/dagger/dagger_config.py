@@ -62,6 +62,7 @@ class DaggerConfig:
     # Falls back to tolerance_overrides when unset.
     eval_tolerance_overrides: dict[str, float] | None = None
     num_workers: int = 1
+    init_checkpoint: Path | None = None  # weights and optimizer state the run starts from
 
     def __post_init__(self) -> None:
         if self.dagger_iterations < 0:
@@ -106,3 +107,5 @@ class DaggerConfig:
             raise ValueError("'num_workers' must be positive.")
         if not self.dataset_root.exists() and not self.start_with_aggregation:
             raise FileNotFoundError(self.dataset_root)
+        if self.init_checkpoint is not None and not self.init_checkpoint.is_file():
+            raise FileNotFoundError(self.init_checkpoint)

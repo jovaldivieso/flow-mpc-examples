@@ -380,7 +380,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
     def _expert_config(self) -> dict:
         return load_and_validate_system_config(EXPERT_CONFIG_PATH)
 
-    def _setup_trainer(self, policy_type: str) -> DaggerTrainer:
+    def _setup_trainer(self, policy_type: str, **overrides: object) -> DaggerTrainer:
         # setup() seeds the process-wide RNGs and turns on deterministic algorithms (warn only).
         self.addCleanup(
             torch.use_deterministic_algorithms,
@@ -390,13 +390,16 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         tmpdir = Path(self.enterContext(tempfile.TemporaryDirectory()))
         trainer = DaggerTrainer(
             _minimal_dagger_config(
-                experiment_config=self._expert_config(),
-                dataset_root=tmpdir / "dataset",
-                checkpoint_dir=tmpdir / "checkpoints",
-                unet=self.UNET,
-                prediction_horizon=self.PREDICTION_HORIZON,
-                policy_type=policy_type,
-                flow_config=FlowConfig(num_inference_steps=self.NUM_INFERENCE_STEPS),
+                **{
+                    "experiment_config": self._expert_config(),
+                    "dataset_root": tmpdir / "dataset",
+                    "checkpoint_dir": tmpdir / "checkpoints",
+                    "unet": self.UNET,
+                    "prediction_horizon": self.PREDICTION_HORIZON,
+                    "policy_type": policy_type,
+                    "flow_config": FlowConfig(num_inference_steps=self.NUM_INFERENCE_STEPS),
+                    **overrides,
+                }
             )
         )
         # Keeps the test on the CPU whatever accelerator the host has.
@@ -456,6 +459,48 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 for name, value in trainer.rollout_policy.state_dict().items():
                     self.assertEqual(value.device.type, "cpu")
                     torch.testing.assert_close(value, expected[name].cpu())
+
+    def _saved_checkpoint(self) -> tuple[DaggerTrainer, Path]:
+        """A trainer that has taken optimizer steps, and the checkpoint it saved."""
+        trainer = self._setup_trainer("flow")
+        batch = (
+            {"observation.environment_state": torch.randn(4, 19), "observation.state": torch.randn(4, 21)},
+            torch.randn(4, self.PREDICTION_HORIZON, 7),
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            trainer.train_policy_steps([batch], 3)
+            trainer.save_checkpoints(training_round=2)
+        return trainer, trainer.cfg.checkpoint_dir / "flow_dagger_iter_002.pt"
+
+    def test_a_run_can_start_from_the_weights_the_averages_and_the_optimizer_of_a_checkpoint(self) -> None:
+        saved, path = self._saved_checkpoint()
+
+        resumed = self._setup_trainer("flow", init_checkpoint=path)
+
+        for name, value in saved.policy.state_dict().items():
+            torch.testing.assert_close(resumed.policy.state_dict()[name], value)
+            torch.testing.assert_close(resumed.ema.state_dict()[name], saved.ema.state_dict()[name])
+        self.assertEqual(resumed.optimizer.state_dict()["state"].keys(), saved.optimizer.state_dict()["state"].keys())
+        self.assertGreater(len(resumed.optimizer.state_dict()["state"]), 0)
+
+    def test_a_checkpoint_of_another_architecture_is_rejected(self) -> None:
+        _, path = self._saved_checkpoint()
+
+        with self.assertRaisesRegex(ValueError, "unet"):
+            self._setup_trainer("flow", init_checkpoint=path, unet=UnetConfig(dim=16, dim_mults=(1, 2)))
+
+    def test_a_checkpoint_with_non_finite_weights_is_rejected(self) -> None:
+        _, path = self._saved_checkpoint()
+        checkpoint = torch.load(path, weights_only=False)
+        next(iter(checkpoint["model_state_dict"].values())).fill_(float("nan"))
+        torch.save(checkpoint, path)
+
+        with self.assertRaisesRegex(ValueError, "non-finite"):
+            self._setup_trainer("flow", init_checkpoint=path)
+
+    def test_a_missing_checkpoint_is_rejected_by_the_config(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            _minimal_dagger_config(init_checkpoint=Path("does_not_exist.pt"))
 
     def test_setup_builds_the_safeflow_projector_on_the_trainers_simulator(self) -> None:
         trainer = self._setup_trainer("safeflow")

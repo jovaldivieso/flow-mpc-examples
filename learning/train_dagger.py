@@ -94,6 +94,7 @@ def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_dir": str(args.checkpoint_dir) if args.checkpoint_dir is not None else None,
         "seed": args.seed,
         "num_workers": args.num_workers,
+        "init_checkpoint": str(args.init_checkpoint) if args.init_checkpoint is not None else None,
     }
 
 
@@ -115,6 +116,7 @@ def _summarize_dagger_config(cfg: Any) -> dict[str, Any]:
         "checkpoint_dir": str(cfg.checkpoint_dir),
         "seed": cfg.seed,
         "num_workers": cfg.num_workers,
+        "init_checkpoint": str(cfg.init_checkpoint) if cfg.init_checkpoint is not None else None,
     }
 
 
@@ -213,6 +215,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int)
     p.add_argument("--max-train-steps", type=int)
     p.add_argument("--num-workers", type=int, help="parallel worker processes for rollout collection and evaluation")
+    p.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        help="start from the weights, EMA and optimizer state of this checkpoint (e.g. the last sound round of a run)",
+    )
     return p.parse_args()
 
 
@@ -331,6 +338,7 @@ def main() -> None:
         seed=int(option("seed", 99)),
         max_train_steps=option("max_train_steps", None),
         num_workers=int(option("num_workers", 1)),
+        init_checkpoint=args.init_checkpoint,
     )
     _print_yaml_block(
         "Resolved DaggerConfig (summary; full explicit states omitted)",

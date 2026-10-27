@@ -119,11 +119,9 @@ class FlowVelocityNet(nn.Module):
         x_0 = torch.randn_like(actions)
         # t = 1 - Beta(1.5, 1): the density rises toward t = 0, so the early, noisy part of the flow gets more of the
         # training steps than the end of it, where the target is almost determined (SafeFlowMPC's training scripts)
-        # Sampled on the CPU: the Dirichlet sampler behind Beta is not implemented on the MPS backend. The copy to the
-        # device does not wait for the host (non_blocking); everything else is created on the device it is used on.
-        t = 1.0 - self._flow_time_distribution.sample((batch_size,)).to(
-            device=actions.device, dtype=actions.dtype, non_blocking=True
-        )
+        # Sampled on the CPU: the Dirichlet sampler behind Beta is not implemented on the MPS backend. The copy must
+        # block: a non_blocking copy of this temporary reads freed host memory there and yields flow times of ~1e22.
+        t = 1.0 - self._flow_time_distribution.sample((batch_size,)).to(device=actions.device, dtype=actions.dtype)
         t_expanded = t.view(batch_size, 1, 1)
         x_t = t_expanded * x_1 + (1.0 - t_expanded) * x_0
         target_velocity = x_1 - x_0

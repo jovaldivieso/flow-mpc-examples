@@ -17,7 +17,7 @@ from planning.casadi_planner import CasadiPlanner
 from systems.rollout_termination import RolloutTerminationTracker
 from planning.initial_guess import InitialGuessGenerator
 from planning.planner import Plan, PlannerSolveError
-from test.planner_fixtures import pose_goal
+from test.planner_fixtures import initial_guess, pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 
@@ -48,20 +48,6 @@ def _first_action(planner: CasadiPlanner, simulator: FrankaSystem, state: np.nda
     return planner.plan(simulator.observe(state)).actions[0]
 
 
-def _initial_guess(planner: CasadiPlanner, observation: np.ndarray, initial_plan: Plan | None = None):
-    """The (states (nx, N + 1), actions (nu, N)) the planner starts its solve from."""
-    guessed = {}
-    original = planner._graph.opti.set_initial
-
-    def recording_set_initial(variable, value):
-        guessed[id(variable)] = np.asarray(value)
-        return original(variable, value)
-
-    planner._graph.opti.set_initial = recording_set_initial
-    planner.plan(observation, initial_plan)
-    return guessed[id(planner._graph.X)], guessed[id(planner._graph.U)]
-
-
 def _start_near_the_ready_pose(simulator: FrankaSystem) -> np.ndarray:
     q = Q_READY.copy()
     q += np.array([0.12, -0.10, 0.08, 0.10, -0.12, 0.10, 0.25])
@@ -69,13 +55,13 @@ def _start_near_the_ready_pose(simulator: FrankaSystem) -> np.ndarray:
 
 
 class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
-    """Regression test for a real training failure: the warm start (the previous solution shifted) can leave IPOPT stuck
+    """Regression test for a real training failure: the warm start (the previous solution shifted) can leave the solver stuck
     at a locally infeasible point once noisy execution has pushed the actual state away from what the previous solve
     predicted, even though a feasible trajectory exists (the same x0 and goal solve from a cold start). The planner
     must recover through a cold restart instead of raising.
 
     The failing warm-started solve is injected (the first solve after a successful one raises), so the test does not
-    depend on a particular IPOPT trajectory.
+    depend on a particular solver trajectory.
     """
 
     def test_warm_start_failure_recovers_via_cold_restart_instead_of_raising(self) -> None:
@@ -173,7 +159,7 @@ class PlannerBehaviorTests(unittest.TestCase):
         simulator, planner, _ = _build()
         state = simulator.reset(_start_near_the_ready_pose(simulator))
 
-        states_guess, actions_guess = _initial_guess(planner, simulator.observe(state))
+        states_guess, actions_guess = initial_guess(planner, simulator.observe(state))
 
         np.testing.assert_allclose(states_guess, np.tile(state[:, None], (1, planner.N + 1)))
         np.testing.assert_allclose(actions_guess, 0.0)
@@ -184,7 +170,7 @@ class PlannerBehaviorTests(unittest.TestCase):
         planner.plan(simulator.observe(state))
         previous_states, previous_actions = planner.last_X_sol.copy(), planner.last_U_sol.copy()
 
-        states_guess, actions_guess = _initial_guess(planner, simulator.observe(state))
+        states_guess, actions_guess = initial_guess(planner, simulator.observe(state))
 
         np.testing.assert_allclose(states_guess[:, :-1], previous_states[:, 1:])
         np.testing.assert_allclose(actions_guess[:, :-1], previous_actions[:, 1:])
@@ -197,7 +183,6 @@ class PlannerBehaviorTests(unittest.TestCase):
         planner.reset()
         self.assertIsNone(planner.last_X_sol)
         self.assertIsNone(planner.last_U_sol)
-        self.assertIsNone(planner._graph._multipliers)
         self.assertIsNone(planner.goal_configuration)
 
     def test_the_plan_stays_inside_the_joint_limits_however_far_the_goal_is_beyond_them(self) -> None:
@@ -286,7 +271,7 @@ class InitialPlanTests(unittest.TestCase):
         rng = np.random.default_rng(0)
         positions = np.vstack([state[:n], state[:n] + np.cumsum(rng.uniform(-0.02, 0.02, (planner.N, n)), axis=0)])
 
-        states, actions = _initial_guess(planner, simulator.observe(state), Plan(positions=positions))
+        states, actions = initial_guess(planner, simulator.observe(state), Plan(positions=positions))
 
         np.testing.assert_allclose(states[:, 0], state)
         np.testing.assert_allclose(states[:n, 1:], positions[1:].T)
@@ -314,8 +299,8 @@ class InitialPlanTests(unittest.TestCase):
         short = Plan(positions=np.vstack([q, last]))  # one step, then it stays there
         full = Plan(positions=np.vstack([q, np.tile(last, (planner.N, 1))]))
 
-        held, _ = _initial_guess(planner, simulator.observe(state), short)
-        explicit, _ = _initial_guess(planner, simulator.observe(state), full)
+        held, _ = initial_guess(planner, simulator.observe(state), short)
+        explicit, _ = initial_guess(planner, simulator.observe(state), full)
 
         np.testing.assert_allclose(held, explicit)
 
@@ -324,7 +309,7 @@ class InitialPlanTests(unittest.TestCase):
         q = state[: simulator.n]
         long = Plan(positions=np.vstack([q, np.tile(q + 0.01, (3 * planner.N, 1))]))
 
-        states, _ = _initial_guess(planner, simulator.observe(state), long)
+        states, _ = initial_guess(planner, simulator.observe(state), long)
 
         self.assertEqual(states.shape, (simulator.nx, planner.N + 1))
 
