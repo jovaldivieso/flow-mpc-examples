@@ -10,6 +10,7 @@ start sampling; a concrete system supplies its goal space, its bounding spheres,
 """
 
 from abc import abstractmethod
+from dataclasses import dataclass
 from typing import Any, Mapping
 
 import casadi as ca
@@ -21,44 +22,53 @@ from .system import SystemSimulator
 SAMPLING_ATTEMPTS = 256
 
 
+@dataclass(frozen=True)
+class PlantLimits:
+    """The dimension and limits of a triple-integrator plant. The position limits may be infinite; ``path_lower`` and
+    ``path_upper`` are the finite box path planners search in (default: the position limits)."""
+
+    n: int
+    lower_position: np.ndarray
+    upper_position: np.ndarray
+    max_velocity: np.ndarray
+    max_acceleration: np.ndarray
+    max_jerk: np.ndarray
+    path_lower: np.ndarray | None = None
+    path_upper: np.ndarray | None = None
+
+
 class TripleIntegratorBase(SystemSimulator):
     """Abstract triple-integrator system with state ``[q, v, a]`` and jerk action ``u = j``."""
 
     def __init__(
         self,
         config: Mapping[str, Any],
+        fields: Mapping[str, Any],
         *,
-        n: int,
-        lower_position: np.ndarray,
-        upper_position: np.ndarray,
-        max_velocity: np.ndarray,
-        max_acceleration: np.ndarray,
-        max_jerk: np.ndarray,
+        limits: PlantLimits,
         default_goal: np.ndarray,
-        default_min_distance: float,
-        default_pos_tol: float,
-        default_vel_tol: float,
-        path_lower: np.ndarray | None = None,
-        path_upper: np.ndarray | None = None,
     ) -> None:
-        """Dimensions, limits, goal, tolerances and obstacles. The position limits may be infinite; ``path_lower`` and
-        ``path_upper`` are the finite box path planners search in (default: the position limits)."""
+        """The plant of ``limits``, and the goal, tolerances, sampling and obstacles of ``fields``, the fields
+        ``validate_config`` returns for ``config``; the goal is ``default_goal`` if ``fields`` has none."""
         super().__init__(config)
+        n = limits.n
         self._n = n
         self._nx = 3 * n
-        self.max_acceleration = np.asarray(max_acceleration, dtype=float).copy()
-        self._max_action = np.asarray(max_jerk, dtype=float).copy()
-        self._state_lower_bounds = np.concatenate([lower_position, -max_velocity, -self.max_acceleration])
-        self._state_upper_bounds = np.concatenate([upper_position, max_velocity, self.max_acceleration])
-        self._path_lower = np.asarray(lower_position if path_lower is None else path_lower, dtype=float).copy()
-        self._path_upper = np.asarray(upper_position if path_upper is None else path_upper, dtype=float).copy()
+        self.max_acceleration = np.asarray(limits.max_acceleration, dtype=float).copy()
+        self._max_action = np.asarray(limits.max_jerk, dtype=float).copy()
+        self._state_lower_bounds = np.concatenate([limits.lower_position, -limits.max_velocity, -self.max_acceleration])
+        self._state_upper_bounds = np.concatenate([limits.upper_position, limits.max_velocity, self.max_acceleration])
+        path_lower = limits.lower_position if limits.path_lower is None else limits.path_lower
+        path_upper = limits.upper_position if limits.path_upper is None else limits.path_upper
+        self._path_lower = np.asarray(path_lower, dtype=float).copy()
+        self._path_upper = np.asarray(path_upper, dtype=float).copy()
 
-        self._goal = np.asarray(config["goal"], dtype=float) if "goal" in config else np.asarray(default_goal, dtype=float).copy()
-        self._randomize_goal = bool(config.get("randomize_goal", "goal" not in config))
-        self.min_start_goal_distance = float(config.get("min_start_goal_distance", default_min_distance))
-        self.pos_tol = float(config.get("pos_tol", default_pos_tol))
-        self.vel_tol = float(config.get("vel_tol", default_vel_tol))
-        obstacles = [(np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in config.get("obstacles", []) or []]
+        self._goal = np.asarray(fields["goal"] if "goal" in fields else default_goal, dtype=float).copy()
+        self._randomize_goal = bool(fields["randomize_goal"])
+        self.min_start_goal_distance = float(fields["min_start_goal_distance"])
+        self.pos_tol = float(fields["pos_tol"])
+        self.vel_tol = float(fields["vel_tol"])
+        obstacles = [(np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in fields["obstacles"]]
         self.collision = SphereCollisionModel(obstacles, self.collision_spheres, n)
 
     # --- the properties the base class declares ---------------------------------

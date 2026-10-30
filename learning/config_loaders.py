@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from learning.models.policy_factory import PolicyFactory
 from planning.config import load_yaml_config
 
 DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
@@ -119,8 +120,8 @@ def load_policy_type(policy_config_path: Path | None) -> str:
         return "flow"
     _, model_section = _model_section(policy_config_path)
     policy_type_raw = model_section.get("policy_type", "flow")
-    if not isinstance(policy_type_raw, str) or policy_type_raw.strip().lower() not in {"flow", "safeflow"}:
-        raise ValueError("'model.policy_type' must be one of {'flow', 'safeflow'}.")
+    if not isinstance(policy_type_raw, str) or policy_type_raw.strip().lower() not in PolicyFactory.names():
+        raise ValueError(f"'model.policy_type' must be one of {set(PolicyFactory.names())}.")
     return policy_type_raw.strip().lower()
 
 

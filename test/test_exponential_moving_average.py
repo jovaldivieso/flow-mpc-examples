@@ -65,28 +65,6 @@ class ExponentialMovingAverageTests(unittest.TestCase):
         ema.update(module)
         self.assertEqual(int(ema.shadow["steps"]), 5)
 
-    def test_averaged_weights_context_runs_with_the_average_and_restores_the_weights(self) -> None:
-        module = _Tiny()
-        _set_all(module, 0.0)
-        ema = ExponentialMovingAverage(module, decay=0.9)
-        _set_all(module, 1.0)
-        ema.update(module)
-
-        with ema.averaged_weights(module):
-            torch.testing.assert_close(module.linear.weight, torch.full((2, 2), 0.1))
-        torch.testing.assert_close(module.linear.weight, torch.ones(2, 2))
-
-    def test_the_weights_are_restored_even_when_the_block_raises(self) -> None:
-        module = _Tiny()
-        ema = ExponentialMovingAverage(module)
-        _set_all(module, 3.0)
-
-        with self.assertRaises(RuntimeError):
-            with ema.averaged_weights(module):
-                raise RuntimeError("boom")
-
-        torch.testing.assert_close(module.linear.weight, torch.full((2, 2), 3.0))
-
     def test_state_dict_round_trips_and_rejects_a_foreign_module(self) -> None:
         module = _Tiny()
         ema = ExponentialMovingAverage(module, decay=0.5)

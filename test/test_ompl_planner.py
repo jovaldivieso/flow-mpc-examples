@@ -15,6 +15,7 @@ from learning.dagger.utils import sample_initial_state
 from ompl import util as ou
 from planning.ompl_planner import OmplPlanner, initialize_ompl
 from planning.planner import Plan, Planner, PlannerSolveError
+from planning.planner_config import OmplConfig
 from test.planner_fixtures import pinned_config
 
 N = 7
@@ -32,7 +33,7 @@ class OmplPlannerTests(unittest.TestCase):
         cls.simulator = FrankaSystem(cls.config)
         cls.start = sample_initial_state(cls.simulator, 3)  # also sets the goal of the sample
         cls.observation = _observation(cls.start[:N], cls.simulator.goal)
-        cls.planner = OmplPlanner(cls.simulator, cls.config)
+        cls.planner = OmplPlanner(cls.simulator, OmplConfig.from_mapping(cls.config))
         cls.path = cls.planner.plan(cls.observation).positions
 
     def test_it_is_a_planner_and_plans_a_timed_path(self) -> None:
@@ -50,7 +51,7 @@ class OmplPlannerTests(unittest.TestCase):
         self.assertLessEqual(distances[-1], step + 1e-9)
 
     def test_a_slower_speed_gives_more_steps_for_the_same_path(self) -> None:
-        slow = OmplPlanner(self.simulator, {**self.config, "ompl_speed": 1.0}).plan(self.observation).positions
+        slow = OmplPlanner(self.simulator, OmplConfig.from_mapping({**self.config, "ompl_speed": 1.0})).plan(self.observation).positions
 
         self.assertGreater(len(slow), len(self.path))
 
@@ -65,7 +66,7 @@ class OmplPlannerTests(unittest.TestCase):
 
     def test_initialize_ompl_sets_the_seed_and_the_log_level_and_building_a_planner_does_not(self) -> None:
         with mock.patch("planning.ompl_planner.ou.RNG") as rng, mock.patch("planning.ompl_planner.ou.setLogLevel") as log:
-            OmplPlanner(self.simulator, {**self.config, "ompl_seed": 7})
+            OmplPlanner(self.simulator, OmplConfig.from_mapping({**self.config, "ompl_seed": 7}))
             rng.setSeed.assert_not_called()
             log.assert_not_called()
 

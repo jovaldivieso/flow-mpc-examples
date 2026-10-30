@@ -156,7 +156,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "when set, rounds sharing the same --round-seeds value replay identical random "
             "initial-state/goal draws (a true stream restart); when unset, the round index "
-            "still varies the draws even if the nominal seed repeats (today's behavior)."
+            "still varies the draws even if the nominal seed repeats."
         ),
     )
     p.add_argument(

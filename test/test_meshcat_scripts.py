@@ -18,9 +18,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from systems.franka_system import Q_READY, FrankaSystem
-from learning.models.flow_policy import FlowPolicy
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.casadi_planner import CasadiPlanner
 from planning.config import validate_system_config
+from planning.planner_config import PlannerConfig
 from scripts.evaluate_policy import load_policy
 from scripts.meshcat_dataset import episode_summary, load_episodes, plan_positions, read_frames
 from scripts.meshcat_utils import (
@@ -236,9 +237,13 @@ class PolicyRolloutTests(unittest.TestCase):
         cls.state = _rest_state(cls.simulator)
         cls.simulator.set_goal(pose_goal(cls.simulator, cls.state[:N] + 0.3))
         torch.manual_seed(0)
-        cls.policy = FlowPolicy(
-            action_dim=N, state_dim=cls.simulator.environment_dim + cls.simulator.nx, prediction_horizon=CHUNK,
-            unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+        cls.policy = PolicyFactory.create(
+            PolicySpec(
+                policy_type="flow", action_dim=N, state_dim=cls.simulator.environment_dim + cls.simulator.nx,
+                prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+                action_scale=tuple(cls.simulator.max_action.tolist()),
+            ),
+            cls.simulator,
         ).eval()
 
     def test_a_rollout_records_the_visited_states_and_the_chunk_planned_at_each(self) -> None:
@@ -257,12 +262,12 @@ class PolicyRolloutTests(unittest.TestCase):
         np.testing.assert_allclose(rollout.states[1], self.simulator.predict_next_state(self.state, rollout.chunks[0][0]))
 
     def test_the_expert_plans_from_every_visited_state_when_asked_to(self) -> None:
-        planner = CasadiPlanner(self.simulator, self.config)
+        planner = CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config))
 
         rollout = rollout_policy(self.simulator, self.policy, self.state, 2, torch.device("cpu"), planner)
 
         self.assertEqual(rollout.expert_plans.shape, rollout.chunks.shape)
-        first_action = CasadiPlanner(self.simulator, self.config).plan(self.simulator.observe(self.state)).actions[0]
+        first_action = CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).plan(self.simulator.observe(self.state)).actions[0]
         np.testing.assert_allclose(rollout.expert_plans[0][0], first_action, atol=1e-6)  # the plan starts at the state
 
     def test_a_rollout_that_starts_at_the_goal_is_reached_without_steps(self) -> None:
@@ -278,9 +283,12 @@ class LoadPolicyTests(unittest.TestCase):
     def test_the_policy_of_a_checkpoint_runs_with_its_ema_weights_in_eval_mode(self) -> None:
         simulator = FrankaSystem(_config())
         state_dim = simulator.environment_dim + simulator.nx
-        template = FlowPolicy(
-            action_dim=N, state_dim=state_dim, prediction_horizon=CHUNK,
-            unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+        template = PolicyFactory.create(
+            PolicySpec(
+                policy_type="flow", action_dim=N, state_dim=state_dim, prediction_horizon=CHUNK, unet_dim=8,
+                unet_dim_mults=(1, 2), num_inference_steps=2, action_scale=(1.0,) * N,
+            ),
+            simulator,
         )
         averaged = {name: torch.full_like(tensor, 0.25) for name, tensor in template.state_dict().items()}
         checkpoint = {
@@ -291,7 +299,7 @@ class LoadPolicyTests(unittest.TestCase):
             "prediction_horizon": CHUNK,
             "unet": {"dim": 8, "dim_mults": [1, 2]},
             "policy_type": "flow",
-            "flow_config": {"num_inference_steps": 2, "action_scale": [1.0] * N},
+            "flow_config": {"num_inference_steps": 2, "safeflow_init": "previous_safe", "action_scale": [1.0] * N},
         }
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "checkpoint.pt")

@@ -12,6 +12,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from planning.casadi_graph import CasadiKinematicGraph
 from planning.casadi_planner import CasadiPlanner
+from planning.planner_config import PlannerConfig
 from systems.franka_system import FrankaSystem
 from test.planner_fixtures import pinned_config, rest_state
 
@@ -25,7 +26,7 @@ OBSTACLES = [
 def _planner(num_obstacles: int) -> tuple[FrankaSystem, CasadiPlanner]:
     config = pinned_config(expert="casadi", obstacles=OBSTACLES[:num_obstacles])
     simulator = FrankaSystem(config)
-    return simulator, CasadiPlanner(simulator, config)
+    return simulator, CasadiPlanner(simulator, PlannerConfig.from_mapping(config))
 
 
 class CasadiKinematicGraphTests(unittest.TestCase):

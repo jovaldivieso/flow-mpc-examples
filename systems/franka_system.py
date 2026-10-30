@@ -28,13 +28,18 @@ import coal
 import numpy as np
 import pinocchio as pin
 
+from .config_fields import SYSTEM_CONFIG_KEYS
+from .franka_config import (
+    FRANKA_CONFIG_KEYS,
+    FRANKA_NUM_JOINTS,
+    POSE_COMPONENTS,
+    POSE_DIM,
+    validate_franka_config,
+)
 from .franka_kinematics import franka_kinematics
 from .franka_model import Q_READY, TCP_FRAME, build_model, build_robot
-from .triple_integrator import SAMPLING_ATTEMPTS, TripleIntegratorBase
+from .triple_integrator import PlantLimits, TripleIntegratorBase
 
-FRANKA_NUM_JOINTS = 7
-FRANKA_DEFAULT_MAX_ACCELERATION = (5.0,) * 7
-FRANKA_DEFAULT_MAX_JERK = (15.0,) * 7
 
 # Random start/goal configurations stay inside the joint margins, within SAMPLING_RADIUS of Q_READY, with the TCP in
 # WORKSPACE_BOUNDS in front of the base and every joint frame at least FLOOR_CLEARANCE above the floor (z = 0)
@@ -42,15 +47,24 @@ JOINT_SAMPLING_MARGIN = 0.1
 SAMPLING_RADIUS = 1.0
 WORKSPACE_BOUNDS = ((0.2, 0.8), (-0.6, 0.6), (0.1, 0.8))
 FLOOR_CLEARANCE = 0.1
+Region = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]  # TCP box: (x, y, z), each (min, max)
+CONFIGURATION_ATTEMPTS = 25000  # rejection samples per configuration
+GOAL_POSE_ATTEMPTS = 100  # sampled poses per goal that has a tool axis (each one is a multi-start inverse kinematics)
 
-POSE_COMPONENTS = ["x", "y", "z"] + [f"R{i}{j}" for i in range(3) for j in range(3)]
-POSE_DIM = len(POSE_COMPONENTS)
 
 
 class FrankaSystem(TripleIntegratorBase):
     """Triple-integrator 7-joint FR3 with jerk as the action; the goal is a TCP pose."""
 
     task_description = "reach target pose"
+
+    @classmethod
+    def config_keys(cls) -> set[str]:
+        return SYSTEM_CONFIG_KEYS | FRANKA_CONFIG_KEYS
+
+    @classmethod
+    def validate_config(cls, raw_config: Mapping[str, Any]) -> dict[str, Any]:
+        return validate_franka_config(raw_config)
 
     def __init__(self, config: Mapping[str, Any]):
         model = build_model()
@@ -59,27 +73,42 @@ class FrankaSystem(TripleIntegratorBase):
             raise ValueError(f"Expected {FRANKA_NUM_JOINTS} joints, the reduced franka_description has {n}.")
         kinematics = franka_kinematics()
         ready_position, ready_rotation = kinematics.fk(Q_READY)
-        per_joint = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (n,)).copy()
+        fields = self.validate_config(config)
         super().__init__(
             config,
-            n=n,
-            lower_position=model.lowerPositionLimit,
-            upper_position=model.upperPositionLimit,
-            max_velocity=model.velocityLimit,
-            max_acceleration=per_joint("max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION),
-            max_jerk=per_joint("max_jerk", FRANKA_DEFAULT_MAX_JERK),
+            fields,
+            limits=PlantLimits(
+                n=n,
+                lower_position=model.lowerPositionLimit,
+                upper_position=model.upperPositionLimit,
+                max_velocity=model.velocityLimit,
+                max_acceleration=np.asarray(fields["max_acceleration"], dtype=float),
+                max_jerk=np.asarray(fields["max_jerk"], dtype=float),
+            ),
             default_goal=np.concatenate([np.array(ready_position).ravel(), np.array(ready_rotation).ravel()]),
-            default_min_distance=0.25,
-            default_pos_tol=0.03,
-            default_vel_tol=0.05,
         )
         self.model = model
         self.data = model.createData()
         self.kinematics = kinematics
         self.tcp_id = model.getFrameId(TCP_FRAME)
+        goal_region = fields.get("goal_region", {})
+        self.start_region = self._region(fields.get("start_region"))
+        self.goal_region = self._region(goal_region or None)
+        self.goal_tool_axis = None if "tool_axis" not in goal_region else self._unit(goal_region["tool_axis"])
+        self.goal_tool_tilt = float(goal_region.get("tool_tilt", 0.0))
         self._mesh_collision: tuple | None = None  # (obstacles, geometry model, geometry data), built on first use
         self._cached_goal: np.ndarray | None = None  # the goal whose joint configuration is cached, and that configuration
         self._cached_q_goal: np.ndarray | None = None
+
+    @staticmethod
+    def _region(raw: Mapping[str, Any] | None) -> Region:
+        """The TCP box of a config's region, ``WORKSPACE_BOUNDS`` if it has none."""
+        return WORKSPACE_BOUNDS if raw is None else tuple((float(raw[axis][0]), float(raw[axis][1])) for axis in "xyz")
+
+    @staticmethod
+    def _unit(vector: Any) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        return vector / np.linalg.norm(vector)
 
     @property
     def environment_dim(self) -> int:
@@ -209,25 +238,58 @@ class FrankaSystem(TripleIntegratorBase):
         return [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self.coordinate_names]
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
-        """Random arm configuration near ``Q_READY`` inside the joint limits, in front of the base and above the floor."""
+        return self._sample_configuration_in(rng, self.start_region)
+
+    def _sample_configuration_in(self, rng: np.random.Generator, region: Region) -> np.ndarray:
+        """Random collision-free arm configuration near ``Q_READY`` inside the joint limits, with the TCP in ``region`` and
+        every joint frame above the floor."""
         lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
         margin = JOINT_SAMPLING_MARGIN * (upper - lower)
         sample_low = np.maximum(lower + margin, Q_READY - SAMPLING_RADIUS)
         sample_high = np.minimum(upper - margin, Q_READY + SAMPLING_RADIUS)
-        (x_min, x_max), (y_min, y_max), (z_min, z_max) = WORKSPACE_BOUNDS
-        for _ in range(SAMPLING_ATTEMPTS):
+        (x_min, x_max), (y_min, y_max), (z_min, z_max) = region
+        for _ in range(CONFIGURATION_ATTEMPTS):
             q = rng.uniform(sample_low, sample_high)
             tcp = self.tcp_placement(q).translation
             if (
                 x_min <= tcp[0] <= x_max
                 and y_min <= tcp[1] <= y_max
                 and z_min <= tcp[2] <= z_max
-                and all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:])
-                and self.collision.is_collision_free(q)
+                and self._is_valid(q)
             ):
                 return q
-        raise RuntimeError(f"Unable to sample an arm configuration in the workspace in {SAMPLING_ATTEMPTS} attempts.")
+        raise RuntimeError(f"Unable to sample an arm configuration in the workspace in {CONFIGURATION_ATTEMPTS} attempts.")
+
+    def _is_valid(self, q: np.ndarray) -> bool:
+        """Every joint frame at least ``FLOOR_CLEARANCE`` above the floor and no obstacle touched."""
+        self.tcp_placement(q)
+        return all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:]) and self.collision.is_collision_free(q)
+
+    def _tool_rotation(self, rng: np.random.Generator) -> np.ndarray:
+        """A hand rotation whose tool axis (z) points along ``goal_tool_axis`` within ``goal_tool_tilt``, at a random roll."""
+        axis = self.goal_tool_axis
+        helper = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        side = np.cross(axis, helper)
+        side /= np.linalg.norm(side)
+        tilt, heading = self.goal_tool_tilt * rng.uniform(), rng.uniform(0.0, 2 * np.pi)
+        z = np.cos(tilt) * axis + np.sin(tilt) * (np.cos(heading) * side + np.sin(heading) * np.cross(axis, side))
+        a = np.cross(z, helper)
+        a /= np.linalg.norm(a)
+        roll = rng.uniform(0.0, 2 * np.pi)
+        x = np.cos(roll) * a + np.sin(roll) * np.cross(z, a)
+        return np.column_stack([x, np.cross(z, x), z])
 
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
-        """The TCP pose of a random configuration (so it is reachable)."""
-        return self.pose_vector(self.tcp_placement(self._sample_configuration(rng)))
+        """The TCP pose of a random configuration (so it is reachable); with a ``tool_axis`` in the goal region, a pose of
+        the box with the hand along it that inverse kinematics reaches without a collision."""
+        if self.goal_tool_axis is None:
+            return self.pose_vector(self.tcp_placement(self._sample_configuration_in(rng, self.goal_region)))
+        low, high = (np.array(bound) for bound in zip(*self.goal_region))
+        for _ in range(GOAL_POSE_ATTEMPTS):
+            position, rotation = rng.uniform(low, high), self._tool_rotation(rng)
+            try:
+                self.kinematics.solve_ik(position, rotation, Q_READY, self._is_valid)
+            except RuntimeError:
+                continue
+            return np.concatenate([position, rotation.ravel()])
+        raise RuntimeError(f"Unable to sample a goal pose in the region in {GOAL_POSE_ATTEMPTS} attempts.")

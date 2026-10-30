@@ -15,7 +15,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from systems.point_mass_system import PointMassSystem
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.pose_guidance import PoseGuidance
 from test.planner_fixtures import pose_goal
 
@@ -118,13 +118,18 @@ class PoseGuidanceOnThePointMassTests(unittest.TestCase):
         np.testing.assert_allclose(final[2:], 0.0, atol=1e-3)
 
 
+def _flow_policy(simulator: PointMassSystem, steps: int, action_scale: float = 10.0):
+    spec = PolicySpec(
+        policy_type="flow", action_dim=2, state_dim=6, prediction_horizon=HORIZON, unet_dim=8, unet_dim_mults=(1, 2),
+        num_inference_steps=steps, action_scale=(action_scale, action_scale),
+    )
+    return PolicyFactory.create(spec, simulator).eval()
+
+
 class GuidedFlowPolicyTests(unittest.TestCase):
     def test_every_euler_step_of_a_flow_policy_is_guided(self) -> None:
         simulator = PointMassSystem({"goal": [0.5, 0.0]})
-        policy = PolicyFactory.create(
-            "flow", action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
-            num_inference_steps=3, action_scale=[10.0, 10.0], simulator=simulator,
-        ).eval()
+        policy = _flow_policy(simulator, 3, 10.0)
         observation = simulator.policy_observation(simulator.observe(np.zeros(6)))
         batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
 
@@ -136,10 +141,7 @@ class GuidedFlowPolicyTests(unittest.TestCase):
 
     def test_the_iterates_of_a_flow_policy_stay_within_the_jerk_limits(self) -> None:
         simulator = PointMassSystem({"goal": [0.5, 0.0]})
-        policy = PolicyFactory.create(
-            "flow", action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
-            num_inference_steps=3, action_scale=[100.0, 100.0], simulator=simulator,  # the noise prior reaches far past the limit of 10
-        ).eval()
+        policy = _flow_policy(simulator, 3, 100.0)
         observation = simulator.policy_observation(simulator.observe(np.zeros(6)))
         batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
 
@@ -149,10 +151,7 @@ class GuidedFlowPolicyTests(unittest.TestCase):
 
     def test_a_reset_starts_the_guidance_of_a_new_episode(self) -> None:
         simulator = PointMassSystem({})
-        policy = PolicyFactory.create(
-            "flow", action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
-            num_inference_steps=1, action_scale=[10.0, 10.0], simulator=simulator,
-        )
+        policy = _flow_policy(simulator, 1, 10.0)
         policy.guidance._start_distance = 1.0
 
         policy.reset()
@@ -161,10 +160,7 @@ class GuidedFlowPolicyTests(unittest.TestCase):
 
     def test_a_guided_flow_policy_serves_one_system(self) -> None:
         simulator = PointMassSystem({})
-        policy = PolicyFactory.create(
-            "flow", action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
-            num_inference_steps=1, action_scale=[10.0, 10.0], simulator=simulator,
-        ).eval()
+        policy = _flow_policy(simulator, 1, 10.0)
         batch = {"observation.environment_state": torch.zeros(2, 2), "observation.state": torch.zeros(2, 4)}
 
         with self.assertRaises(ValueError):

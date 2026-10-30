@@ -23,7 +23,7 @@ from learning.data_utils import build_dataset_features
 from learning.dagger.dagger_trainer import MIN_LEARNING_RATE, WEIGHT_DECAY, _validate_resumable_dataset_schema
 from learning.dagger.metrics import DaggerEvalMetrics
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from learning.train_dagger import DaggerConfig, DaggerTrainer
 
@@ -596,17 +596,19 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 # 'flow' and 'safeflow' checkpoints are interchangeable: a bare FlowPolicy rebuilt
                 # from the checkpoint's own metadata loads either one (through the loading utility).
                 rebuilt = PolicyFactory.create(
-                    "flow",
-                    action_dim=checkpoint["action_dim"],
-                    state_dim=checkpoint["state_dim"],
-                    unet_dim=checkpoint["unet"]["dim"],
-                    unet_dim_mults=tuple(checkpoint["unet"]["dim_mults"]),
-                    prediction_horizon=checkpoint["prediction_horizon"],
-                    num_inference_steps=checkpoint["flow_config"]["num_inference_steps"],
-                    action_scale=checkpoint["flow_config"]["action_scale"],
-                    simulator=trainer.simulator,
+                    PolicySpec(
+                        policy_type="flow",
+                        action_dim=checkpoint["action_dim"],
+                        state_dim=checkpoint["state_dim"],
+                        prediction_horizon=checkpoint["prediction_horizon"],
+                        unet_dim=checkpoint["unet"]["dim"],
+                        unet_dim_mults=tuple(checkpoint["unet"]["dim_mults"]),
+                        num_inference_steps=checkpoint["flow_config"]["num_inference_steps"],
+                        action_scale=tuple(checkpoint["flow_config"]["action_scale"]),
+                    ),
+                    trainer.simulator,
                 )
-                load_policy_state_dict(rebuilt, checkpoint["ema_model_state_dict"])
+                rebuilt.load_network_state_dict(checkpoint["ema_model_state_dict"])
                 prefix = "inner_policy." if policy_type == "safeflow" else ""
                 self.assertEqual({prefix + name for name in rebuilt.state_dict()}, set(checkpoint["ema_model_state_dict"]))
                 for name, value in rebuilt.state_dict().items():

@@ -11,7 +11,18 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from .triple_integrator import SAMPLING_ATTEMPTS, TripleIntegratorBase
+from .config_fields import (
+    SYSTEM_CONFIG_KEYS,
+    ConfigurationError,
+    read_bool,
+    read_float,
+    read_int,
+    read_limits,
+    read_obstacles,
+    read_tolerances,
+    read_vector,
+)
+from .triple_integrator import SAMPLING_ATTEMPTS, PlantLimits, TripleIntegratorBase
 
 DEFAULT_DIMENSION = 2
 DEFAULT_WORKSPACE_BOUNDS = (-1.0, 1.0)  # [min, max] of every axis, where starts and goals are drawn
@@ -19,30 +30,64 @@ DEFAULT_MAX_VELOCITY = 1.0
 DEFAULT_MAX_ACCELERATION = 2.0
 DEFAULT_MAX_JERK = 10.0
 
+# The keys of a point mass config beside the ones every system has
+POINT_MASS_CONFIG_KEYS = {"dimension", "max_velocity", "workspace_bounds"}
+
 
 class PointMassSystem(TripleIntegratorBase):
     """Point mass in ``dimension`` dimensions (default 2) with jerk as the action: a toy system to calibrate the pipeline."""
 
     task_description = "reach target position"
 
+    @classmethod
+    def config_keys(cls) -> set[str]:
+        return SYSTEM_CONFIG_KEYS | POINT_MASS_CONFIG_KEYS
+
+    @classmethod
+    def validate_config(cls, raw_config: Mapping[str, Any]) -> dict[str, Any]:
+        """The fields of the point mass: dimension, limits, tolerances, sampling, obstacles and goal."""
+        dimension = read_int(raw_config, "dimension", DEFAULT_DIMENSION)
+        if dimension < 1:
+            raise ConfigurationError("'dimension' must be positive.")
+        bounds = read_vector(raw_config, "workspace_bounds", 2, DEFAULT_WORKSPACE_BOUNDS)
+        if bounds[0] >= bounds[1]:
+            raise ConfigurationError("'workspace_bounds' minimum must be smaller than its maximum.")
+        min_start_goal_distance = read_float(raw_config, "min_start_goal_distance", 0.5)
+        if min_start_goal_distance < 0:
+            raise ConfigurationError("'min_start_goal_distance' must be non-negative.")
+        fields: dict[str, Any] = {
+            "dimension": dimension,
+            "workspace_bounds": list(bounds),
+            "randomize_goal": read_bool(raw_config, "randomize_goal", "goal" not in raw_config),
+            "min_start_goal_distance": min_start_goal_distance,
+            "max_velocity": list(read_limits(raw_config, "max_velocity", DEFAULT_MAX_VELOCITY, dimension)),
+            "max_acceleration": list(read_limits(raw_config, "max_acceleration", DEFAULT_MAX_ACCELERATION, dimension)),
+            "max_jerk": list(read_limits(raw_config, "max_jerk", DEFAULT_MAX_JERK, dimension)),
+            "obstacles": read_obstacles(raw_config, dimension),
+            **read_tolerances(raw_config, 0.02, 0.02),
+        }
+        if "goal" in raw_config:
+            fields["goal"] = list(read_vector(raw_config, "goal", dimension, ()))
+        return fields
+
     def __init__(self, config: Mapping[str, Any]):
-        n = int(config.get("dimension", DEFAULT_DIMENSION))
-        per_axis = lambda key, default: np.broadcast_to(np.asarray(config.get(key, default), dtype=float), (n,)).copy()
-        self.workspace_bounds = tuple(float(value) for value in config.get("workspace_bounds", DEFAULT_WORKSPACE_BOUNDS))
+        fields = self.validate_config(config)
+        n = fields["dimension"]
+        self.workspace_bounds = tuple(fields["workspace_bounds"])
         super().__init__(
             config,
-            n=n,
-            lower_position=np.full(n, -np.inf),
-            upper_position=np.full(n, np.inf),
-            path_lower=np.full(n, self.workspace_bounds[0]),
-            path_upper=np.full(n, self.workspace_bounds[1]),
-            max_velocity=per_axis("max_velocity", DEFAULT_MAX_VELOCITY),
-            max_acceleration=per_axis("max_acceleration", DEFAULT_MAX_ACCELERATION),
-            max_jerk=per_axis("max_jerk", DEFAULT_MAX_JERK),
+            fields,
+            limits=PlantLimits(
+                n=n,
+                lower_position=np.full(n, -np.inf),
+                upper_position=np.full(n, np.inf),
+                max_velocity=np.asarray(fields["max_velocity"], dtype=float),
+                max_acceleration=np.asarray(fields["max_acceleration"], dtype=float),
+                max_jerk=np.asarray(fields["max_jerk"], dtype=float),
+                path_lower=np.full(n, self.workspace_bounds[0]),
+                path_upper=np.full(n, self.workspace_bounds[1]),
+            ),
             default_goal=np.zeros(n),
-            default_min_distance=0.5,
-            default_pos_tol=0.02,
-            default_vel_tol=0.02,
         )
 
     def goal_errors(self, state: np.ndarray) -> tuple[float, float]:

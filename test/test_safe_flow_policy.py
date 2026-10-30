@@ -15,9 +15,10 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from learning.models.flow_policy import FlowPolicy
-from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.planner import PlannerSolveError
+from planning.planner_config import PlannerConfig
 from planning.casadi_projector import CasadiTrajectoryProjector
 from test.planner_fixtures import pose_goal
 
@@ -72,23 +73,39 @@ def _policy_input(simulator: FrankaSystem, state: np.ndarray) -> dict[str, torch
     }
 
 
+class _NoGuidance:
+    """Hands the proposal on as it is: the tests of the projection wiring need what the projector is handed unmoved."""
+
+    def __init__(self, simulator) -> None:
+        self.max_action = simulator.max_action
+
+    def guide(self, environment_state, state, proposal):
+        return proposal
+
+    def reset(self) -> None:
+        pass
+
+
+def _policy_spec(simulator, policy_type: str = "safeflow", **options) -> PolicySpec:
+    """The flow conditions directly on observation_features: environment_state(81) + state(21) = 102. The chunk is jerks,
+    scaled by their limits exactly as DaggerTrainer passes it."""
+    return PolicySpec(
+        policy_type=policy_type, action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx,
+        prediction_horizon=HORIZON, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+        action_scale=tuple(simulator.max_action.tolist()), **options,
+    )
+
+
 def _build_safe_flow_policy(simulator, planner_config=None, *, guided=False, **policy_options) -> SafeFlowMPCPolicy:
-    # The flow policy conditions directly on observation_features:
-    # environment_state(81) + state(21) = 102 = simulator.environment_dim + simulator.nx.
-    # The chunk is jerks, scaled by their limits exactly as DaggerTrainer passes it;
-    # planner_config defaults to the validated expert config, as it does there. policy_options are the
+    # planner_config defaults to the validated expert config, as it does in the trainer. policy_options are the
     # safeflow options (flow_init). The tests of the projection wiring run unguided: the flow's guidance
     # (test_pose_guidance.py) would move what the projector is handed.
     policy = PolicyFactory.create(
-        "safeflow",
-        action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
-        num_inference_steps=2, action_scale=simulator.max_action.tolist(),
-        simulator=simulator, planner_config=_validated_config() if planner_config is None else planner_config,
-        **policy_options,
+        _policy_spec(simulator, **policy_options), simulator, _validated_config() if planner_config is None else planner_config
     )
     assert isinstance(policy, SafeFlowMPCPolicy)
     if not guided:
-        policy.inner_policy.guidance = None
+        policy.inner_policy.guidance = _NoGuidance(simulator)
     return policy
 
 
@@ -135,9 +152,7 @@ class SharedSimulatorTests(unittest.TestCase):
         # projector level): invert_obs drops the goal, so the projection
         # must not depend on it -- policies with the same weights, built
         # from simulators holding different goals, must act identically on
-        # the same observation. If this ever fails, zeroing the goal in
-        # PolicyFactory.create is no longer a safe substitute for the real
-        # one, and this whole approach needs revisiting.
+        # the same observation.
         observation_dict = _rest_observation_dict(_build_simulator(goal=GOAL))
         actions = []
         for goal in (GOAL, OTHER_GOAL):
@@ -165,7 +180,7 @@ class TerminalConditionSupportTests(unittest.TestCase):
         # always solvable, just weakly enforced from far-from-rest states.
         horizon = 2
         simulator = _build_simulator()
-        projector = CasadiTrajectoryProjector(simulator, _validated_config(), horizon=horizon)
+        projector = CasadiTrajectoryProjector(simulator, PlannerConfig.from_mapping(_validated_config()), horizon=horizon)
         state0 = _rest_state(simulator)
         state0[simulator.n] = 2.0
         state0[simulator.n + 4] = 3.0
@@ -187,7 +202,7 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
     """
 
     def test_rollout_policy_with_action_fn_ends_episode_on_policy_solve_failure(self) -> None:
-        from learning.dagger.rollouts import rollout_policy_with_action_fn
+        from learning.dagger.evaluation import rollout_policy_with_action_fn
 
         simulator = _build_simulator()
         initial_state = _rest_state(simulator)
@@ -213,7 +228,8 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
         # surfaces from select_action as a PlannerSolveError (see
         # CasadiTrajectoryProjector.project), which the evaluation-side
         # rollout turns into an episode-ending failure.
-        from learning.dagger.rollouts import build_policy_action, rollout_policy_with_action_fn
+        from learning.dagger.evaluation import rollout_policy_with_action_fn
+        from learning.dagger.policy_action import build_policy_action
 
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator)
@@ -269,20 +285,14 @@ class SelectActionBatchSizeGuardTests(unittest.TestCase):
 
 
 class PolicyFactorySafeFlowTests(unittest.TestCase):
-    """PolicyFactory.create("safeflow", ...) wires an inner FlowPolicy, a
-    CasadiTrajectoryProjector into one single-arm SafeFlowMPCPolicy.
+    """PolicyFactory.create(a safeflow spec, ...) wires an inner FlowPolicy and a CasadiTrajectoryProjector into one
+    single-arm SafeFlowMPCPolicy.
     """
 
-    def test_requires_simulator_and_planner_config(self) -> None:
+    def test_requires_the_planner_config(self) -> None:
         simulator = _build_simulator()
-        flow_kwargs = dict(
-            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
-            prediction_horizon=HORIZON, num_inference_steps=2,
-        )
-        for given in ({}, {"simulator": simulator}, {"planner_config": {}}):
-            with self.subTest(given=sorted(given)):
-                with self.assertRaises(ValueError):
-                    PolicyFactory.create("safeflow", **flow_kwargs, **given)
+        with self.assertRaises(ValueError):
+            PolicyFactory.create(_policy_spec(simulator), simulator)
 
     def test_projector_is_sized_by_the_prediction_horizon_and_keeps_the_arms_rest_indices(self) -> None:
         policy = _build_safe_flow_policy(_build_simulator())
@@ -458,17 +468,14 @@ class FlowInitializationTests(unittest.TestCase):
 class StateDictInterchangeTests(unittest.TestCase):
     """'flow' and 'safeflow' checkpoints are interchangeable: a SafeFlowMPCPolicy's state dict is its inner
     FlowPolicy's behind an ``inner_policy.`` prefix (the projector is no nn.Module, so it contributes nothing), and
-    ``load_policy_state_dict`` loads either kind of checkpoint into either kind of policy through PyTorch's own,
+    ``load_network_state_dict`` loads either kind of checkpoint into either kind of policy through PyTorch's own,
     strict, ``load_state_dict`` -- which neither policy overrides.
     """
 
     def _policies(self):
         simulator = _build_simulator()
         safe_policy = _build_safe_flow_policy(simulator)
-        flow_policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
-            prediction_horizon=HORIZON, num_inference_steps=2,
-        )
+        flow_policy = PolicyFactory.create(_policy_spec(simulator, "flow"), simulator)
         return safe_policy, flow_policy
 
     def test_neither_policy_overrides_load_state_dict(self) -> None:
@@ -482,11 +489,11 @@ class StateDictInterchangeTests(unittest.TestCase):
         self.assertEqual(set(safe_state_dict), {f"inner_policy.{name}" for name in flow_state_dict})
 
         # a bare flow checkpoint into the safeflow policy ...
-        load_policy_state_dict(safe_policy, flow_state_dict)
+        safe_policy.load_network_state_dict(flow_state_dict)
         for name, value in flow_state_dict.items():
             torch.testing.assert_close(safe_policy.state_dict()[f"inner_policy.{name}"], value)
         # ... and a safeflow checkpoint into the bare flow policy
-        load_policy_state_dict(flow_policy, safe_state_dict)
+        flow_policy.load_network_state_dict(safe_state_dict)
         for name, value in safe_state_dict.items():
             torch.testing.assert_close(flow_policy.state_dict()[name.removeprefix("inner_policy.")], value)
 
@@ -496,9 +503,9 @@ class StateDictInterchangeTests(unittest.TestCase):
 
         safe_policy.load_state_dict(own)  # PyTorch's own loading, no remapping needed
         with self.assertRaises(RuntimeError):  # strict: an unknown key is an error, not silently dropped
-            load_policy_state_dict(flow_policy, {**own, "inner_policy.unexpected": torch.zeros(1)})
+            flow_policy.load_network_state_dict({**own, "inner_policy.unexpected": torch.zeros(1)})
         with self.assertRaises(RuntimeError):  # and so is a missing one
-            load_policy_state_dict(safe_policy, dict(list(own.items())[1:]))
+            safe_policy.load_network_state_dict(dict(list(own.items())[1:]))
 
     def test_keys_saved_while_the_network_was_torch_compiled_and_projector_keys_are_mapped(self) -> None:
         safe_policy, _ = self._policies()
@@ -506,7 +513,7 @@ class StateDictInterchangeTests(unittest.TestCase):
         saved["projector.stale"] = torch.zeros(1)
         self.assertTrue(any("_orig_mod" in name for name in saved))
 
-        load_policy_state_dict(safe_policy, saved)
+        safe_policy.load_network_state_dict(saved)
 
 
 if __name__ == "__main__":

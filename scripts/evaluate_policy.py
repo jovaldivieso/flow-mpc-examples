@@ -30,10 +30,10 @@ from systems.system_factory import SystemFactory
 from learning.config_loaders import UnetConfig
 from learning.data_utils import build_dataset_features
 from learning.dagger import apply_config_overrides, build_policy_action
-from learning.dagger.rollouts import apply_execution_noise
+from learning.dagger.policy_action import apply_execution_noise
 from learning.dagger.utils import rng_for_seed_spec as _rng_for_seed_spec, sample_initial_state
 from learning.models.policy import ActionPolicy
-from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
@@ -309,8 +309,7 @@ def _load_checkpoint_policy_components(
     unet_raw = checkpoint.get("unet")
     if not isinstance(unet_raw, Mapping):
         raise ValueError(
-            f"'{policy_type}' checkpoint has no 'unet' entry: it was trained with a flow network that is no longer "
-            "supported (the temporal U-Net replaced the MLP)."
+            f"'{policy_type}' checkpoint has no 'unet' entry (the size of its temporal U-Net)."
         )
     unet = UnetConfig(dim=int(unet_raw["dim"]), dim_mults=tuple(int(m) for m in unet_raw["dim_mults"]))
 
@@ -338,29 +337,20 @@ def load_policy(
     checkpoint, state_dict, state_dim, action_dim, unet, prediction_horizon = (
         _load_checkpoint_policy_components(model_dir, simulator, policy_type, device)
     )
-    policy_kwargs: dict[str, object] = {
-        "action_dim": action_dim,
-        "state_dim": state_dim,
-        "unet_dim": unet.dim,
-        "unet_dim_mults": unet.dim_mults,
-        "prediction_horizon": prediction_horizon,
-    }
-    if policy_type in {"flow", "safeflow"}:
-        num_inference_steps = 10
-        flow_config_raw = checkpoint.get("flow_config")
-        if isinstance(flow_config_raw, Mapping):
-            num_inference_steps = int(flow_config_raw.get("num_inference_steps", 10))
-            action_scale_raw = flow_config_raw.get("action_scale")
-            if action_scale_raw is not None:
-                policy_kwargs["action_scale"] = list(action_scale_raw)
-        policy_kwargs["num_inference_steps"] = num_inference_steps
-    policy_kwargs["simulator"] = simulator
-    if policy_type == "safeflow":
-        policy_kwargs["planner_config"] = planner_config
-        if isinstance(flow_config_raw, Mapping):
-            policy_kwargs["flow_init"] = flow_config_raw.get("safeflow_init", "previous_safe")
-    policy = PolicyFactory.create(policy_type, **policy_kwargs)
-    load_policy_state_dict(policy, state_dict)
+    flow_config = checkpoint["flow_config"]
+    spec = PolicySpec(
+        policy_type=policy_type,
+        action_dim=action_dim,
+        state_dim=state_dim,
+        prediction_horizon=prediction_horizon,
+        unet_dim=unet.dim,
+        unet_dim_mults=unet.dim_mults,
+        num_inference_steps=int(flow_config["num_inference_steps"]),
+        action_scale=tuple(flow_config["action_scale"]),
+        flow_init=flow_config["safeflow_init"],
+    )
+    policy = PolicyFactory.create(spec, simulator, planner_config)
+    policy.load_network_state_dict(state_dict)
 
     policy.eval()
     policy.to(device)

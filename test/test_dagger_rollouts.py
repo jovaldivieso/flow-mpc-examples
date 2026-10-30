@@ -17,17 +17,15 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from learning.data_utils import build_dataset_features
-from learning.dagger.rollouts import (
-    RolloutWorkerSpec,
-    _setup_episode_start,
-    apply_execution_noise,
-    build_policy_action,
-    collect_dagger_rollouts,
-    evaluate_policy_rollouts,
-)
-from learning.models.flow_policy import FlowPolicy
+from learning.dagger.collection import collect_dagger_rollouts
+from learning.dagger.episode_starts import _setup_episode_start
+from learning.dagger.evaluation import evaluate_policy_rollouts
+from learning.dagger.policy_action import apply_execution_noise, build_policy_action
+from learning.dagger.workers import RolloutWorkerSpec
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.casadi_planner import CasadiPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
+from planning.planner_config import PlannerConfig
 from test.planner_fixtures import pose_goal
 from systems.seed_utils import (
     action_noise_seed_for_rollout,
@@ -41,6 +39,8 @@ PREDICTION_HORIZON = 2  # the chunk length of the fake system's labels (and of t
 
 class _FakeSimulator:
     """Minimal 1-D stand-in exercising only what collect_dagger_rollouts needs."""
+
+    task_description = "reach target"
 
     def __init__(self, collision_threshold: float = 1e9, goal_threshold: float = 1.0, done_hold_steps: int = 1) -> None:
         self.goal = np.array([0.0], dtype=float)
@@ -388,7 +388,7 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
 
     def test_manual_seed_is_called_once_per_episode_with_the_derived_seed(self) -> None:
         simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=1e9)
-        with mock.patch("learning.dagger.rollouts.torch.manual_seed") as manual_seed:
+        with mock.patch("learning.dagger.collection.torch.manual_seed") as manual_seed:
             evaluate_policy_rollouts(
                 simulator=simulator,
                 num_episodes=3,
@@ -419,7 +419,7 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
         simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=1e9)
         seeds_seen: list[list[int]] = [[], []]
         for run_idx in range(2):
-            with mock.patch("learning.dagger.rollouts.torch.manual_seed", side_effect=seeds_seen[run_idx].append):
+            with mock.patch("learning.dagger.collection.torch.manual_seed", side_effect=seeds_seen[run_idx].append):
                 evaluate_policy_rollouts(
                     simulator=simulator,
                     num_episodes=2,
@@ -582,7 +582,7 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
                 raise PlannerSolveError("forced failure for test")
             return np.array([0.0])
 
-        clock = mock.patch("learning.dagger.rollouts.time.perf_counter", side_effect=self._clock(durations))
+        clock = mock.patch("learning.dagger.evaluation.time.perf_counter", side_effect=self._clock(durations))
         with clock:
             metrics = evaluate_policy_rollouts(
                 simulator=simulator, num_episodes=2, num_steps=3, seed_start=0, action_fn=action_fn,
@@ -679,7 +679,7 @@ class SetupEpisodeStartTests(unittest.TestCase):
     def test_an_episode_beyond_the_provided_ones_restores_the_baseline_goal_and_samples_a_start(self) -> None:
         self.simulator.set_goal(np.array([9.0]))  # what an earlier explicit episode left behind
 
-        with mock.patch("learning.dagger.rollouts.sample_initial_state", return_value=np.array([0.1])) as sample:
+        with mock.patch("learning.dagger.episode_starts.sample_initial_state", return_value=np.array([0.1])) as sample:
             state = self._start(2, usable=2, goals=self.goals, seed=5)
 
         np.testing.assert_array_equal(state, [0.1])
@@ -770,8 +770,7 @@ class BuildPolicyActionTests(unittest.TestCase):
 class DefaultFrameBuilderTests(unittest.TestCase):
     """Without a frame_builder, collect_dagger_rollouts formats frames with
     data_utils.format_dataset_frame -- ONE mapping per step (the arm is a
-    single robot) -- and adds the LeRobot ``task`` string: the simulator's
-    task_description if it has one, else "reach target".
+    single robot) -- and adds the LeRobot ``task`` string: the simulator's task_description.
     """
 
     @staticmethod
@@ -810,11 +809,6 @@ class DefaultFrameBuilderTests(unittest.TestCase):
         np.testing.assert_allclose(frame["action"], [1.0, 0.0])
         self.assertEqual(writer.episode_boundaries, [1])
 
-    def test_task_defaults_to_reach_target_without_a_task_description(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
-        writer = self._collect(simulator)
-        self.assertEqual(writer.frames[0]["task"], "reach target")
-
     def test_a_frame_builder_must_return_a_single_mapping(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
         with self.assertRaises(TypeError):
@@ -849,7 +843,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             metrics = collect_dagger_rollouts(
                 simulator=simulator,
-                expert_planner=CasadiPlanner(simulator, dict(self.config)),
+                expert_planner=CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(self.config))),
                 dataset_writer=writer,
                 trajectories_per_iteration=1,
                 steps_per_trajectory=3,
@@ -893,9 +887,13 @@ class RolloutsWithTheArmTests(unittest.TestCase):
 
     def test_evaluate_policy_rollouts_queries_the_policy_through_build_policy_action(self) -> None:
         simulator = self.simulator
-        policy = FlowPolicy(
-            action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2),
-            prediction_horizon=4, num_inference_steps=2,
+        policy = PolicyFactory.create(
+            PolicySpec(
+                policy_type="flow", action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx,
+                prediction_horizon=4, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+                action_scale=tuple(simulator.max_action.tolist()),
+            ),
+            simulator,
         ).eval()
         actions: list[np.ndarray] = []
 
@@ -935,7 +933,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         metrics_by_workers = []
         for num_workers, writer in zip((1, 2), writers):
             simulator = FrankaSystem(config)
-            planner = CasadiPlanner(simulator, dict(config))
+            planner = CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(config)))
             with contextlib.redirect_stdout(io.StringIO()):
                 metrics = collect_dagger_rollouts(
                     simulator=simulator,

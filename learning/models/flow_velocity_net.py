@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -81,12 +82,8 @@ class FlowVelocityNet(nn.Module):
                 )
             if bool((~torch.isfinite(action_scale_tensor)).any() or (action_scale_tensor <= 0).any()):
                 raise ValueError("'action_scale' entries must all be finite and positive.")
-        # Non-persistent: this is config-derived (the fleet's own max_action),
-        # not learned, and every current caller already reconstructs it from
-        # scratch at both train and eval time via checkpoint metadata rather
-        # than through load_state_dict -- keeping it out of state_dict()
-        # avoids a checkpoint saved before this option existed suddenly
-        # gaining an unexpected key.
+        # Non-persistent: it is derived from the config (the system's max_action), not learned, and rebuilt from the
+        # checkpoint metadata at both train and eval time rather than loaded with the state dict.
         self.register_buffer("action_scale", action_scale_tensor, persistent=False)
 
         self._flow_time_distribution = torch.distributions.Beta(torch.tensor(TIME_BETA_ALPHA), torch.tensor(TIME_BETA_BETA))
@@ -129,24 +126,30 @@ class FlowVelocityNet(nn.Module):
         return F.mse_loss(pred_velocity, target_velocity.flatten(1))
 
     @torch.no_grad()
-    def integrate(self, obs_cond: torch.Tensor) -> torch.Tensor:
-        batch_size = obs_cond.shape[0]
-        device = obs_cond.device
+    def integrate(
+        self,
+        obs_cond: torch.Tensor,
+        correct: Callable[[np.ndarray], np.ndarray],
+        initial: np.ndarray | None = None,
+    ) -> torch.Tensor:
+        """Euler integration of the flow for the one observation ``obs_cond`` (1, obs_cond_dim), in physical action units.
 
-        x = torch.randn(
-            batch_size, self.prediction_horizon, self.action_dim, device=device, dtype=obs_cond.dtype
-        )
-
+        The flow starts from Gaussian noise, or from the chunk ``initial`` (H, action_dim). After every step the iterate
+        is handed to ``correct`` (guidance, projection) as a chunk in physical units, and what it returns is the next
+        iterate. The integration runs in the normalized space ``compute_loss`` trains in: only what ``correct`` sees and
+        returns is rescaled by ``action_scale``.
+        """
+        if obs_cond.shape[0] != 1:
+            raise ValueError(f"The integration serves one system, so the batch must hold one row, got {obs_cond.shape[0]}.")
+        scale = self.action_scale.detach().cpu().numpy()
+        if initial is None:
+            x = torch.randn(1, self.prediction_horizon, self.action_dim, device=obs_cond.device, dtype=obs_cond.dtype)
+        else:
+            x = torch.tensor(initial / scale, device=obs_cond.device, dtype=obs_cond.dtype).unsqueeze(0)
         dt = 1.0 / float(self.num_inference_steps)
-
         for step in range(self.num_inference_steps):
-            t_val = step * dt
-            t_tensor = torch.full((batch_size,), t_val, device=device, dtype=obs_cond.dtype)
-            pred_velocity = self.predict_velocity(x.flatten(1), obs_cond, t_tensor)
-            pred_velocity = pred_velocity.view(batch_size, self.prediction_horizon, self.action_dim)
-            x.add_(pred_velocity, alpha=dt)
-
-        # x was integrated entirely in the normalized space compute_loss trains
-        # in -- rescale back to physical action units before returning, since
-        # every caller (apply_execution_noise, simulator.step, ...) expects those.
+            t_tensor = torch.full((1,), step * dt, device=obs_cond.device, dtype=obs_cond.dtype)
+            velocity = self.predict_velocity(x.flatten(1), obs_cond, t_tensor).view_as(x)
+            corrected = correct((x + dt * velocity)[0].detach().cpu().numpy() * scale)
+            x = torch.tensor(corrected / scale, device=obs_cond.device, dtype=obs_cond.dtype).unsqueeze(0)
         return x * self.action_scale

@@ -1,11 +1,10 @@
 import warnings
-from typing import Any, Mapping
-
 import casadi as ca
 import numpy as np
 
 from planning.casadi_graph import CasadiKinematicGraph, GraphSolution
 from planning.planner import PlannerSolveError
+from planning.planner_config import PlannerConfig
 from systems.triple_integrator import TripleIntegratorBase
 
 
@@ -65,15 +64,14 @@ class CasadiTrajectoryProjector:
     from the state held still; if that fails too, the previous safe solution is the fallback (see above).
     """
 
-    def __init__(self, simulator: TripleIntegratorBase, config: Mapping[str, Any], *, horizon: int):
+    def __init__(self, simulator: TripleIntegratorBase, config: PlannerConfig, *, horizon: int):
         # The chunk length is the flow policy's prediction horizon, not the expert's ``horizon``
         if int(horizon) < 1:
             raise ValueError("'horizon' must be at least 1.")
-        # The scalars of the validated config (planning/config.py), used as they are
-        self.terminal_velocity_weight = float(config["terminal_velocity_weight"])
+        self.terminal_velocity_weight = config.terminal_velocity_weight
         # How close to zero the rest velocity and acceleration of a reused trajectory must be
-        self.fallback_terminal_velocity_tol = float(config["fallback_terminal_velocity_tol"])
-        self.max_consecutive_fallbacks = int(config["max_consecutive_fallbacks"])
+        self.fallback_terminal_velocity_tol = config.fallback_terminal_velocity_tol
+        self.max_consecutive_fallbacks = config.max_consecutive_fallbacks
         self.sim = simulator
         self.tracked_horizon = self.N = int(horizon)
         self.rest_idx = list(self.sim.rest_state_indices)

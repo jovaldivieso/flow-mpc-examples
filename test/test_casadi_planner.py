@@ -17,6 +17,7 @@ from planning.casadi_planner import CasadiPlanner
 from systems.rollout_termination import RolloutTerminationTracker
 from planning.initial_guess import InitialGuessGenerator
 from planning.planner import Plan, PlannerSolveError
+from planning.planner_config import PlannerConfig
 from test.planner_fixtures import initial_guess, pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
@@ -40,7 +41,7 @@ def _build(**overrides) -> tuple[FrankaSystem, CasadiPlanner, dict]:
     raw_config.update(overrides)
     validated = validate_system_config(raw_config=raw_config)
     simulator = FrankaSystem(validated)
-    return simulator, CasadiPlanner(simulator, dict(validated)), validated
+    return simulator, CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(validated))), validated
 
 
 def _first_action(planner: CasadiPlanner, simulator: FrankaSystem, state: np.ndarray) -> np.ndarray:
@@ -210,13 +211,13 @@ class PlannerBehaviorTests(unittest.TestCase):
         for key, value in (("Q_diag", [1.0] * 13), ("R_diag", [1.0] * 6)):
             with self.subTest(key=key):
                 with self.assertRaises(ValueError):
-                    CasadiPlanner(simulator, {**validated, key: value})
+                    CasadiPlanner(simulator, PlannerConfig.from_mapping({**validated, key: value}))
 
     def test_omitted_diagonals_default_to_the_weights_of_the_dimensions(self) -> None:
         simulator, _, validated = _build()
         omitted = {key: value for key, value in validated.items() if key not in ("Q_diag", "R_diag")}
 
-        planner = CasadiPlanner(simulator, {**omitted, "R_weight": 0.3})
+        planner = CasadiPlanner(simulator, PlannerConfig.from_mapping({**omitted, "R_weight": 0.3}))
 
         np.testing.assert_array_equal(planner.Q, 10.0 * np.eye(simulator.nx))
         np.testing.assert_array_equal(planner.R, 0.3 * np.eye(simulator.nu))
@@ -379,7 +380,7 @@ class InitialGuessGeneratorTests(unittest.TestCase):
         q_goal = simulator.goal_configuration(simulator.goal, state[: simulator.n])
         positions = np.linspace(state[: simulator.n], q_goal, 12)
         generator = _StubGenerator(Plan(positions=positions) if plan_to_goal else None)
-        return simulator, CasadiPlanner(simulator, dict(validated), initial_guess_generator=generator), generator, state, q_goal
+        return simulator, CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(validated)), initial_guess_generator=generator), generator, state, q_goal
 
     def test_the_end_of_the_generators_plan_is_the_goal_configuration_the_solve_starts_from_the_plan(self) -> None:
         simulator, planner, generator, state, q_goal = self._planner_and_state()
@@ -426,7 +427,7 @@ class InitialGuessGeneratorTests(unittest.TestCase):
         from planning.casadi_projector import CasadiTrajectoryProjector
 
         simulator, planner, validated = _build()
-        projector = CasadiTrajectoryProjector(simulator, validated, horizon=5)
+        projector = CasadiTrajectoryProjector(simulator, PlannerConfig.from_mapping(validated), horizon=5)
 
         for problem in (planner, projector):
             self.assertIsInstance(problem._graph, CasadiKinematicGraph)

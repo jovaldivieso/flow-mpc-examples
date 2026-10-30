@@ -16,6 +16,7 @@ from planning.planner_factory import PlannerFactory
 from planning.ompl_initial_guess import OmplInitialGuess
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, Planner
+from planning.planner_config import PlannerConfig, OmplConfig
 from test.planner_fixtures import pinned_config
 
 N = 7
@@ -31,8 +32,8 @@ class PlannerInterfaceTests(unittest.TestCase):
 
     def _planners(self) -> list[Planner]:
         return [
-            CasadiPlanner(self.simulator, self.config),
-            OmplPlanner(self.simulator, self.config),
+            CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)),
+            OmplPlanner(self.simulator, OmplConfig.from_mapping(self.config)),
             PlannerFactory.create("ompl_casadi", self.simulator, self.config),
         ]
 
@@ -92,12 +93,12 @@ class PlannerInterfaceTests(unittest.TestCase):
             Plan(positions=np.zeros((3, 2))).first_actions(2)
 
     def test_a_planner_keeps_no_statistics_unless_it_says_so(self) -> None:
-        self.assertEqual(OmplPlanner(self.simulator, self.config).statistics, {})
-        self.assertEqual(CasadiPlanner(self.simulator, self.config).statistics, {"trajectory_optimizations": 0})
+        self.assertEqual(OmplPlanner(self.simulator, OmplConfig.from_mapping(self.config)).statistics, {})
+        self.assertEqual(CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).statistics, {"trajectory_optimizations": 0})
         ompl_casadi = PlannerFactory.create("ompl_casadi", self.simulator, self.config)
         self.assertIn("ompl_paths", ompl_casadi.statistics)
         self.assertIsInstance(ompl_casadi.initial_guess_generator, OmplInitialGuess)
-        self.assertIsNone(CasadiPlanner(self.simulator, self.config).initial_guess_generator)
+        self.assertIsNone(CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).initial_guess_generator)
 
 
 if __name__ == "__main__":

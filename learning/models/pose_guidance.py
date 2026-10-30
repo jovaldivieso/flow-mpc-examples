@@ -38,6 +38,11 @@ class PoseGuidance:
         self._start_distance: float | None = None
         self._correction = self._correction_map()
 
+    @property
+    def max_action(self) -> np.ndarray:
+        """The jerk limits of the system the guidance serves."""
+        return self.sim.max_action
+
     def reset(self) -> None:
         """A new episode: the start distance is the one of its first call."""
         self._start_distance = None

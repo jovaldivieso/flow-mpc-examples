@@ -12,6 +12,17 @@ class SystemSimulator(ABC):
 
     task_description = "reach target"
 
+    @classmethod
+    @abstractmethod
+    def config_keys(cls) -> set[str]:
+        """The keys a config of this system may set."""
+
+    @classmethod
+    @abstractmethod
+    def validate_config(cls, raw_config: Mapping[str, Any]) -> dict[str, Any]:
+        """The normalized fields of the system in a raw config (limits, tolerances, sampling, obstacles, goal); raises
+        ``ConfigurationError`` for what is missing or malformed."""
+
     def __init__(self, config: Mapping[str, Any]):
         self.config = config
         self.dt = float(config.get("dt", 0.05))

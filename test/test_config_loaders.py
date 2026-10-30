@@ -47,12 +47,9 @@ def _write_model_config(model_yaml_lines: list[str]) -> Path:
 
 
 class LoadDaggerTrainingConfigTests(unittest.TestCase):
-    """Regression coverage for the 'training:' section's key allowlist --
-    DEFAULT_DAGGER_TRAINING_CONFIG is the single source of truth for which
-    keys a policy YAML may set; DaggerConfig/collect_dagger_rollouts tests
-    never exercise this loader directly, so a field added everywhere else
-    but here still fails at CLI startup with 'Unknown key(s) in policy
-    config' -- exactly what happened before this file existed.
+    """The 'training:' section's key allowlist -- DEFAULT_DAGGER_TRAINING_CONFIG is the single source of truth for
+    which keys a policy YAML may set; a field added everywhere else but there fails at CLI startup with 'Unknown
+    key(s) in policy config'.
     """
 
     def test_every_dagger_config_field_used_by_train_dagger_is_a_known_key(self) -> None:
@@ -74,9 +71,8 @@ class LoadDaggerTrainingConfigTests(unittest.TestCase):
         }
         self.assertEqual(expected_keys, set(DEFAULT_DAGGER_TRAINING_CONFIG))
 
-    def test_removed_beta_keys_are_rejected(self) -> None:
-        # Legacy decay/recovery keys were replaced by explicit expert_beta_per_iteration;
-        # a policy YAML that still sets them must fail loudly instead of being silently ignored.
+    def test_unknown_beta_keys_are_rejected(self) -> None:
+        # The beta schedule is expert_beta_per_iteration; any other beta key must fail loudly instead of being ignored.
         for key in (
             "expert_mix_beta_start",
             "expert_mix_beta_end",

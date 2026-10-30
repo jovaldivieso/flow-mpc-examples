@@ -17,6 +17,7 @@ from planning.casadi_planner import CasadiPlanner
 from planning.casadi_graph import GraphSolution
 from planning.casadi_projector import CasadiTrajectoryProjector
 from planning.planner import PlannerSolveError
+from planning.planner_config import PlannerConfig
 from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
@@ -76,7 +77,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # constraint, and these tests need a genuinely resting cached
         # trajectory to fall back on.
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, config, horizon=HORIZON)
+        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(config), horizon=HORIZON)
         self.state0 = _rest_state(self.simulator)
         self.q_ref = _zero_chunk()
 
@@ -181,7 +182,7 @@ class FallbackRevalidationTests(unittest.TestCase):
     def setUp(self) -> None:
         config = _validated_config(terminal_velocity_weight=500.0)
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, config, horizon=HORIZON)
+        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(config), horizon=HORIZON)
         self.state0 = _rest_state(self.simulator)
         self.u_rest = np.zeros((self.simulator.nu, HORIZON))
 
@@ -201,7 +202,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.config = _validated_config()
         cls.simulator = FrankaSystem(cls.config)
-        cls.projector = CasadiTrajectoryProjector(cls.simulator, cls.config, horizon=HORIZON)
+        cls.projector = CasadiTrajectoryProjector(cls.simulator, PlannerConfig.from_mapping(cls.config), horizon=HORIZON)
 
     def test_projection_of_a_resting_reference_at_rest_stays_put(self) -> None:
         self.projector.reset()
@@ -232,7 +233,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
 
     def test_unit_gaussian_noise_is_projected_without_failing(self) -> None:
         # The flow starts from noise like this (scaled by the action limits): the cold start must not begin inside
-        # the constraints, where the solver used to end in a locally infeasible point for most draws
+        # the constraints, where the solver ends in a locally infeasible point
         simulator = self.simulator
         state = _rest_state(simulator)
         for seed in range(6):
@@ -247,7 +248,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         # A proposal that drives joint 5 into its upper limit at full jerk
         joint = 4
         simulator = FrankaSystem(self.config)
-        projector = CasadiTrajectoryProjector(simulator, self.config, horizon=HORIZON)
+        projector = CasadiTrajectoryProjector(simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
         state = _rest_state(simulator)
         upper = simulator.state_upper_bounds[joint]
         state[joint] = upper - 0.3
@@ -263,7 +264,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         simulator = self.simulator
         simulator.set_goal(pose_goal(simulator, Q_READY))
         state = _rest_state(simulator)
-        reference = CasadiPlanner(simulator, self.config).plan(simulator.observe(state)).actions[:HORIZON]
+        reference = CasadiPlanner(simulator, PlannerConfig.from_mapping(self.config)).plan(simulator.observe(state)).actions[:HORIZON]
         self.projector.reset()
 
         projected = self.projector.project(state, reference)
@@ -271,7 +272,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         np.testing.assert_allclose(projected, reference, atol=0.15 * simulator.max_action.max())
 
     def test_the_next_chunk_guess_is_the_actions_shifted_by_one_step(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
+        projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
         self.assertIsNone(projector.next_chunk_guess())
         state = _rest_state(self.simulator)
         projected = projector.project(state, _moving_chunk())
@@ -290,7 +291,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
             self.projector.project(state, _zero_chunk().T)
 
     def test_short_horizon_constructs_and_solves(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=2)
+        projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=2)
         state = _rest_state(self.simulator)
         projected = projector.project(state, _zero_chunk(2))
         self.assertEqual(projected.shape, (2, self.simulator.nu))
@@ -301,8 +302,8 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         simulator = FrankaSystem(self.config)
         other = FrankaSystem(self.config)
         other.set_goal(np.zeros_like(other.goal))
-        projector = CasadiTrajectoryProjector(other, self.config, horizon=HORIZON)
-        reference = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
+        projector = CasadiTrajectoryProjector(other, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
+        reference = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
         state = _rest_state(simulator)
         u_ref = np.random.default_rng(5).normal(0.0, 0.3, (HORIZON, simulator.nu)) * simulator.max_action
         np.testing.assert_allclose(
@@ -314,7 +315,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
     def test_a_projector_needs_a_horizon(self) -> None:
         # Its scalar settings are validated when the config is loaded (test_planner_config)
         with self.assertRaises(ValueError):
-            CasadiTrajectoryProjector(self.simulator, self.config, horizon=0)
+            CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=0)
 
     def test_projector_pushes_an_obstacle_colliding_proposal_outside_the_sphere(self) -> None:
         state = _rest_state(self.simulator)
@@ -327,7 +328,7 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         self.assertTrue(obs_sim.collision.is_collision_free(state))
         self.assertFalse(obs_sim.collision.is_collision_free(rollout_q[-1]))
 
-        projector = CasadiTrajectoryProjector(obs_sim, obs_config, horizon=HORIZON)
+        projector = CasadiTrajectoryProjector(obs_sim, PlannerConfig.from_mapping(obs_config), horizon=HORIZON)
         projected = projector.project(state, proposal)
         projected_q = obs_sim.rollout_positions(state, projected)
         for q in projected_q[1:]:
@@ -345,7 +346,7 @@ class PerStepProjectionTests(unittest.TestCase):
             obstacles=[{"position": FrankaSystem(_validated_config()).tcp_position(rollout_q[-1]).tolist(), "radius": 0.05}],
         )
         self.simulator = FrankaSystem(self.config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
+        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
 
     def test_the_obstacles_are_linearized_at_every_step(self) -> None:
         real_halfspaces = self.simulator.collision.halfspaces

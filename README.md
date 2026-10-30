@@ -34,17 +34,20 @@ flow-mpc-examples/
 │   ├── system.py                # SystemSimulator: the plant, goal, observations and the policy's view of them (no dataset or rollout state)
 │   ├── sphere_collision.py      # SphereCollisionModel: the obstacles, the sphere collision check and the linearized half-spaces of a system
 │   ├── rollout_termination.py   # RolloutTerminationTracker: ends a rollout once the goal has held for done_hold_steps
-│   ├── system_factory.py        # SystemFactory: registry of the systems the config chooses from
+│   ├── system_factory.py        # SystemFactory: registry of the systems the config chooses from, which also validates their config fields
+│   ├── config_fields.py         # The readers of the fields of a config mapping (types, ranges, known keys) and ConfigurationError
 │   ├── franka_system.py         # 7-joint FR3, gripper as fixed geometry: kinematic plant, dataset schema, sampling
+│   ├── franka_config.py         # The config of the FR3: its constants and the validation of its fields (limits, tolerances, start and goal regions)
 │   ├── franka_model.py          # The FR3 as a Pinocchio model: xacro/URDF expansion, locked fingers, SafeFlowMPC's joint limits
 │   ├── franka_kinematics.py     # CasADi kinematics generated from that model (built once): TCP forward kinematics, link bounding spheres, SafeFlowMPC's IK problem (IPOPT)
 │   ├── collision_spheres.py     # Bounding spheres fitted to the collision meshes (they cover the real geometry, hand and fingers included)
-│   ├── triple_integrator.py     # TripleIntegratorBase: the shared triple-integrator core (plant, limits, goal, obstacles, start sampling)
+│   ├── triple_integrator.py     # TripleIntegratorBase: the shared triple-integrator core (plant limits, goal, obstacles, start sampling)
 │   ├── point_mass_system.py     # PointMassSystem: a point mass, a toy system to calibrate the pipeline
 │   ├── initial_state_utils.py   # Initial/goal-state parsing and normalization
 │   └── seed_utils.py            # Seed defaults and deterministic rollout seeding
 ├── planning/
-│   ├── config.py                # Typed validation and normalized YAML loading of the expert config
+│   ├── config.py                # Validation and normalized YAML loading of the expert config: the planner fields, and the system's through SystemFactory
+│   ├── planner_config.py        # PlannerConfig and OmplConfig: the typed settings of the planners and the projector
 │   ├── planner.py               # The one abstract Planner (observation [, initial plan] -> Plan: joint positions and jerks)
 │   ├── casadi_graph.py          # CasadiKinematicGraph: the stage-wise OCP skeleton (FATROP) the MPC and the projector share (dynamics, limits, obstacle half-spaces)
 │   ├── initial_guess.py         # InitialGuessGenerator: the strategy interface of the optional initial guess of the MPC
@@ -58,18 +61,18 @@ flow-mpc-examples/
 │   ├── config/                  # Policy + DAgger schedule configs (flow, safeflow)
 │   ├── models/
 │   │   ├── temporal_unet.py     # SafeFlowMPC's temporal U-Net (1D convolutions over the horizon), without its attention layers
-│   │   ├── flow_velocity_net.py # Flow-matching loss and Euler integration around the U-Net
+│   │   ├── flow_velocity_net.py # Flow-matching loss and the one Euler integration (with a per-step correction) around the U-Net
 │   │   ├── flow_policy.py       # FlowVelocityNet conditioned directly on [goal, state]
 │   │   ├── exponential_moving_average.py  # Exponential moving average of the weights
 │   │   ├── pose_guidance.py     # Goal-pose guidance of the flow's proposals (SafeFlowMPC, Eq. 9)
 │   │   ├── safe_flow_policy.py  # Flow policy + CasADi safety projection at inference (SafeFlowMPC)
 │   │   ├── policy.py            # Shared policy interface
-│   │   └── policy_factory.py    # PolicyFactory: builds the flow or safeflow policy from its type
+│   │   └── policy_factory.py    # PolicySpec and PolicyFactory: a registry that builds the flow or safeflow policy from a spec
 │   ├── data_utils.py            # LeRobot dataset adapter: features and frames of a system's dataset, policy batch formatting (flat dataset action -> (prediction_horizon, nu) chunk)
-│   ├── dagger/                  # config, trainer, metrics, utils; rollouts: RolloutCollector, RolloutEvaluator and the RolloutWorker of a process pool
+│   ├── dagger/                  # config, trainer, round summary, metrics, utils; collection.py (RolloutCollector), evaluation.py (RolloutEvaluator), workers.py (the RolloutWorker of a process pool), episode_starts.py, policy_action.py
 │   └── train_dagger.py          # CLI: parses args, builds DaggerConfig, runs DaggerTrainer
 ├── scripts/
-│   ├── config/                  # Expert configs (casadi, ompl_casadi, the cluttered ompl_casadi evaluation environment; point mass)
+│   ├── config/                  # Expert configs (casadi, ompl_casadi, the ompl_casadi table scene; point mass)
 │   ├── evaluate_policy.py       # Expert vs policy rollouts and metrics
 │   ├── meshcat_expert.py        # Expert check before DAgger: random rollouts, statistics, Meshcat playback
 │   ├── meshcat_utils.py         # Shared Meshcat drawing helpers
@@ -102,22 +105,22 @@ venv/bin/python learning/train_dagger.py --experiment-name toy_flow \
 
 ### Expert config (`scripts/config/franka_casadi_config.yaml`)
 
-The expert config holds the system and planner parameters, validated through [planning/config.py](planning/config.py) (unknown keys, wrong types and impossible values are rejected before anything runs; the config does not know the system's dimensions, so `CasadiPlanner` checks the lengths of `Q_diag` and `R_diag` and completes them when omitted):
+The expert config holds the system and planner parameters, validated through [planning/config.py](planning/config.py) (the system's own fields by the system class, `validate_config`) (unknown keys, wrong types and impossible values are rejected before anything runs; the config does not know the system's dimensions, so `CasadiPlanner` checks the lengths of `Q_diag` and `R_diag` and completes them when omitted):
 
 - planner: `dt`, `horizon` (the expert MPC's own horizon), `Q_diag` (positive, 21 for the arm, one per state: the position, velocity and acceleration error to the goal state; default 10 each), `R_diag` (positive, 7, one per joint: the squared jerk; default `R_weight` each), `terminal_cost_multiplier`
-- projector: `terminal_velocity_weight`, `fallback_terminal_velocity_tol`, `max_consecutive_fallbacks` (read by `CasadiTrajectoryProjector`, defaults in `planning/config.py`)
+- projector: `terminal_velocity_weight`, `fallback_terminal_velocity_tol`, `max_consecutive_fallbacks` (read by `CasadiTrajectoryProjector`, defaults in `planning/planner_config.py`)
 - `expert`: the expert planner, a name of the registry in [planning/planner_factory.py](planning/planner_factory.py) (`PlannerFactory`): `casadi` (the MPC) or `ompl_casadi` (the same MPC with the end of an OMPL path as its goal configuration, starting from the path); a new planner is one more entry
 - OMPL path (`OmplConfig`, for `ompl_casadi`): the `ompl_*` settings (`ompl_speed`, `ompl_replan_distance`, `ompl_timeout`, `ompl_seed`), see below
 - arm: `max_acceleration` and `max_jerk` (each a scalar or 7 per-joint limits; the joint position and velocity limits come from the description)
 - tolerances: `pos_tol` [m, TCP to goal position], `vel_tol` [rad/s] (what counts as "reached the goal and at rest"), `done_hold_steps`
 - `obstacles`: static spherical obstacles in the world frame, a list of `position` and `radius` [m] (see "Obstacles")
-- sampling: `min_start_goal_distance` [m, TCP to goal position], `goal` (a pose: position and a row-major rotation matrix, 12 numbers) / `randomize_goal` (omit `goal` to randomize it every episode), `initial_state_seed`, `action_noise_seed`
+- sampling: `min_start_goal_distance` [m, TCP to goal position], `goal` (a pose: position and a row-major rotation matrix, 12 numbers) / `randomize_goal` (omit `goal` to randomize it every episode), `initial_state_seed`, `action_noise_seed` `start_region` / `goal_region` (optional TCP boxes, `x`, `y`, `z` each as [min, max], that the random starts and goals are sampled in instead of the whole workspace; `goal_region` may also have a `tool_axis` (a world direction) and `tool_tilt` [rad]: the goal's hand then points along that axis, found by inverse kinematics, as it must to reach under a table). `scripts/config/franka_ompl_casadi_table_config.yaml` is such a scene: a table of 10 spheres with the starts above it and the goals underneath, so every episode has to go around it.
 
 **The experts.** `casadi` is the MPC alone: it heads for the goal configuration `q_goal` (the inverse kinematics solution of the goal pose seeded from `Q_READY`), solved as a convex QP with FATROP at every step from the previous solution shifted by one step. With `expert: ompl_casadi` the expert is the same `CasadiPlanner`, composed with an `OmplInitialGuess` (an `InitialGuessGenerator` strategy): the goal configuration is the end of an OMPL path and the first solve starts from that path. For a goal, `OmplPlanner` plans an RRT-Connect path to `q_goal` (inside the joint limits, collision-free, simplified, deterministic given `ompl_seed`, which the entry points pass to `initialize_ompl` once) and returns it as a `Plan`, timed at the constant joint speed `ompl_speed`. Later solves start from the previous solution again, unless the arm is further than `ompl_replan_distance` rad from it (the learner drove it away): then a new path is planned from where it is. If the MPC solve that started from a path fails, the path is the plan (`trajectory_fallbacks`); if no path is found (for example the arm starts in collision) the MPC runs as it does alone (`ompl_path_failures`). The path alone is no expert: a jerk-limited arm cannot follow it step by step.
 
 ### Obstacles
 
-The obstacles are static spheres. The arm is covered by bounding spheres fitted to its collision meshes (`systems/collision_spheres.py`: the meshes are split recursively along their principal axis until a minimal enclosing ball has a radius of at most 8 cm, so the hand and the fingers are covered too). Everything that plans or filters keeps these spheres clear of the obstacles: the MPC and the projector as linearized half-spaces `n^T J_s(q_ref) q >= b` per sphere, obstacle and node with a slack per sphere and node (shared by its obstacles) penalized by 1e5 (the solution is linearized again once if it still penetrates), and OMPL as its validity check. The evaluation counts a collision as a touch of the real collision meshes with an obstacle, which the spheres cover; the DAgger collection does not check for collisions. The policy does not observe the obstacles: they act through the expert's labels and the projector, so one checkpoint can be evaluated with any `obstacles` list. FATROP's time grows linearly with the obstacles (an MPC step takes about 3 ms without obstacles, 12 with 1, 19 with 3 and 29 with 6 on an Apple-silicon laptop; ProxQP, which this replaced, took seconds from 4 obstacles on). `scripts/config/franka_ompl_casadi_cluttered_config.yaml` is `franka_ompl_casadi_config.yaml` with 5 obstacles (its 2 and 3 more, at other depths, left-right displacements and heights), to evaluate how a policy trained in the latter generalizes, as `flow` or as `safeflow` (`--policy-type safeflow`).
+The obstacles are static spheres. The arm is covered by bounding spheres fitted to its collision meshes (`systems/collision_spheres.py`: the meshes are split recursively along their principal axis until a minimal enclosing ball has a radius of at most 8 cm, so the hand and the fingers are covered too). Everything that plans or filters keeps these spheres clear of the obstacles: the MPC and the projector as linearized half-spaces `n^T J_s(q_ref) q >= b` per sphere, obstacle and node with a slack per sphere and node (shared by its obstacles) penalized by 1e5 (the solution is linearized again once if it still penetrates), and OMPL as its validity check. The evaluation counts a collision as a touch of the real collision meshes with an obstacle, which the spheres cover; the DAgger collection does not check for collisions. The policy does not observe the obstacles: they act through the expert's labels and the projector, so one checkpoint can be evaluated with any `obstacles` list. FATROP's time grows linearly with the obstacles (an MPC step takes about 3 ms without obstacles, 12 with 1, 19 with 3 and 29 with 6 on an Apple-silicon laptop).
 
 ### Training and curriculum config (`learning/config/`)
 

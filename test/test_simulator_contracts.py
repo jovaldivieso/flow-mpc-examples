@@ -17,7 +17,8 @@ sys.path.insert(0, PROJECT_ROOT)
 
 import torch
 
-from planning.config import ConfigurationError, load_and_validate_system_config, validate_system_config
+from planning.config import load_and_validate_system_config, validate_system_config
+from systems.config_fields import ConfigurationError
 from learning.data_utils import build_dataset_features, format_dataset_frame
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
@@ -30,7 +31,7 @@ from systems.franka_model import build_robot
 from systems.point_mass_system import PointMassSystem
 from systems.sphere_collision import SphereCollisionModel
 from systems.triple_integrator import TripleIntegratorBase
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.planner_factory import PlannerFactory
 from test.planner_fixtures import pose_goal
 
@@ -366,7 +367,7 @@ class CollisionModelTests(unittest.TestCase):
         self.assertGreater(collisions, 50)  # the sample does reach the obstacles
 
     def test_the_hand_and_fingers_count_not_only_the_axis_of_the_arm(self) -> None:
-        # an obstacle beside the hand, 9 cm off the axis of the TCP frame: outside the old on-axis spheres, inside the hand
+        # an obstacle beside the hand, 9 cm off the axis of the TCP frame: outside spheres on the axis alone, inside the hand
         simulator = _build_simulator()
         placement = simulator.tcp_placement(Q_READY)
         beside_the_hand = placement.act(np.array([0.0, 0.09, -0.08]))
@@ -551,6 +552,65 @@ class SamplingTests(unittest.TestCase):
             simulator.random_initial_state(np.random.default_rng(0))
 
 
+TABLE = [{"position": [x, y, 0.50], "radius": 0.10} for x in (0.40, 0.54) for y in (-0.28, -0.14, 0.0, 0.14, 0.28)]
+START_REGION = {"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.70, 0.90]}
+GOAL_REGION = {"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.15, 0.34], "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4}
+
+
+def _in_region(point: np.ndarray, region: dict) -> bool:
+    return all(region[axis][0] <= value <= region[axis][1] for axis, value in zip("xyz", point))
+
+
+class RegionSamplingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.simulator = _build_simulator(obstacles=TABLE, start_region=START_REGION, goal_region=GOAL_REGION)
+
+    def test_without_regions_the_workspace_and_any_hand_orientation_are_sampled(self) -> None:
+        simulator = _build_simulator()
+
+        self.assertEqual(simulator.start_region, WORKSPACE_BOUNDS)
+        self.assertEqual(simulator.goal_region, WORKSPACE_BOUNDS)
+        self.assertIsNone(simulator.goal_tool_axis)
+
+    def test_starts_are_collision_free_with_the_tcp_in_the_start_region(self) -> None:
+        simulator = self.simulator
+        for seed in range(5):
+            rng = np.random.default_rng(seed)
+            simulator.randomize_goal_for_reset(rng)
+            q = simulator.random_initial_state(rng)[: simulator.n]
+
+            self.assertTrue(_in_region(simulator.tcp_position(q), START_REGION))
+            self.assertTrue(simulator.collision.is_collision_free(q))
+
+    def test_goals_are_in_the_goal_region_with_the_hand_along_the_tool_axis_and_reached_without_a_collision(self) -> None:
+        simulator = self.simulator
+        for seed in range(5):
+            simulator.randomize_goal_for_reset(np.random.default_rng(seed))
+            position, rotation = simulator.goal[:3], simulator.goal[3:].reshape(3, 3)
+
+            self.assertTrue(_in_region(position, GOAL_REGION))
+            np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-9)
+            self.assertAlmostEqual(np.linalg.det(rotation), 1.0)
+            self.assertGreaterEqual(rotation[:, 2] @ np.array([1.0, 0.0, 0.0]), np.cos(GOAL_REGION["tool_tilt"]) - 1e-9)
+            q_goal = simulator.goal_configuration(simulator.goal)
+            self.assertTrue(simulator.collision.is_collision_free(q_goal))
+            np.testing.assert_allclose(simulator.tcp_position(q_goal), position, atol=1e-3)
+
+    def test_a_goal_region_without_a_tool_axis_samples_the_pose_of_a_configuration_in_its_box(self) -> None:
+        box = {"x": [0.40, 0.60], "y": [-0.2, 0.2], "z": [0.55, 0.75]}
+        simulator = _build_simulator(goal_region=box)
+        simulator.randomize_goal_for_reset(np.random.default_rng(0))
+
+        self.assertIsNone(simulator.goal_tool_axis)
+        self.assertTrue(_in_region(simulator.goal[:3], box))
+
+    def test_an_empty_region_raises_instead_of_looping_forever(self) -> None:
+        simulator = _build_simulator(start_region={"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.45, 0.55]}, obstacles=TABLE)
+        with self.assertRaises(RuntimeError):
+            simulator.random_initial_state(np.random.default_rng(0))
+
+
 POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_casadi_config.yaml")
 # The tests pin the dimension they assume, so scaling the shipped config up does not break them
 POINT_MASS_SETTINGS = {"dimension": 2, "Q_diag": [20.0, 20.0, 2.0, 2.0, 0.2, 0.2], "R_diag": [1.0e-2, 1.0e-2]}
@@ -689,13 +749,13 @@ class PointMassSystemTests(unittest.TestCase):
         simulator.randomize_goal_for_reset(np.random.default_rng(0))
         observation = simulator.policy_observation(simulator.observe(np.concatenate([simulator.goal, np.zeros(4)])))
         batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
-        for policy_type, extra in (("flow", {"simulator": simulator}), ("safeflow", {"simulator": simulator, "planner_config": self.config})):
+        for policy_type in PolicyFactory.names():
             with self.subTest(policy_type=policy_type):
-                policy = PolicyFactory.create(
-                    policy_type, action_dim=2, state_dim=sum(value.shape[0] for value in observation.values()),
-                    unet_dim=8, unet_dim_mults=(1, 2),
-                    prediction_horizon=CHUNK, num_inference_steps=2, action_scale=[1.0, 1.0], **extra,
-                ).eval()
+                spec = PolicySpec(
+                    policy_type=policy_type, action_dim=2, state_dim=sum(value.shape[0] for value in observation.values()),
+                    prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2, action_scale=(1.0, 1.0),
+                )
+                policy = PolicyFactory.create(spec, simulator, self.config).eval()
                 self.assertEqual(tuple(policy.select_action(batch).shape), (1, CHUNK, 2))
 
     def test_the_config_rejects_what_a_point_mass_has_no_use_for(self) -> None:

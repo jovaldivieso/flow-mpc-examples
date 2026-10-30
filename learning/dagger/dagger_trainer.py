@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import copy
 import gc
-from collections import Counter
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 import torch
-import yaml
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -21,12 +19,16 @@ from systems.seed_utils import default_action_noise_seed_for_config
 from learning.data_utils import build_dataset_features, create_collate_fn
 from learning.models.exponential_moving_average import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy
-from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.planner_factory import PlannerFactory
 
 from .dagger_config import DaggerConfig
 from .metrics import DaggerEvalMetrics
-from .rollouts import RolloutWorkerSpec, build_policy_action, collect_dagger_rollouts, evaluate_policy_rollouts
+from .collection import collect_dagger_rollouts
+from .evaluation import evaluate_policy_rollouts
+from .policy_action import build_policy_action
+from .round_summary import append_round_summary
+from .workers import RolloutWorkerSpec
 from .utils import (
     apply_config_overrides,
     print_rollout_metrics,
@@ -274,27 +276,25 @@ class DaggerTrainer:
         print(f"  mean_step_loss={mean_loss:.6f}")
         return mean_loss
 
+    def _policy_spec(self, policy_type: str) -> PolicySpec:
+        assert self.simulator is not None
+        return PolicySpec(
+            policy_type=policy_type,
+            action_dim=self.action_dim,
+            state_dim=self.state_dim,
+            prediction_horizon=self.prediction_horizon,
+            unet_dim=self.cfg.unet.dim,
+            unet_dim_mults=tuple(self.cfg.unet.dim_mults),
+            num_inference_steps=self.cfg.flow_config.num_inference_steps,
+            action_scale=tuple(np.asarray(self.simulator.max_action, dtype=float).tolist()),
+            flow_init=self.cfg.flow_config.safeflow_init,
+        )
+
     def _build_policy(
         self, policy_type: str, device: torch.device, simulator: SystemSimulator, planner_config: dict[str, Any]
     ) -> ActionPolicy:
         """A policy of ``policy_type`` for ``simulator`` (whose projector is built from ``planner_config``)."""
-        return PolicyFactory.create(
-            policy_type,
-            action_dim=self.action_dim,
-            state_dim=self.state_dim,
-            unet_dim=self.cfg.unet.dim,
-            unet_dim_mults=self.cfg.unet.dim_mults,
-            prediction_horizon=self.prediction_horizon,
-            num_inference_steps=self.cfg.flow_config.num_inference_steps,
-            # The jerks are scaled by their limits, to the order of the unit-scale noise prior
-            action_scale=np.asarray(self.simulator.max_action, dtype=float).tolist(),
-            simulator=simulator,
-            **(
-                {"planner_config": planner_config, "flow_init": self.cfg.flow_config.safeflow_init}
-                if policy_type == "safeflow"
-                else {}
-            ),
-        ).to(device).eval()
+        return PolicyFactory.create(self._policy_spec(policy_type), simulator, planner_config).to(device).eval()
 
     def _apply_runtime_config_overrides(
         self, config: dict[str, Any], *, tolerance_overrides: Mapping[str, float] | None = None
@@ -322,25 +322,15 @@ class DaggerTrainer:
         self, config: dict[str, Any], *, need_expert: bool, need_policy: bool, policy_type: str | None = None
     ) -> RolloutWorkerSpec:
         assert self.simulator is not None and self.rollout_policy is not None
-        policy_kwargs = None
+        policy_spec = None
         policy_state_dict = None
         policy_type = policy_type or self.cfg.policy_type
         if need_policy:
-            policy_kwargs = {
-                "policy_type": policy_type,
-                "action_dim": self.action_dim,
-                "state_dim": self.state_dim,
-                "unet_dim": self.cfg.unet.dim,
-                "unet_dim_mults": self.cfg.unet.dim_mults,
-                "prediction_horizon": self.prediction_horizon,
-                "num_inference_steps": self.cfg.flow_config.num_inference_steps,
-                "action_scale": np.asarray(self.simulator.max_action, dtype=float).tolist(),
-                **({"flow_init": self.cfg.flow_config.safeflow_init} if policy_type == "safeflow" else {}),
-            }
+            policy_spec = self._policy_spec(policy_type)
             policy_state_dict = {name: tensor.cpu() for name, tensor in self.rollout_policy.state_dict().items()}
         return RolloutWorkerSpec(
             config=dict(config),
-            policy_kwargs=policy_kwargs,
+            policy_spec=policy_spec,
             policy_state_dict=policy_state_dict,
             need_expert=need_expert,
         )
@@ -363,7 +353,7 @@ class DaggerTrainer:
         policy = self.rollout_policy
         if policy_type != self.cfg.policy_type:
             policy = self._build_policy(policy_type, ROLLOUT_DEVICE, simulator, eval_config)
-            load_policy_state_dict(policy, self.rollout_policy.state_dict())
+            policy.load_network_state_dict(self.rollout_policy.state_dict())
 
         def action_fn(obs: np.ndarray) -> np.ndarray:
             return build_policy_action(simulator, policy, obs, ROLLOUT_DEVICE)
@@ -398,62 +388,16 @@ class DaggerTrainer:
     ) -> None:
         """Persist a round-by-round YAML summary with success and failure stats."""
 
-        summary_path = self.cfg.checkpoint_dir / "training_summary.yaml"
-        summary: dict[str, Any]
-        if summary_path.exists():
-            with summary_path.open("r") as f:
-                summary = yaml.safe_load(f) or {}
-        else:
-            summary = {}
-
-        rounds = summary.get("rounds", [])
-        entry: dict[str, Any] = {
-            "round": int(round_index),
-            "train_loss": train_loss,
-            "aggregation_success_rate": aggregation_metrics.success_rate if aggregation_metrics is not None else None,
-            **(eval_metrics.to_dict() if eval_metrics is not None else DaggerEvalMetrics.not_evaluated()),
-        }
-        if safeflow_eval_metrics is not None:
-            entry["safeflow_eval"] = safeflow_eval_metrics.to_dict()
-        if aggregation_metrics is not None:
-            entry.update(aggregation_metrics.collection_summary())
-        if latest_checkpoint is not None or iteration_checkpoint is not None:
-            entry["checkpoints"] = {
-                "latest": str(latest_checkpoint) if latest_checkpoint is not None else None,
-                "iteration": str(iteration_checkpoint) if iteration_checkpoint is not None else None,
-            }
-        rounds.append(entry)
-        summary["rounds"] = rounds
-        valid_rates = [
-            round_entry["eval_success_rate"]
-            for round_entry in rounds
-            if round_entry["eval_success_rate"] is not None
-        ]
-        if valid_rates:
-            best_round = max(
-                rounds,
-                key=lambda round_entry: round_entry["eval_success_rate"]
-                if round_entry["eval_success_rate"] is not None
-                else float("-inf"),
-            )
-            summary["best_round"] = best_round["round"]
-            summary["best_success_rate"] = best_round["eval_success_rate"]
-        else:
-            summary["best_round"] = None
-            summary["best_success_rate"] = None
-        summary["latest_round"] = int(round_index)
-        collection_rounds = [r["aggregation_failures"] for r in rounds if "aggregation_failures" in r]
-        summary["total_aggregation_failures"] = {
-            key: sum(r[key] for r in collection_rounds)
-            for key in ("attempted_episodes", "discarded_episodes", "planner_failures", "policy_solve_fallbacks")
-        }
-        total_expert_statistics = Counter()
-        for round_entry in rounds:
-            total_expert_statistics.update(round_entry.get("expert_statistics", {}))
-        if total_expert_statistics:
-            summary["total_expert_statistics"] = dict(total_expert_statistics)
-        with summary_path.open("w") as f:
-            yaml.safe_dump(summary, f, sort_keys=False)
+        append_round_summary(
+            self.cfg.checkpoint_dir / "training_summary.yaml",
+            round_index,
+            train_loss,
+            eval_metrics,
+            aggregation_metrics,
+            safeflow_eval_metrics,
+            latest_checkpoint,
+            iteration_checkpoint,
+        )
 
     def save_checkpoints(self, training_round: int) -> None:
         assert self.policy is not None

@@ -21,7 +21,7 @@ from pinocchio.visualize import MeshcatVisualizer
 from systems.franka_system import FrankaSystem
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.seed_utils import action_noise_rng_for_rollout, default_action_noise_seed_for_config
-from learning.dagger.rollouts import apply_execution_noise
+from learning.dagger.policy_action import apply_execution_noise
 from learning.dagger.utils import sample_initial_state
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.ompl_planner import initialize_ompl

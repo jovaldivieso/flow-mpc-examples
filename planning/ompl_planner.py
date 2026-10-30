@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
-
 import numpy as np
 from ompl import base as ob
 from ompl import geometric as og
@@ -9,6 +7,7 @@ from ompl import util as ou
 
 from systems.triple_integrator import TripleIntegratorBase
 from planning.planner import Plan, Planner, PlannerSolveError, goal_configuration
+from planning.planner_config import OmplConfig
 
 def initialize_ompl(seed: int, log_level: ou.LogLevel = ou.LogLevel.LOG_ERROR) -> None:
     """Set OMPL's process-wide random seed and log level.
@@ -38,11 +37,11 @@ class OmplPlanner(Planner):
     by ``initialize_ompl``, which the entry point of the application calls once.
     """
 
-    def __init__(self, simulator: TripleIntegratorBase, config: Mapping[str, Any]) -> None:
+    def __init__(self, simulator: TripleIntegratorBase, config: OmplConfig) -> None:
         self.sim = simulator
         self.n_joints = simulator.n
-        self.timeout = float(config["ompl_timeout"])
-        self.speed = float(config["ompl_speed"])
+        self.timeout = config.ompl_timeout
+        self.speed = config.ompl_speed
 
     def reset(self) -> None:
         """Planning from scratch every time: there is nothing to forget."""

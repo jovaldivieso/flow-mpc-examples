@@ -1,62 +1,82 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-
-import torch
+from dataclasses import dataclass
+from typing import Any, Callable, Mapping
 
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy
 from learning.models.pose_guidance import PoseGuidance
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.planner_config import PlannerConfig
+from systems.triple_integrator import TripleIntegratorBase
 
-INNER_POLICY_PREFIX = "inner_policy."  # of the keys of a safe flow policy's state dict
+
+@dataclass(frozen=True)
+class PolicySpec:
+    """Everything of a policy but the system it serves: what the factory builds it from, and what the rollout pool
+    sends its workers."""
+
+    policy_type: str
+    action_dim: int
+    state_dim: int
+    prediction_horizon: int
+    unet_dim: int
+    unet_dim_mults: tuple[int, ...]
+    num_inference_steps: int
+    action_scale: tuple[float, ...]  # the jerks are scaled by their limits, to the order of the unit-scale noise prior
+    flow_init: str = "previous_safe"  # of a safe flow policy
+
+
+PolicyBuilder = Callable[[PolicySpec, TripleIntegratorBase, Mapping[str, Any] | None], ActionPolicy]
+
+
+def build_flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, planner_config: Mapping[str, Any] | None) -> FlowPolicy:
+    """A flow policy whose flow is guided toward the goal pose of ``simulator``."""
+    return FlowPolicy(
+        action_dim=spec.action_dim,
+        state_dim=spec.state_dim,
+        guidance=PoseGuidance(simulator, spec.prediction_horizon),
+        prediction_horizon=spec.prediction_horizon,
+        unet_dim=spec.unet_dim,
+        unet_dim_mults=spec.unet_dim_mults,
+        num_inference_steps=spec.num_inference_steps,
+        action_scale=spec.action_scale,
+    )
+
+
+def build_safe_flow_policy(
+    spec: PolicySpec, simulator: TripleIntegratorBase, planner_config: Mapping[str, Any] | None
+) -> SafeFlowMPCPolicy:
+    """A flow policy with the projection of ``CasadiTrajectoryProjector``, built from the validated expert config
+    ``planner_config``. The projector reads no goal of the simulator (its dynamics, limits and obstacles come from the
+    system), so the simulator is shared with it and not copied."""
+    if planner_config is None:
+        raise ValueError("policy_type 'safeflow' requires a planner config to build its CasadiTrajectoryProjector.")
+    projector = CasadiTrajectoryProjector(simulator, PlannerConfig.from_mapping(planner_config), horizon=spec.prediction_horizon)
+    return SafeFlowMPCPolicy(build_flow_policy(spec, simulator, planner_config), projector, flow_init=spec.flow_init)
+
+
+# The policies the config can choose (``model.policy_type``)
+POLICY_REGISTRY: dict[str, PolicyBuilder] = {
+    "flow": build_flow_policy,
+    "safeflow": build_safe_flow_policy,
+}
 
 
 class PolicyFactory:
+    """Factory for policy instances."""
+
     @staticmethod
-    def create(policy_type: str, **kwargs: object) -> ActionPolicy:
-        """A flow or safe flow policy of the ``simulator`` kwarg: its flow is guided toward the goal pose, and the
-        projector of a safe flow policy (which also needs ``planner_config``) shares the simulator."""
-        normalized_type = policy_type.strip().lower()
-        if normalized_type not in {"flow", "safeflow"}:
-            raise ValueError(f"Unknown policy type '{policy_type}'. Supported policies: 'flow', 'safeflow'.")
-        flow_kwargs = dict(kwargs)
-        simulator = flow_kwargs.pop("simulator", None)
-        if simulator is None:
-            raise ValueError(f"policy_type '{normalized_type}' requires a 'simulator' kwarg to guide its flow.")
-        planner_config = flow_kwargs.pop("planner_config", None)
-        safeflow_options = {name: flow_kwargs.pop(name) for name in ("flow_init",) if name in flow_kwargs}
-        inner_policy = FlowPolicy(**flow_kwargs)
-        inner_policy.guidance = PoseGuidance(simulator, inner_policy.velocity_net.prediction_horizon)
-        if normalized_type == "flow":
-            return inner_policy
-        if planner_config is None:
-            raise ValueError("policy_type 'safeflow' requires a 'planner_config' kwarg to build its CasadiTrajectoryProjector.")
-        # The projector reads no goal of the simulator (its dynamics, limits and obstacles come from the system), so
-        # the simulator is shared with it and not copied.
-        projector = CasadiTrajectoryProjector(
-            simulator,
-            dict(planner_config),
-            horizon=inner_policy.velocity_net.prediction_horizon,
-        )
-        return SafeFlowMPCPolicy(inner_policy, projector, **safeflow_options)
+    def names() -> tuple[str, ...]:
+        return tuple(POLICY_REGISTRY.keys())
 
-
-def load_policy_state_dict(
-    policy: ActionPolicy, state_dict: Mapping[str, torch.Tensor], strict: bool = True
-) -> torch.nn.modules.module._IncompatibleKeys:
-    """Load the weights of a checkpoint of either policy type into ``policy``, with PyTorch's own ``load_state_dict``.
-
-    A safe flow policy keeps its network behind ``inner_policy.``, a flow policy does not, and a checkpoint can come
-    from either (the two share their weights); the projector has none, and ``torch.compile`` leaves ``_orig_mod`` in the
-    names. The keys are mapped onto the ones ``policy`` itself uses first, so the loading, its hooks and its ``strict``
-    check are PyTorch's.
-    """
-    prefix = INNER_POLICY_PREFIX if isinstance(policy, SafeFlowMPCPolicy) else ""
-    network_keys = {
-        key.removeprefix(INNER_POLICY_PREFIX).replace("._orig_mod.", "."): value
-        for key, value in state_dict.items()
-        if not key.startswith("projector.")
-    }
-    return policy.load_state_dict({prefix + key: value for key, value in network_keys.items()}, strict=strict)
+    @staticmethod
+    def create(
+        spec: PolicySpec, simulator: TripleIntegratorBase, planner_config: Mapping[str, Any] | None = None
+    ) -> ActionPolicy:
+        try:
+            builder = POLICY_REGISTRY[spec.policy_type]
+        except KeyError as exc:
+            raise ValueError(f"Unknown policy type '{spec.policy_type}'. Available: {sorted(POLICY_REGISTRY)}") from exc
+        return builder(spec, simulator, planner_config)

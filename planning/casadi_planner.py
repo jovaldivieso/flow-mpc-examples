@@ -1,9 +1,9 @@
 import casadi as ca
 import numpy as np
-from typing import Any, Mapping
 
 from .casadi_graph import CasadiKinematicGraph
 from .initial_guess import InitialGuessGenerator
+from .planner_config import PlannerConfig
 from .planner import Plan, Planner, PlannerSolveError, goal_configuration
 from systems.triple_integrator import TripleIntegratorBase
 
@@ -37,9 +37,7 @@ class CasadiPlanner(Planner):
     are all affine in ``(X, U, S)`` and the cost is convex quadratic, so the problem is a convex QP with the stage
     structure of an optimal control problem. **FATROP** (an interior point method with a Riccati recursion over the
     stages) solves it in time linear in the horizon, and in the number of obstacles: the slack is one per sphere, so
-    more obstacles only add half-space rows to a stage, where one slack per sphere-obstacle pair made a QP solver
-    like ProxQP slow down a hundredfold from 4 obstacles on. See ``CasadiKinematicGraph`` for the layout
-    FATROP needs. If the first pass penetrates a spherical obstacle, one re-linearization pass around the solved
+    more obstacles only add half-space rows to a stage. See ``CasadiKinematicGraph`` for the layout FATROP needs. If the first pass penetrates a spherical obstacle, one re-linearization pass around the solved
     trajectory refines the half-spaces.
 
     Initial guess strategy
@@ -51,31 +49,30 @@ class CasadiPlanner(Planner):
     solution (counted in ``trajectory_fallbacks``).
     """
 
-    def _resolve_r_diag(self, config: Mapping[str, Any]) -> np.ndarray:
-        """``R_diag`` (nu entries), else ``R_weight`` for every action dimension."""
-        raw_r_diag = config.get("R_diag")
-        if raw_r_diag is None:
-            return np.full(self.sim.nu, float(config["R_weight"]))
-        if len(raw_r_diag) != self.sim.nu:
-            raise ValueError(f"'R_diag' length must equal simulator action dimension nu={self.sim.nu}, got {len(raw_r_diag)}.")
-        return np.asarray(raw_r_diag, dtype=float)
+    def _resolve_r_diag(self, config: PlannerConfig) -> np.ndarray:
+        """``r_diag`` (nu entries), else ``r_weight`` for every action dimension."""
+        if not config.r_diag:
+            return np.full(self.sim.nu, config.r_weight)
+        if len(config.r_diag) != self.sim.nu:
+            raise ValueError(f"'R_diag' length must equal simulator action dimension nu={self.sim.nu}, got {len(config.r_diag)}.")
+        return np.asarray(config.r_diag, dtype=float)
 
     def __init__(
         self,
         simulator: TripleIntegratorBase,
-        config: Mapping[str, Any],
+        config: PlannerConfig,
         initial_guess_generator: InitialGuessGenerator | None = None,
     ):
-        # The scalars of the validated config (planning/config.py) are used as they are; only what depends on the
-        # system's dimensions is checked (and completed) here
-        self.terminal_cost_multiplier = float(config["terminal_cost_multiplier"])
-        q_diag = config.get("Q_diag", [10.0] * simulator.nx)
+        # The scalars of the config are used as they are; only what depends on the system's dimensions is checked (and
+        # completed) here
+        self.terminal_cost_multiplier = config.terminal_cost_multiplier
+        q_diag = config.q_diag or [10.0] * simulator.nx
         if len(q_diag) != simulator.nx:
             raise ValueError(
                 f"'Q_diag' length must equal simulator state dimension nx={simulator.nx}, got {len(q_diag)}."
             )
         self.sim = simulator
-        self._graph = CasadiKinematicGraph(simulator, config["horizon"])
+        self._graph = CasadiKinematicGraph(simulator, config.horizon)
         self.N = self._graph.N
         self.n_joints = simulator.n
         self.Q = np.diag(q_diag)

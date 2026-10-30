@@ -11,14 +11,10 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.config import (
-    ConfigurationError,
-    OmplConfig,
-    PlannerConfig,
-    load_and_validate_system_config,
-    validate_system_config,
-)
+from planning.config import load_and_validate_system_config, validate_system_config
+from planning.planner_config import OmplConfig, PlannerConfig
 from planning.planner_factory import PlannerFactory
+from systems.config_fields import ConfigurationError
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 
@@ -65,7 +61,7 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
         self.assertEqual(validated["fallback_terminal_velocity_tol"], 1e-2)
         self.assertEqual(validated["max_consecutive_fallbacks"], 5)
 
-    def test_the_keys_of_removed_features_are_rejected(self) -> None:
+    def test_keys_outside_the_schema_are_rejected(self) -> None:
         raw_config = _load_raw_config()
         for key in ("joint_limit_margin", "collision_slack_penalty_weight", "task_weights", "mode", "path_length_weight"):
             with self.subTest(key=key):
@@ -160,14 +156,14 @@ class PlannerConfigTests(unittest.TestCase):
 
     def test_wrong_types_and_values_are_rejected(self) -> None:
         for bad in ({"Q_diag": [1.0, 0.0]}, {"Q_diag": []}, {"Q_diag": 1.0}, {"R_diag": [1.0, 0.0]}, {"horizon": 2.5}, {"R_weight": "x"},
-                    {"R_weight": 0.0}, {"horizon": 0}, {"expert": "rrt"}, {"terminal_cost_multiplier": 0.0},
+                    {"R_weight": 0.0}, {"horizon": 0}, {"terminal_cost_multiplier": 0.0},
                     {"terminal_velocity_weight": -1.0}, {"fallback_terminal_velocity_tol": -0.1},
                     {"max_consecutive_fallbacks": 0}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
                 PlannerConfig.from_mapping(bad)
 
     def test_a_planner_config_built_directly_is_validated_too(self) -> None:
-        for bad in ({"horizon": 0}, {"expert": "rrt"}, {"r_weight": 0.0}, {"max_consecutive_fallbacks": 0}):
+        for bad in ({"horizon": 0}, {"r_weight": 0.0}, {"max_consecutive_fallbacks": 0}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
                 PlannerConfig(**bad)
 
@@ -310,6 +306,39 @@ class ExpertConfigValidationTests(unittest.TestCase):
                 raw_config["obstacles"] = bad_obstacles
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=raw_config)
+
+    def test_start_and_goal_regions_are_validated(self) -> None:
+        raw_config = _load_raw_config()
+        for key in ("start_region", "goal_region"):
+            raw_config.pop(key, None)
+        validated = validate_system_config(raw_config=raw_config)
+        self.assertNotIn("start_region", validated)
+        self.assertNotIn("goal_region", validated)
+
+        box = {"x": [0.3, 0.6], "y": [-0.2, 0.2], "z": [0.1, 0.3]}
+        raw_config["start_region"] = box
+        raw_config["goal_region"] = {**box, "tool_axis": [1, 0, 0], "tool_tilt": 0.4}
+        validated = validate_system_config(raw_config=raw_config)
+        self.assertEqual(validated["start_region"], box)
+        self.assertEqual(validated["goal_region"], {**box, "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4})
+        self.assertEqual(validate_system_config(raw_config=validated), validated)
+
+        for key, bad in (
+            ("start_region", {"x": [0.3, 0.6], "y": [-0.2, 0.2]}),  # missing axis
+            ("start_region", {**box, "z": [0.3, 0.1]}),  # min above max
+            ("start_region", {**box, "z": [0.1]}),  # not a pair
+            ("start_region", {**box, "extra": 1}),  # unknown key
+            ("start_region", {**box, "tool_axis": [1, 0, 0]}),  # starts have no hand direction
+            ("start_region", [0.3, 0.6]),  # not a mapping
+            ("goal_region", {**box, "tool_tilt": 0.4}),  # a tilt without an axis
+            ("goal_region", {**box, "tool_axis": [0, 0, 0]}),  # no direction
+            ("goal_region", {**box, "tool_axis": [1, 0]}),  # wrong length
+            ("goal_region", {**box, "tool_axis": [1, 0, 0], "tool_tilt": -0.1}),
+        ):
+            with self.subTest(key=key, bad=bad):
+                invalid = {**_load_raw_config(), key: bad}
+                with self.assertRaises(ConfigurationError):
+                    validate_system_config(raw_config=invalid)
 
 
 if __name__ == "__main__":

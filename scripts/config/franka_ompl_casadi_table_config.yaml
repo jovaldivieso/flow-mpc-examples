@@ -1,8 +1,4 @@
-# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm in a more cluttered environment: 5 obstacles in front
-# of the robot at different depths (x), left-right displacements (y) and heights (z): the 2 obstacles of
-# franka_ompl_casadi_config.yaml (the training environment) and 3 more, to evaluate how a policy trained there generalizes.
-# Each of the 3 is touched by 10-30% of the episodes collected in the training environment, and about half of those
-# episodes touch at least one of the 5.
+# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm with a table: starts above it, goals underneath.
 # State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
 system: franka
 dt: 0.1
@@ -38,18 +34,42 @@ vel_tol: 0.01
 # Random start configurations and goal poses (the TCP pose of a random configuration): minimum TCP-to-goal distance [m]
 min_start_goal_distance: 0.3
 
-# Spherical obstacles in the world frame [m]
+# The table: a 2 x 5 grid of spheres (0.14 m apart, at most sqrt(2) radii, so the four spheres of a cell leave no hole), a slab
+# 0.2 m thick at z = 0.4 .. 0.6 m, x = 0.30 .. 0.64 m, y = -0.38 .. 0.38 m, its front edge 0.3 m from the base.
 obstacles:
-  - position: [0.45, -0.12, 0.40]
-    radius: 0.08
-  - position: [0.45, 0.15, 0.48]
-    radius: 0.08
-  - position: [0.40, -0.30, 0.30]
-    radius: 0.07
-  - position: [0.62, 0.05, 0.55]
-    radius: 0.07
-  - position: [0.30, 0.28, 0.45]
-    radius: 0.07
+  - position: [0.40, -0.28, 0.50]
+    radius: 0.10
+  - position: [0.40, -0.14, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.00, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.14, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.28, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.28, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.14, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.00, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.14, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.28, 0.50]
+    radius: 0.10
+
+# TCP boxes [m] of the random starts and goals: starts above the table, goals underneath it (the hand points forward,
+# along the tool_axis within tool_tilt [rad], as it has to to fit under). The way from one to the other goes around the table.
+start_region:
+  x: [0.38, 0.56]
+  y: [-0.25, 0.25]
+  z: [0.70, 0.90]
+goal_region:
+  x: [0.38, 0.56]
+  y: [-0.25, 0.25]
+  z: [0.15, 0.34]
+  tool_axis: [1.0, 0.0, 0.0]
+  tool_tilt: 0.4
 
 initial_state_seed: 0
 action_noise_seed: 0

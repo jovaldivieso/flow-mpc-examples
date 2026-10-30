@@ -27,7 +27,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from learning.config_loaders import load_dagger_training_config
 from learning.dagger import apply_config_overrides, build_policy_action, evaluation_seed_specs
-from learning.dagger.rollouts import EpisodeStarts
+from learning.dagger.episode_starts import EpisodeStarts
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.ompl_planner import initialize_ompl
 from planning.planner import PlannerSolveError
