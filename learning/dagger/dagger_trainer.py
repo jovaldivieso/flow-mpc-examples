@@ -21,7 +21,7 @@ from systems.seed_utils import default_action_noise_seed_for_config
 from learning.data_utils import build_dataset_features, create_collate_fn
 from learning.models.exponential_moving_average import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
 from planning.planner_factory import PlannerFactory
 
 from .dagger_config import DaggerConfig
@@ -124,35 +124,9 @@ class DaggerTrainer:
 
         self.state_dim = environment_state_dim + proprioception_dim
 
-        flow = {
-            "num_inference_steps": self.cfg.flow_config.num_inference_steps,
-            # The jerks are scaled by their limits, to the order of the unit-scale noise prior
-            "action_scale": np.asarray(self.simulator.max_action, dtype=float).tolist(),
-        }
-        safeflow = (
-            {
-                "simulator": self.simulator,
-                "planner_config": self.seeded_config,
-                "flow_init": self.cfg.flow_config.safeflow_init,
-            }
-            if self.cfg.policy_type == "safeflow"
-            else {}
-        )
-        def build_policy(device: torch.device) -> ActionPolicy:
-            return PolicyFactory.create(
-                self.cfg.policy_type,
-                action_dim=self.action_dim,
-                state_dim=self.state_dim,
-                unet_dim=self.cfg.unet.dim,
-                unet_dim_mults=self.cfg.unet.dim_mults,
-                prediction_horizon=self.prediction_horizon,
-                **flow,
-                **safeflow,
-            ).to(device).eval()
-
-        self.policy = build_policy(self.device)
+        self.policy = self._build_policy(self.cfg.policy_type, self.device, self.simulator, self.seeded_config)
         # Single-sample inference is faster on the CPU than on an accelerator, so rollouts use a CPU copy
-        self.rollout_policy = build_policy(ROLLOUT_DEVICE)
+        self.rollout_policy = self._build_policy(self.cfg.policy_type, ROLLOUT_DEVICE, self.simulator, self.seeded_config)
         self.optimizer = torch.optim.AdamW(
             self.policy.parameters(), lr=self.cfg.learning_rate, weight_decay=WEIGHT_DECAY
         )
@@ -300,6 +274,28 @@ class DaggerTrainer:
         print(f"  mean_step_loss={mean_loss:.6f}")
         return mean_loss
 
+    def _build_policy(
+        self, policy_type: str, device: torch.device, simulator: SystemSimulator, planner_config: dict[str, Any]
+    ) -> ActionPolicy:
+        """A policy of ``policy_type`` for ``simulator`` (whose projector is built from ``planner_config``)."""
+        return PolicyFactory.create(
+            policy_type,
+            action_dim=self.action_dim,
+            state_dim=self.state_dim,
+            unet_dim=self.cfg.unet.dim,
+            unet_dim_mults=self.cfg.unet.dim_mults,
+            prediction_horizon=self.prediction_horizon,
+            num_inference_steps=self.cfg.flow_config.num_inference_steps,
+            # The jerks are scaled by their limits, to the order of the unit-scale noise prior
+            action_scale=np.asarray(self.simulator.max_action, dtype=float).tolist(),
+            simulator=simulator,
+            **(
+                {"planner_config": planner_config, "flow_init": self.cfg.flow_config.safeflow_init}
+                if policy_type == "safeflow"
+                else {}
+            ),
+        ).to(device).eval()
+
     def _apply_runtime_config_overrides(
         self, config: dict[str, Any], *, tolerance_overrides: Mapping[str, float] | None = None
     ) -> dict[str, Any]:
@@ -322,13 +318,16 @@ class DaggerTrainer:
         assert self.rollout_policy is not None and self.ema is not None
         self.rollout_policy.load_state_dict({name: tensor.cpu() for name, tensor in self.ema.state_dict().items()})
 
-    def _worker_spec(self, config: dict[str, Any], *, need_expert: bool, need_policy: bool) -> RolloutWorkerSpec:
+    def _worker_spec(
+        self, config: dict[str, Any], *, need_expert: bool, need_policy: bool, policy_type: str | None = None
+    ) -> RolloutWorkerSpec:
         assert self.simulator is not None and self.rollout_policy is not None
         policy_kwargs = None
         policy_state_dict = None
+        policy_type = policy_type or self.cfg.policy_type
         if need_policy:
             policy_kwargs = {
-                "policy_type": self.cfg.policy_type,
+                "policy_type": policy_type,
                 "action_dim": self.action_dim,
                 "state_dim": self.state_dim,
                 "unet_dim": self.cfg.unet.dim,
@@ -336,11 +335,7 @@ class DaggerTrainer:
                 "prediction_horizon": self.prediction_horizon,
                 "num_inference_steps": self.cfg.flow_config.num_inference_steps,
                 "action_scale": np.asarray(self.simulator.max_action, dtype=float).tolist(),
-                **(
-                    {"flow_init": self.cfg.flow_config.safeflow_init}
-                    if self.cfg.policy_type == "safeflow"
-                    else {}
-                ),
+                **({"flow_init": self.cfg.flow_config.safeflow_init} if policy_type == "safeflow" else {}),
             }
             policy_state_dict = {name: tensor.cpu() for name, tensor in self.rollout_policy.state_dict().items()}
         return RolloutWorkerSpec(
@@ -350,34 +345,42 @@ class DaggerTrainer:
             need_expert=need_expert,
         )
 
-    def evaluate_current_policy(self, label: str) -> DaggerEvalMetrics | None:
+    def evaluate_current_policy(self, label: str, policy_type: str | None = None) -> DaggerEvalMetrics | None:
+        """Evaluate the weights being trained as a policy of ``policy_type`` (the trained one by default): the weights
+        of a flow policy also make a safe flow policy, which runs the same episodes with its projector."""
         assert self.rollout_policy is not None
         assert self.seeded_config is not None
         if self.cfg.eval_episodes == 0:
             return None
+        policy_type = policy_type or self.cfg.policy_type
         eval_config = self._apply_runtime_config_overrides(
             copy.deepcopy(dict(self.seeded_config)),
             tolerance_overrides=self.cfg.eval_tolerance_overrides,
         )
         simulator = SystemFactory.create(eval_config["system"], eval_config)
 
-        def action_fn(obs: np.ndarray) -> np.ndarray:
-            return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
-
         self._sync_rollout_policy()
+        policy = self.rollout_policy
+        if policy_type != self.cfg.policy_type:
+            policy = self._build_policy(policy_type, ROLLOUT_DEVICE, simulator, eval_config)
+            load_policy_state_dict(policy, self.rollout_policy.state_dict())
+
+        def action_fn(obs: np.ndarray) -> np.ndarray:
+            return build_policy_action(simulator, policy, obs, ROLLOUT_DEVICE)
+
         metrics = evaluate_policy_rollouts(
             simulator,
             self.cfg.eval_episodes,
             self.cfg.eval_steps or self.cfg.steps_per_trajectory,
             self.cfg.eval_seed_start,
             action_fn,
-            reset_fn=self.rollout_policy.reset,
+            reset_fn=policy.reset,
             action_noise_std=self.cfg.eval_action_noise_std,
             action_noise_seed=self.action_noise_seed,
             initial_states=self.cfg.initial_states,
             goal_states=self.cfg.goal_states,
             num_workers=self.cfg.num_workers,
-            worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True),
+            worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True, policy_type=policy_type),
         )
         if metrics is not None:
             print_rollout_metrics(label, "eval", metrics)
@@ -389,6 +392,7 @@ class DaggerTrainer:
         train_loss: float | None,
         eval_metrics: DaggerEvalMetrics | None,
         aggregation_metrics: DaggerEvalMetrics | None = None,
+        safeflow_eval_metrics: DaggerEvalMetrics | None = None,
         latest_checkpoint: str | None = None,
         iteration_checkpoint: str | None = None,
     ) -> None:
@@ -409,6 +413,8 @@ class DaggerTrainer:
             "aggregation_success_rate": aggregation_metrics.success_rate if aggregation_metrics is not None else None,
             **(eval_metrics.to_dict() if eval_metrics is not None else DaggerEvalMetrics.not_evaluated()),
         }
+        if safeflow_eval_metrics is not None:
+            entry["safeflow_eval"] = safeflow_eval_metrics.to_dict()
         if aggregation_metrics is not None:
             entry.update(aggregation_metrics.collection_summary())
         if latest_checkpoint is not None or iteration_checkpoint is not None:
@@ -492,7 +498,11 @@ class DaggerTrainer:
                 0,
                 self.cfg.target_epochs_per_round[0],
             )
-            initial = self.evaluate_current_policy("Round 0 evaluation")
+            initial = self.evaluate_current_policy(f"Round 0 {self.cfg.policy_type} evaluation")
+            initial_safeflow = (
+                self.evaluate_current_policy("Round 0 safeflow evaluation", "safeflow") if self.cfg.policy_type == "flow" else None
+            )
+
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_iter_000.pt"
             self.save_checkpoints(0)
@@ -500,6 +510,7 @@ class DaggerTrainer:
                 round_index=0,
                 train_loss=None,
                 eval_metrics=initial,
+                safeflow_eval_metrics=initial_safeflow,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
             )
@@ -621,10 +632,13 @@ class DaggerTrainer:
                 training_round=index,
                 target_epochs=self.cfg.target_epochs_per_round[schedule],
             )
-            eval_metrics = self.evaluate_current_policy(
-                f"Round {display} evaluation"
-                if self.cfg.start_with_aggregation
-                else f"Refinement {display} evaluation"
+            stage = "Round" if self.cfg.start_with_aggregation else "Refinement"
+            eval_metrics = self.evaluate_current_policy(f"{stage} {display} {self.cfg.policy_type} evaluation")
+
+            safeflow_eval_metrics = (
+                self.evaluate_current_policy(f"{stage} {display} safeflow evaluation", "safeflow")
+                if self.cfg.policy_type == "flow"
+                else None
             )
 
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
@@ -635,6 +649,7 @@ class DaggerTrainer:
                 train_loss=train_loss,
                 eval_metrics=eval_metrics,
                 aggregation_metrics=metrics,
+                safeflow_eval_metrics=safeflow_eval_metrics,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
             )

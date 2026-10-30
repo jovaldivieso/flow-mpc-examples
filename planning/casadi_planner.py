@@ -5,7 +5,7 @@ from typing import Any, Mapping
 from .casadi_graph import CasadiKinematicGraph
 from .initial_guess import InitialGuessGenerator
 from .planner import Plan, Planner, PlannerSolveError, goal_configuration
-from systems.kinematic_collision_system import KinematicCollisionSystem
+from systems.triple_integrator import TripleIntegratorBase
 
 
 class CasadiPlanner(Planner):
@@ -62,7 +62,7 @@ class CasadiPlanner(Planner):
 
     def __init__(
         self,
-        simulator: KinematicCollisionSystem,
+        simulator: TripleIntegratorBase,
         config: Mapping[str, Any],
         initial_guess_generator: InitialGuessGenerator | None = None,
     ):

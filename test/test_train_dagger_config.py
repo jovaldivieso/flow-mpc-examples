@@ -166,7 +166,7 @@ class DaggerEvalMetricsSummaryTests(unittest.TestCase):
         fields = dict(
             success_rate=0.5, mean_steps=40.0, min_steps=20, max_steps=60, num_episodes=4,
             config_successes=1, config_num_episodes=2, random_successes=1, random_num_episodes=2,
-            timeout_failures=1, solve_failures=0, collision_failures=1,
+            timeout_failures=1, solve_failures=0, collision_failures=1, mean_inference_ms=12.5,
         )
         return DaggerEvalMetrics(**{**fields, **overrides})
 
@@ -181,6 +181,7 @@ class DaggerEvalMetricsSummaryTests(unittest.TestCase):
                     "random": {"successes": 1, "total": 2, "rate": 50.0},
                 },
                 "eval_failure_breakdown": {"timeout": 1, "solve_failure": 0, "collision": 1},
+                "eval_mean_inference_ms": 12.5,
             },
         )
 
@@ -276,6 +277,22 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
             # a run whose expert keeps no statistics reports none
             self.assertNotIn("expert_statistics", summary["rounds"][1])
             self.assertNotIn("total_expert_statistics", summary)
+
+    def test_the_safeflow_evaluation_of_a_flow_policy_is_reported_next_to_its_own(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = DaggerTrainer(_minimal_dagger_config(checkpoint_dir=Path(directory)))
+            flow = DaggerEvalMetrics(success_rate=0.1, mean_steps=80.0, min_steps=4, max_steps=100, num_episodes=10, timeout_failures=9)
+            safeflow = DaggerEvalMetrics(success_rate=0.9, mean_steps=60.0, min_steps=40, max_steps=100, num_episodes=10, timeout_failures=1)
+            trainer.save_round_summary(round_index=0, train_loss=0.3, eval_metrics=flow, safeflow_eval_metrics=safeflow)
+            trainer.save_round_summary(round_index=1, train_loss=0.3, eval_metrics=flow)
+
+            summary = yaml.safe_load((Path(directory) / "training_summary.yaml").read_text())
+
+        self.assertEqual(summary["rounds"][0]["eval_success_rate"], 0.1)
+        self.assertEqual(summary["rounds"][0]["safeflow_eval"]["eval_success_rate"], 0.9)
+        self.assertEqual(summary["rounds"][0]["safeflow_eval"]["eval_failure_breakdown"]["timeout"], 1)
+        self.assertNotIn("safeflow_eval", summary["rounds"][1])
+        self.assertEqual(summary["best_success_rate"], 0.1)  # the best round is still the one of the trained policy
 
     def test_the_experts_statistics_are_reported_per_round_and_in_total(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -415,12 +432,12 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         trainer = self._setup_trainer("flow")
 
         self.assertIsInstance(trainer.simulator, FrankaSystem)
-        self.assertEqual((trainer.state_dim, trainer.action_dim), (19 + 21, 7))  # goal in the TCP frame + q_rel, state
+        self.assertEqual((trainer.state_dim, trainer.action_dim), (12 + 69 + 21, 7))  # goal in the TCP frame, sphere centers, state
         self.assertEqual(trainer.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(trainer.obs_feature_names, ["observation.environment_state", "observation.state"])
         self.assertIsInstance(trainer.policy, FlowPolicy)
         velocity_net = trainer.policy.velocity_net
-        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (40, 7))
+        self.assertEqual((velocity_net.obs_cond_dim, velocity_net.action_dim), (102, 7))
         self.assertEqual(velocity_net.prediction_horizon, self.PREDICTION_HORIZON)
         self.assertEqual(velocity_net.num_inference_steps, self.NUM_INFERENCE_STEPS)
         # The chunk is jerks, scaled by their limits
@@ -432,7 +449,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         self.assertIsInstance(trainer.optimizer, torch.optim.AdamW)
         self.assertEqual(trainer.optimizer.defaults["weight_decay"], WEIGHT_DECAY)
         batch = (
-            {"observation.environment_state": torch.zeros(2, 19), "observation.state": torch.zeros(2, 21)},
+            {"observation.environment_state": torch.zeros(2, 81), "observation.state": torch.zeros(2, 21)},
             torch.zeros(2, self.PREDICTION_HORIZON, 7),
         )
         base = trainer.cfg.learning_rate
@@ -464,7 +481,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         """A trainer that has taken optimizer steps, and the checkpoint it saved."""
         trainer = self._setup_trainer("flow")
         batch = (
-            {"observation.environment_state": torch.randn(4, 19), "observation.state": torch.randn(4, 21)},
+            {"observation.environment_state": torch.randn(4, 81), "observation.state": torch.randn(4, 21)},
             torch.randn(4, self.PREDICTION_HORIZON, 7),
         )
         with contextlib.redirect_stdout(io.StringIO()):
@@ -502,6 +519,39 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             _minimal_dagger_config(init_checkpoint=Path("does_not_exist.pt"))
 
+    def test_a_flow_trainer_evaluates_its_weights_as_a_safeflow_policy_too(self) -> None:
+        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2, num_workers=1)
+
+        with mock.patch.object(trainer, "_build_policy", wraps=trainer._build_policy) as build, contextlib.redirect_stdout(io.StringIO()):
+            flow_metrics = trainer.evaluate_current_policy("flow evaluation")
+            safeflow_metrics = trainer.evaluate_current_policy("safeflow evaluation", "safeflow")
+
+        self.assertEqual([call.args[0] for call in build.call_args_list], ["safeflow"])  # the flow one is the trainer's own
+        self.assertEqual((flow_metrics.num_episodes, safeflow_metrics.num_episodes), (2, 2))
+
+    def test_an_offline_start_also_evaluates_a_flow_policy_as_safeflow_and_labels_both(self) -> None:
+        trainer = self._setup_trainer("flow", eval_episodes=1, dagger_iterations=0)
+        object.__setattr__(trainer.cfg, "start_with_aggregation", False)  # the config would want an existing dataset
+        labels: list[tuple[str, str | None]] = []
+        evaluation = DaggerEvalMetrics(success_rate=0.5, mean_steps=1.0, min_steps=1, max_steps=1, num_episodes=1)
+
+        def record(label: str, policy_type: str | None = None) -> DaggerEvalMetrics:
+            labels.append((label, policy_type))
+            return evaluation
+
+        with (
+            mock.patch.object(trainer, "setup"),
+            mock.patch.object(trainer, "train_on_aggregate"),
+            mock.patch.object(trainer, "evaluate_current_policy", side_effect=record),
+            mock.patch.object(trainer, "save_checkpoints"),
+            mock.patch.object(trainer, "save_round_summary") as save,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            trainer.run()
+
+        self.assertEqual(labels, [("Round 0 flow evaluation", None), ("Round 0 safeflow evaluation", "safeflow")])
+        self.assertIs(save.call_args.kwargs["safeflow_eval_metrics"], evaluation)
+
     def test_setup_builds_the_safeflow_projector_on_the_trainers_simulator(self) -> None:
         trainer = self._setup_trainer("safeflow")
 
@@ -529,7 +579,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     },
                 )
                 self.assertEqual(checkpoint["iteration"], 2)
-                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (40, 7))
+                self.assertEqual((checkpoint["state_dim"], checkpoint["action_dim"]), (102, 7))
                 self.assertEqual(checkpoint["prediction_horizon"], self.PREDICTION_HORIZON)
                 self.assertEqual(checkpoint["unet"], {"dim": self.UNET.dim, "dim_mults": list(self.UNET.dim_mults)})
                 self.assertEqual(checkpoint["obs_feature_names"], ["observation.environment_state", "observation.state"])
@@ -554,6 +604,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     prediction_horizon=checkpoint["prediction_horizon"],
                     num_inference_steps=checkpoint["flow_config"]["num_inference_steps"],
                     action_scale=checkpoint["flow_config"]["action_scale"],
+                    simulator=trainer.simulator,
                 )
                 load_policy_state_dict(rebuilt, checkpoint["ema_model_state_dict"])
                 prefix = "inner_policy." if policy_type == "safeflow" else ""

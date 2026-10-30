@@ -336,15 +336,15 @@ class InitialPlanTests(unittest.TestCase):
             obstacles=[{"position": obs_pos, "radius": 0.06}],
         )
         simulator.set_goal(pose_goal(simulator, q_goal))
-        self.assertTrue(simulator.is_collision_free(q_start))
-        self.assertTrue(simulator.is_collision_free(q_goal))
-        self.assertFalse(simulator.is_collision_free(mid_q))
+        self.assertTrue(simulator.collision.is_collision_free(q_start))
+        self.assertTrue(simulator.collision.is_collision_free(q_goal))
+        self.assertFalse(simulator.collision.is_collision_free(mid_q))
 
         state = simulator.reset(np.concatenate([q_start, np.zeros(2 * simulator.n)]))
         termination = RolloutTerminationTracker(simulator)
         for _ in range(80):
             state = simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
-            self.assertTrue(simulator.is_collision_free(state), "MPC collided with the spherical obstacle")
+            self.assertTrue(simulator.collision.is_collision_free(state), "MPC collided with the spherical obstacle")
             if termination.update(state):
                 break
         self.assertTrue(simulator.is_done(state), "MPC did not reach the goal around the obstacle")

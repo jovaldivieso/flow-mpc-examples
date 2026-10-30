@@ -30,6 +30,9 @@ class DaggerEvalMetrics:
     timeout_failures: int = 0
     solve_failures: int = 0
     collision_failures: int = 0  # the system touched an obstacle (ground truth, ``simulator.collides``)
+    # The mean wall-clock time of a policy call over all the steps of the evaluation (the pool's workers run side by side,
+    # so it is a little more than a call alone takes); None when no call returned an action
+    mean_inference_ms: float | None = None
     # Collection bookkeeping, only populated by collect_dagger_rollouts: how many episode attempts it took,
     # how many were dropped (expert solve failure), how many expert solves failed, and how many times the
     # policy's own solve failed and the expert action was used instead.
@@ -73,6 +76,7 @@ class DaggerEvalMetrics:
                 "solve_failure": self.solve_failures,
                 "collision": self.collision_failures,
             },
+            "eval_mean_inference_ms": self.mean_inference_ms,
         }
 
     @classmethod

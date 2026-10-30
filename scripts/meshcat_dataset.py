@@ -174,7 +174,7 @@ def main() -> None:
     viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
     viz.initViewer(open=True)
     viz.loadViewerModel()
-    draw_obstacles(viz, dyn.obstacles)
+    draw_obstacles(viz, dyn.collision.obstacles)
     if args.overview:
         show_overview(viz, dyn, episodes, args.success_tol)
     episodes = played

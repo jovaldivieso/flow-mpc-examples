@@ -13,6 +13,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import observation_features
 from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
+from systems.point_mass_system import PointMassSystem
 
 
 def _build_policy(action_scale=None) -> FlowPolicy:
@@ -323,12 +324,13 @@ class PolicyFactoryTests(unittest.TestCase):
     def _flow_kwargs() -> dict[str, object]:
         return dict(
             action_dim=2, state_dim=6, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=4,
-            num_inference_steps=4, action_scale=[1.0, 2.0],
+            num_inference_steps=4, action_scale=[1.0, 2.0], simulator=PointMassSystem({}),
         )
 
     def test_creates_flow_policy(self) -> None:
         policy = PolicyFactory.create("flow", **self._flow_kwargs())
         self.assertIsInstance(policy, FlowPolicy)
+        self.assertIsNotNone(policy.guidance)  # the flow is always guided toward the goal
         self.assertEqual(policy.velocity_net.prediction_horizon, 4)
         self.assertEqual(policy.velocity_net.num_inference_steps, 4)
         torch.testing.assert_close(policy.velocity_net.action_scale, torch.tensor([1.0, 2.0]))
@@ -336,6 +338,12 @@ class PolicyFactoryTests(unittest.TestCase):
     def test_policy_type_is_case_and_whitespace_insensitive(self) -> None:
         policy = PolicyFactory.create("  FLOW ", **self._flow_kwargs())
         self.assertIsInstance(policy, FlowPolicy)
+
+    def test_a_flow_policy_needs_the_simulator_for_its_guidance(self) -> None:
+        kwargs = self._flow_kwargs()
+        del kwargs["simulator"]
+        with self.assertRaises(ValueError):
+            PolicyFactory.create("flow", **kwargs)
 
     def test_unknown_policy_types_are_rejected(self) -> None:
         for policy_type in ("mlp", "wam", "not_a_real_policy_type"):

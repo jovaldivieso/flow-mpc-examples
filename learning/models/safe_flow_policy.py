@@ -16,9 +16,9 @@ class SafeFlowMPCPolicy(ActionPolicy):
     """Wraps a FlowPolicy with a CasADi safety projection at every inference step (SafeFlowMPC, Oelerich et al., 2026).
 
     Loss and reset delegate to the inner FlowPolicy. ``select_action`` re-implements the Euler ODE integration loop
-    over the chunk of actions: after every flow step the proposal is projected onto the safe set by
-    ``CasadiTrajectoryProjector``, and the projected chunk is the flow's next state. The first action of the
-    returned chunk is what the system executes.
+    over the chunk of actions: after every flow step the proposal is moved toward the goal by the inner policy's guidance
+    and projected onto the safe set by ``CasadiTrajectoryProjector``, and the projected chunk is the flow's next state.
+    The first action of the returned chunk is what the system executes.
 
     With ``flow_init="previous_safe"`` the integration does not start from Gaussian noise but from the previous
     tick's safe actions (shifted by one step), or, on the first tick of an episode, from zero actions.
@@ -93,7 +93,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
             t_tensor = torch.full((batch_size,), step * dt, device=device, dtype=obs_cond.dtype)
             pred_velocity = net.predict_velocity(x.flatten(1), obs_cond, t_tensor)
             pred_velocity = pred_velocity.view(batch_size, net.prediction_horizon, net.action_dim)
-            proposal = (x + dt * pred_velocity)[0].detach().cpu().numpy() * scale
+            proposal = inner.guide(observation_dict, (x + dt * pred_velocity)[0].detach().cpu().numpy() * scale)
             safe = self.projector.project(state, proposal)
             x = torch.tensor(safe / scale, device=device, dtype=x.dtype).unsqueeze(0)
 

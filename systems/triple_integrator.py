@@ -5,8 +5,8 @@ Action u = j          (jerk), nu = n
 
 Every axis (or joint) is a triple integrator with piecewise constant jerk, limited in velocity, acceleration, and jerk
 (and, for a system that sets them, in position). The base class holds the exact plant step (numeric and CasADi), the
-limits, the goal and tolerances, the obstacles with their sphere-based collision checks, and the start sampling; a concrete
-system supplies its goal space, its bounding spheres, and what its policy observes.
+limits, the goal and tolerances, the ``SphereCollisionModel`` of its obstacles and bounding spheres (``collision``), and the
+start sampling; a concrete system supplies its goal space, its bounding spheres, and what its policy observes.
 """
 
 from abc import abstractmethod
@@ -15,12 +15,13 @@ from typing import Any, Mapping
 import casadi as ca
 import numpy as np
 
-from .kinematic_collision_system import KinematicCollisionSystem
+from .sphere_collision import SphereCollisionModel
+from .system import SystemSimulator
 
 SAMPLING_ATTEMPTS = 256
 
 
-class TripleIntegratorBase(KinematicCollisionSystem):
+class TripleIntegratorBase(SystemSimulator):
     """Abstract triple-integrator system with state ``[q, v, a]`` and jerk action ``u = j``."""
 
     def __init__(
@@ -57,9 +58,8 @@ class TripleIntegratorBase(KinematicCollisionSystem):
         self.min_start_goal_distance = float(config.get("min_start_goal_distance", default_min_distance))
         self.pos_tol = float(config.get("pos_tol", default_pos_tol))
         self.vel_tol = float(config.get("vel_tol", default_vel_tol))
-        self._obstacles: list[tuple[np.ndarray, float]] = [
-            (np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in config.get("obstacles", []) or []
-        ]
+        obstacles = [(np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in config.get("obstacles", []) or []]
+        self.collision = SphereCollisionModel(obstacles, self.collision_spheres, n)
 
     # --- the properties the base class declares ---------------------------------
 
@@ -102,10 +102,6 @@ class TripleIntegratorBase(KinematicCollisionSystem):
     @property
     def randomize_goal(self) -> bool:
         return self._randomize_goal
-
-    @property
-    def obstacles(self) -> list[tuple[np.ndarray, float]]:
-        return self._obstacles
 
     @property
     def path_lower(self) -> np.ndarray:
@@ -151,6 +147,21 @@ class TripleIntegratorBase(KinematicCollisionSystem):
     @abstractmethod
     def goal_errors(self, state: np.ndarray) -> tuple[float, float]:
         """Position error of ``state`` with respect to the goal, and its orientation error (0 where there is none)."""
+
+    @abstractmethod
+    def collision_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bounding sphere centers (S, d), position Jacobians (S, d, n), and radii (S,) at configuration ``q``."""
+
+    @abstractmethod
+    def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
+        """The configuration the planners drive to for ``goal``, the nearest one to ``q_reference`` if there are several.
+        Raises ``RuntimeError`` if none reaches the goal."""
+
+    @abstractmethod
+    def goal_task_error(self, q: np.ndarray, goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        """What moves the configuration ``q`` toward ``goal``: the task-space error ``e`` (m,) (the position error, then
+        the orientation error where there is one), the Jacobian ``J`` (m, n) with ``dx = J dq``, and the position error
+        norm (the first part of ``e``)."""
 
     @abstractmethod
     def tcp_position(self, q: np.ndarray) -> np.ndarray:

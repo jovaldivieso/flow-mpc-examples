@@ -4,9 +4,9 @@ from typing import Any, Mapping
 import casadi as ca
 import numpy as np
 
-from planning.casadi_graph import CasadiKinematicGraph
+from planning.casadi_graph import CasadiKinematicGraph, GraphSolution
 from planning.planner import PlannerSolveError
-from systems.kinematic_collision_system import KinematicCollisionSystem
+from systems.triple_integrator import TripleIntegratorBase
 
 
 class CasadiTrajectoryProjector:
@@ -26,7 +26,7 @@ class CasadiTrajectoryProjector:
     Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
                              present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by all obstacles.
     Parameters               x_init, u_ref, and linearized obstacle half-spaces (A_coll, b_coll) evaluated along the
-                             rollout of u_ref from x_init.
+                             rollout of u_ref from x_init at the first Euler step of a control tick and at its last.
 
     Cost                     min_{X, U, S}  sum_{k=0..N-1} ||(u_k - u_ref,k) / u_max||_2^2
                                             + beta ||[v_N, a_N]||_2^2 + w_s ||S||_F^2
@@ -50,6 +50,11 @@ class CasadiTrajectoryProjector:
     structure of an optimal control problem, solved in a few ms by **FATROP** (see ``CasadiKinematicGraph``) started from
     the previous solution across adjacent Euler steps and control ticks.
 
+    Every Euler step of a tick is one such solve to convergence, linearized along the rollout of its own proposal. The
+    half-spaces are first-order, so a solution that still penetrates an obstacle is linearized again around itself and
+    solved once more (``CasadiKinematicGraph.solve``); if it still penetrates, the projection has failed, as it does in
+    SafeFlowMPC when the slack of its filter exceeds a tolerance (see above for what a failed projection does).
+
     Initial guess strategy
     ----------------------
     The first solve after a reset starts from the current state held still (zero actions: within the limits whatever
@@ -60,7 +65,7 @@ class CasadiTrajectoryProjector:
     from the state held still; if that fails too, the previous safe solution is the fallback (see above).
     """
 
-    def __init__(self, simulator: KinematicCollisionSystem, config: Mapping[str, Any], *, horizon: int):
+    def __init__(self, simulator: TripleIntegratorBase, config: Mapping[str, Any], *, horizon: int):
         # The chunk length is the flow policy's prediction horizon, not the expert's ``horizon``
         if int(horizon) < 1:
             raise ValueError("'horizon' must be at least 1.")
@@ -70,16 +75,20 @@ class CasadiTrajectoryProjector:
         self.fallback_terminal_velocity_tol = float(config["fallback_terminal_velocity_tol"])
         self.max_consecutive_fallbacks = int(config["max_consecutive_fallbacks"])
         self.sim = simulator
-        self._graph = CasadiKinematicGraph(simulator, horizon)
-        self.tracked_horizon = self.N = self._graph.N
+        self.tracked_horizon = self.N = int(horizon)
         self.rest_idx = list(self.sim.rest_state_indices)
-        max_action = np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1)
-
-        # Cost: track the proposed chunk (each action divided by its limit) and come to rest at the end of the horizon
-        self.u_ref_param = self._graph.parameter(self.sim.nu, self.N)
-        tracking = ca.sumsqr((self._graph.U - self.u_ref_param) / ca.repmat(ca.DM(max_action), 1, self.N))
-        self._graph.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(self._graph.X[self.rest_idx, self.N]))
+        self._graph, self.u_ref_param = self._problem()
         self.reset()
+
+    def _problem(self) -> tuple[CasadiKinematicGraph, ca.MX]:
+        """The projection problem and its ``u_ref``."""
+        graph = CasadiKinematicGraph(self.sim, self.N)
+        max_action = np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1)
+        # Cost: track the proposed chunk (each action divided by its limit) and come to rest at the end of the horizon
+        u_ref = graph.parameter(self.sim.nu, self.N)
+        tracking = ca.sumsqr((graph.U - u_ref) / ca.repmat(ca.DM(max_action), 1, self.N))
+        graph.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(graph.X[self.rest_idx, self.N]))
+        return graph, u_ref
 
     def reset(self) -> None:
         """Signals the start of a new episode: nothing of the last one is reused."""
@@ -116,8 +125,29 @@ class CasadiTrajectoryProjector:
             states[:, 1:] <= np.asarray(self.sim.state_upper_bounds)[:, None] + tolerance
         )
         at_rest = np.all(np.abs(states[self.rest_idx, self.N]) <= self.fallback_terminal_velocity_tol)
-        collision_free = all(self.sim.is_collision_free(states[: self.sim.n, k]) for k in range(1, self.N + 1))
+        collision_free = all(self.sim.collision.is_collision_free(states[: self.sim.n, k]) for k in range(1, self.N + 1))
         return states if within_limits and at_rest and collision_free else None
+
+    def _linearize(self, x0: np.ndarray, u_ref: np.ndarray) -> None:
+        """Linearize the obstacles along the rollout of the proposal ``u_ref`` from ``x0``."""
+        if self._graph.num_collision_pairs == 0:
+            return
+        self._graph.set_collision_halfspaces(*self.sim.collision.halfspaces(self.sim.rollout_positions(x0, u_ref)[1:]))
+
+    def _solve(self) -> GraphSolution:
+        """The converged solution of the problem set, which has to be clear of the obstacles."""
+        solution = self._graph.solve()
+        if not all(self.sim.collision.is_collision_free(solution.states[: self.sim.n, k]) for k in range(1, self.N + 1)):
+            raise RuntimeError("The projection penetrates an obstacle.")
+        return solution
+
+    @staticmethod
+    def _set_problem(
+        graph: CasadiKinematicGraph, u_ref_param: ca.MX, x0: np.ndarray, u_ref: np.ndarray, states: np.ndarray, actions: np.ndarray
+    ) -> None:
+        graph.set_state(x0)
+        graph.set_value(u_ref_param, u_ref.T)
+        graph.set_initial(states, actions)
 
     def project(self, state: np.ndarray, u_ref: np.ndarray) -> np.ndarray:
         """The projected actions (H, nu) of the proposed chunk ``u_ref`` (H, nu) from ``state``, the observed one of the
@@ -139,21 +169,18 @@ class CasadiTrajectoryProjector:
             state_guess = np.hstack([self._prev_X_sol[:, 1:], self._prev_X_sol[:, -1:]])
             u_guess = np.hstack([self._prev_U_sol[:, 1:], np.zeros((self.sim.nu, 1))])
 
-        self._graph.set_state(x0)
-        self._graph.set_value(self.u_ref_param, u_ref.T)
-        if self._graph.num_collision_pairs > 0:
-            self._graph.update_collision_halfspaces(self.sim.rollout_positions(x0, u_ref)[1:])
-        self._graph.set_initial(state_guess, u_guess)
-
         try:
             try:
-                sol = self._graph.solve()
+                self._linearize(x0, u_ref)
+                self._set_problem(self._graph, self.u_ref_param, x0, u_ref, state_guess, u_guess)
+                sol = self._solve()
             except RuntimeError:
                 # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
                 # prediction: a cold restart resolves most of those
                 cold_states, cold_actions = self._hold_still_guess(x0)
-                self._graph.set_initial(cold_states, cold_actions)
-                sol = self._graph.solve()
+                self._linearize(x0, u_ref)
+                self._set_problem(self._graph, self.u_ref_param, x0, u_ref, cold_states, cold_actions)
+                sol = self._solve()
             self._prev_X_sol = sol.states
             self._prev_U_sol = sol.actions
             self._prev_x0 = x0

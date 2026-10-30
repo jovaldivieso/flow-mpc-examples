@@ -49,6 +49,11 @@ class PointMassSystem(TripleIntegratorBase):
         """Position error of ``state`` with respect to the goal, and the orientation error (none: 0)."""
         return float(np.linalg.norm(np.asarray(state, dtype=float)[: self.n] - self.goal)), 0.0
 
+    def goal_task_error(self, q: np.ndarray, goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+        """The position error to the goal, with the identity as Jacobian."""
+        error = np.asarray(goal, dtype=float) - np.asarray(q, dtype=float)[: self.n]
+        return error, np.eye(self.n), float(np.linalg.norm(error))
+
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
         """The configuration the planners drive to for ``goal`` (here the goal is a configuration itself)."""
         return np.asarray(goal, dtype=float).copy()
@@ -69,7 +74,7 @@ class PointMassSystem(TripleIntegratorBase):
 
     def collides(self, state: np.ndarray) -> bool:
         """The point mass is its own bounding sphere: it collides when that sphere penetrates an obstacle."""
-        return not self.is_collision_free(np.asarray(state, dtype=float)[: self.n])
+        return not self.collision.is_collision_free(np.asarray(state, dtype=float)[: self.n])
 
     def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
         """What the policy sees: the goal relative to the point, ``g - p``, and the velocity and acceleration. Nothing
@@ -103,7 +108,7 @@ class PointMassSystem(TripleIntegratorBase):
         """Sample a random collision-free position inside the workspace."""
         for _ in range(SAMPLING_ATTEMPTS):
             q = rng.uniform(*self.workspace_bounds, size=self.n)
-            if self.is_collision_free(q):
+            if self.collision.is_collision_free(q):
                 return q
         raise RuntimeError(f"Unable to sample a collision-free configuration in {SAMPLING_ATTEMPTS} attempts.")
 

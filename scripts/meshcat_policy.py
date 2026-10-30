@@ -158,7 +158,7 @@ def main() -> None:
         viz.viewer["point"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0x2060FF))
         viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
         show = lambda state: viz.viewer["point"].set_transform(tf.translation_matrix(dyn.tcp_position(state[: dyn.n])))
-    draw_obstacles(viz, dyn.obstacles)
+    draw_obstacles(viz, dyn.collision.obstacles)
     if args.show_collision_geometry:
         draw_collision_spheres(viz, dyn.collision_spheres(rollouts[0][2].states[0][: dyn.n])[2])
         show_robot = show

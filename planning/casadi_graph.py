@@ -3,7 +3,7 @@ from typing import NamedTuple
 import casadi as ca
 import numpy as np
 
-from systems.kinematic_collision_system import KinematicCollisionSystem
+from systems.triple_integrator import TripleIntegratorBase
 
 # structure_detection "auto" needs the stage-wise layout of ``CasadiKinematicGraph``; the mapped dynamics are expanded to SX.
 # FATROP has no warm start option: the initial barrier parameter mu_init is what makes it start close to the solution it is
@@ -80,7 +80,7 @@ class CasadiKinematicGraph:
     ``X`` and ``U`` are the symbolic expressions its owner builds its cost from; everything else of ``opti`` stays here.
     """
 
-    def __init__(self, simulator: KinematicCollisionSystem, horizon: int) -> None:
+    def __init__(self, simulator: TripleIntegratorBase, horizon: int) -> None:
         self.sim = simulator
         self.N = int(horizon)
         self.n_joints = simulator.n
@@ -89,7 +89,7 @@ class CasadiKinematicGraph:
         self.opti = ca.Opti()
         self.x0_param = self.opti.parameter(nx)
 
-        obstacles = self.sim.obstacles
+        obstacles = self.sim.collision.obstacles
         num_spheres = len(self.sim.collision_spheres(np.zeros(n))[2]) if obstacles else 0
         self.num_collision_pairs = num_spheres * len(obstacles)
         P = self.num_collision_pairs
@@ -179,9 +179,12 @@ class CasadiKinematicGraph:
     def update_collision_halfspaces(self, q_ref: np.ndarray) -> None:
         """Linearize the obstacle half-spaces along ``q_ref`` (N, n_joints)."""
         if self.num_collision_pairs > 0:
-            A, b = self.sim.collision_halfspaces(q_ref)
-            self.opti.set_value(self.A_coll, A.reshape(-1, self.n_joints))
-            self.opti.set_value(self.b_coll, b.reshape(-1))
+            self.set_collision_halfspaces(*self.sim.collision.halfspaces(q_ref))
+
+    def set_collision_halfspaces(self, A: np.ndarray, b: np.ndarray) -> None:
+        """The half-spaces ``collision_halfspaces`` returned, (N, P, n_joints) and (N, P)."""
+        self.opti.set_value(self.A_coll, A.reshape(-1, self.n_joints))
+        self.opti.set_value(self.b_coll, b.reshape(-1))
 
     def solve(self) -> GraphSolution:
         """Solve from the initial values set; raises ``RuntimeError`` if the solver fails."""
@@ -194,7 +197,7 @@ class CasadiKinematicGraph:
         if self.num_collision_pairs == 0:
             return sol
         X_first = sol.value(self.X)
-        if all(self.sim.is_collision_free(X_first[: self.n_joints, k]) for k in range(1, self.N + 1)):
+        if all(self.sim.collision.is_collision_free(X_first[: self.n_joints, k]) for k in range(1, self.N + 1)):
             return sol
         self.set_initial(X_first, sol.value(self.U))
         self.update_collision_halfspaces(X_first[: self.n_joints, 1:].T)

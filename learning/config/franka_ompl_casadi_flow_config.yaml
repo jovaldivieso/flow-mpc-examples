@@ -21,11 +21,11 @@ training:
   expert_beta_per_iteration: [0.80, 0.4, 0.2, 0.0]
   eval_episodes: 100
   tolerance_overrides:
-    pos_tol: 0.05
-    vel_tol: 0.02
+    pos_tol: 0.03
+    vel_tol: 0.01
   # Deliberately more relaxed than tolerance_overrides above, falls back to tolerance_overrides if omitted.
   eval_tolerance_overrides:
-    pos_tol: 0.3
-    vel_tol: 0.01
+    pos_tol: 0.05
+    vel_tol: 0.02
   num_workers: 4
 

@@ -72,12 +72,13 @@ def _policy_input(simulator: FrankaSystem, state: np.ndarray) -> dict[str, torch
     }
 
 
-def _build_safe_flow_policy(simulator, planner_config=None, **policy_options) -> SafeFlowMPCPolicy:
+def _build_safe_flow_policy(simulator, planner_config=None, *, guided=False, **policy_options) -> SafeFlowMPCPolicy:
     # The flow policy conditions directly on observation_features:
-    # environment_state(19) + state(21) = 40 = simulator.environment_dim + simulator.nx.
+    # environment_state(81) + state(21) = 102 = simulator.environment_dim + simulator.nx.
     # The chunk is jerks, scaled by their limits exactly as DaggerTrainer passes it;
     # planner_config defaults to the validated expert config, as it does there. policy_options are the
-    # safeflow options (flow_init, use_guidance).
+    # safeflow options (flow_init). The tests of the projection wiring run unguided: the flow's guidance
+    # (test_pose_guidance.py) would move what the projector is handed.
     policy = PolicyFactory.create(
         "safeflow",
         action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx, unet_dim=8, unet_dim_mults=(1, 2), prediction_horizon=HORIZON,
@@ -86,6 +87,8 @@ def _build_safe_flow_policy(simulator, planner_config=None, **policy_options) ->
         **policy_options,
     )
     assert isinstance(policy, SafeFlowMPCPolicy)
+    if not guided:
+        policy.inner_policy.guidance = None
     return policy
 
 
@@ -313,8 +316,8 @@ class SelectActionProjectionTests(unittest.TestCase):
         real_project = policy.projector.project
         calls: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
 
-        def recording_project(state: np.ndarray, q_ref: np.ndarray) -> np.ndarray:
-            q_safe = real_project(state, q_ref)
+        def recording_project(state: np.ndarray, q_ref: np.ndarray, **options) -> np.ndarray:
+            q_safe = real_project(state, q_ref, **options)
             calls.append((state.copy(), q_ref.copy(), q_safe.copy()))
             return q_safe
 
@@ -350,6 +353,18 @@ class SelectActionProjectionTests(unittest.TestCase):
         self.assertEqual(tuple(action.shape), (1, HORIZON, simulator.nu))
         np.testing.assert_allclose(action[0].numpy(), last_projection, atol=1e-4)
         self.assertTrue(np.all(np.abs(last_projection) <= simulator.max_action + 1e-6))
+
+    def test_the_projector_is_handed_the_guided_proposal(self) -> None:
+        simulator = _build_simulator()
+        policy = _build_safe_flow_policy(simulator, guided=True)
+        _zero_the_network(policy)
+        calls = self._recording_projector(policy)
+
+        with mock.patch.object(policy.inner_policy.guidance, "guide", side_effect=lambda *_, proposal=None, **__: np.full((HORIZON, 7), 0.5)) as guide:
+            policy.select_action(_rest_observation_dict(simulator))
+
+        self.assertEqual(guide.call_count, policy.inner_policy.velocity_net.num_inference_steps)
+        np.testing.assert_allclose(calls[0][1], 0.5)
 
     def test_reset_clears_the_projectors_warm_start(self) -> None:
         # Without this, a new episode's first solve would warm start from

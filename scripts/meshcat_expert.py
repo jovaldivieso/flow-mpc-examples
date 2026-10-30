@@ -141,7 +141,7 @@ def main() -> None:
     viz = MeshcatVisualizer(robot.model, robot.collision_model, robot.visual_model)
     viz.initViewer(open=True)
     viz.loadViewerModel()
-    draw_obstacles(viz, dyn.obstacles)
+    draw_obstacles(viz, dyn.collision.obstacles)
     tcp_paths = [np.array([dyn.tcp_placement(s[: dyn.n]).translation for s in r[2]["states"]]) for r in results]
     draw_tcp_paths(viz, tcp_paths, [r[1][:3] for r in results], reached)
     draw_frame(viz, "goal")

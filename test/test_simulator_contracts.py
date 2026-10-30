@@ -19,7 +19,6 @@ import torch
 
 from planning.config import ConfigurationError, load_and_validate_system_config, validate_system_config
 from learning.data_utils import build_dataset_features, format_dataset_frame
-from systems.kinematic_collision_system import KinematicCollisionSystem
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
@@ -29,6 +28,7 @@ from systems.franka_kinematics import COLLISION_SPHERE_MAX_RADIUS
 from systems import franka_model
 from systems.franka_model import build_robot
 from systems.point_mass_system import PointMassSystem
+from systems.sphere_collision import SphereCollisionModel
 from systems.triple_integrator import TripleIntegratorBase
 from learning.models.policy_factory import PolicyFactory
 from planning.planner_factory import PlannerFactory
@@ -113,9 +113,10 @@ class SimulatorContractTests(unittest.TestCase):
 
     def test_dimensions_and_rest_state_indices(self) -> None:
         simulator = self.simulator
-        # observation = goal pose (12) + state (21); the policy sees the goal in the TCP frame (12) + q_rel (7) = 19
+        # observation = goal pose (12) + state (21); the policy sees the goal in the TCP frame (12), no goal configuration,
+        # and the centers of the 23 bounding spheres (69)
         self.assertEqual((simulator.nx, simulator.nu, simulator.obs_dim, simulator.goal_dim), (21, 7, 33, 12))
-        self.assertEqual(simulator.environment_dim, 19)
+        self.assertEqual(simulator.environment_dim, 12 + 3 * 23)
         self.assertEqual(simulator.max_action.shape, (simulator.nu,))
         self.assertEqual(simulator.state_lower_bounds.shape, (simulator.nx,))
         # state = [q, v, a]: the projector's terminal come-to-rest cost reads the velocities and accelerations
@@ -146,12 +147,11 @@ class SimulatorContractTests(unittest.TestCase):
             self.assertEqual(str(frame[name].dtype), feature["dtype"], name)
             self.assertEqual(len(feature["names"]), feature["shape"][0], name)
 
-        q = state[: simulator.n]
-        relative = simulator.tcp_placement(q).actInv(simulator.vector_pose(simulator.goal))
-        q_rel = simulator.goal_configuration(simulator.goal, q) - q
+        relative = simulator.tcp_placement(state[: simulator.n]).actInv(simulator.vector_pose(simulator.goal))
+        sphere_centers = simulator.collision_spheres(state[: simulator.n])[0]
         np.testing.assert_allclose(
             frame["observation.environment_state"],
-            np.concatenate([simulator.pose_vector(relative), q_rel]),
+            np.concatenate([simulator.pose_vector(relative), sphere_centers.ravel()]),
             atol=1e-6,
         )
         np.testing.assert_allclose(frame["observation.state"], state, atol=1e-6)
@@ -189,13 +189,25 @@ class SimulatorContractTests(unittest.TestCase):
 
         np.testing.assert_allclose(seen[:3], placement.rotation.T @ (goal.translation - placement.translation), atol=1e-6)
         np.testing.assert_allclose(seen[3:12].reshape(3, 3), placement.rotation.T @ goal.rotation, atol=1e-6)
-        np.testing.assert_allclose(
-            seen[12:], simulator.goal_configuration(simulator.goal, state[: simulator.n]) - state[: simulator.n], atol=1e-6
-        )
+        self.assertEqual(seen.shape, (simulator.environment_dim,))  # no goal joint configuration: IK is the experts'
         # the goal comes back from what the policy saw and the state
         rebuilt = simulator.observation_from_policy(seen, state[:])
         np.testing.assert_allclose(rebuilt[: simulator.goal_dim], simulator.goal, atol=1e-5)
         np.testing.assert_array_equal(rebuilt[simulator.goal_dim :], state)
+
+    def test_the_policy_sees_where_its_body_is_whatever_the_goal(self) -> None:
+        simulator = _build_simulator()
+        rng = np.random.default_rng(6)
+        state = simulator.reset(simulator.random_initial_state(rng))
+        simulator.randomize_goal_for_reset(rng)
+        first = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+        simulator.randomize_goal_for_reset(rng)
+        second = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+
+        expected = simulator.collision_spheres(state[: simulator.n])[0].ravel()  # base frame: forward kinematics of q only
+        np.testing.assert_allclose(first[12:], expected, atol=1e-6)
+        np.testing.assert_array_equal(first[12:], second[12:])
+        self.assertEqual(len(simulator.environment_state_names), simulator.environment_dim)
 
     def test_a_reached_goal_is_the_identity_in_the_tcp_frame(self) -> None:
         simulator = _build_simulator()
@@ -204,9 +216,7 @@ class SimulatorContractTests(unittest.TestCase):
 
         seen = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
 
-        np.testing.assert_allclose(
-            seen, np.concatenate([np.zeros(3), np.eye(3).ravel(), np.zeros(simulator.n)]), atol=1e-6
-        )
+        np.testing.assert_allclose(seen[:12], np.concatenate([np.zeros(3), np.eye(3).ravel()]), atol=1e-6)
 
     def test_set_goal_rejects_a_wrong_shape_and_copies_its_input(self) -> None:
         simulator = _build_simulator()
@@ -352,7 +362,7 @@ class CollisionModelTests(unittest.TestCase):
             q = rng.uniform(lower, upper)
             if simulator.collides(q):
                 collisions += 1
-                self.assertFalse(simulator.is_collision_free(q), f"the spheres miss a real collision at q={q.tolist()}")
+                self.assertFalse(simulator.collision.is_collision_free(q), f"the spheres miss a real collision at q={q.tolist()}")
         self.assertGreater(collisions, 50)  # the sample does reach the obstacles
 
     def test_the_hand_and_fingers_count_not_only_the_axis_of_the_arm(self) -> None:
@@ -363,26 +373,35 @@ class CollisionModelTests(unittest.TestCase):
         simulator = _build_simulator(obstacles=[{"position": beside_the_hand.tolist(), "radius": 0.02}])
 
         self.assertTrue(simulator.collides(Q_READY))
-        self.assertFalse(simulator.is_collision_free(Q_READY))
+        self.assertFalse(simulator.collision.is_collision_free(Q_READY))
 
     def test_a_system_without_obstacles_never_collides(self) -> None:
         self.assertFalse(_build_simulator().collides(Q_READY))
 
 
-class KinematicCollisionInterfaceTests(unittest.TestCase):
-    """What the planners use of a system is declared by ``KinematicCollisionSystem``, which both systems implement."""
+class CollisionInterfaceTests(unittest.TestCase):
+    """What the planners use of a system is declared by ``TripleIntegratorBase``: its ``collision`` model, the path box and
+    the goal configuration."""
 
-    def test_both_systems_are_kinematic_collision_systems_with_obstacles_and_a_path_box(self) -> None:
+    def test_both_systems_have_a_collision_model_without_obstacles_and_a_path_box(self) -> None:
         for simulator in (_build_simulator(), _TripleIntegratorFactory.build()):
             with self.subTest(system=type(simulator).__name__):
-                self.assertIsInstance(simulator, KinematicCollisionSystem)
-                self.assertEqual(simulator.obstacles, [])
+                self.assertIsInstance(simulator, TripleIntegratorBase)
+                self.assertIsInstance(simulator.collision, SphereCollisionModel)
+                self.assertEqual(simulator.collision.obstacles, [])
                 self.assertEqual(simulator.path_lower.shape, (simulator.n,))
                 self.assertTrue(np.all(simulator.path_lower < simulator.path_upper))
 
+    def test_the_collision_model_uses_the_bounding_spheres_of_its_system(self) -> None:
+        simulator = _build_simulator()
+        centers, _, radii = simulator.collision_spheres(Q_READY)
+        simulator.collision.obstacles.append((centers[0].copy(), 0.01))
+
+        self.assertFalse(simulator.collision.is_collision_free(Q_READY))
+
     def test_the_interface_cannot_be_instantiated_without_its_geometry(self) -> None:
         with self.assertRaises(TypeError):
-            KinematicCollisionSystem({})
+            TripleIntegratorBase({})
 
     def test_the_state_the_policy_sees_gives_the_plant_state(self) -> None:
         arm = _build_simulator()
@@ -670,7 +689,7 @@ class PointMassSystemTests(unittest.TestCase):
         simulator.randomize_goal_for_reset(np.random.default_rng(0))
         observation = simulator.policy_observation(simulator.observe(np.concatenate([simulator.goal, np.zeros(4)])))
         batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
-        for policy_type, extra in (("flow", {}), ("safeflow", {"simulator": simulator, "planner_config": self.config})):
+        for policy_type, extra in (("flow", {"simulator": simulator}), ("safeflow", {"simulator": simulator, "planner_config": self.config})):
             with self.subTest(policy_type=policy_type):
                 policy = PolicyFactory.create(
                     policy_type, action_dim=2, state_dim=sum(value.shape[0] for value in observation.values()),

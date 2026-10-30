@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import multiprocessing
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -21,7 +22,7 @@ from systems.seed_utils import (
     torch_inference_seed_for_rollout,
 )
 from learning.data_utils import format_dataset_frame
-from learning.models.policy_factory import PolicyFactory
+from learning.models.policy_factory import PolicyFactory, load_policy_state_dict
 from planning.ompl_planner import initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
@@ -56,6 +57,8 @@ class _EvalEpisodeResult(NamedTuple):
     rollout_steps: int
     failure_reason: str | None
     is_config_sourced: bool
+    inference_seconds: float  # the wall-clock time of the policy calls of the episode that returned an action
+    inference_calls: int
 
 
 def build_policy_action(
@@ -424,6 +427,7 @@ class RolloutEvaluator:
         settings = self.settings
         initial_state = settings.starts.begin(self.simulator, episode_idx, seed_spec)
         torch.manual_seed(torch_inference_seed_for_rollout(settings.action_noise_seed, seed_spec=seed_spec))
+        call_times: list[float] = []
         reached_goal, rollout_steps, failure_reason = rollout_policy_with_action_fn(
             simulator=self.simulator,
             initial_state=initial_state,
@@ -432,8 +436,11 @@ class RolloutEvaluator:
             reset_fn=self.reset_fn,
             action_noise_std=settings.action_noise_std,
             action_noise_rng=action_noise_rng_for_rollout(settings.action_noise_seed, seed_spec=seed_spec),
+            call_times=call_times,
         )
-        return _EvalEpisodeResult(reached_goal, int(rollout_steps), failure_reason, settings.starts.is_provided(episode_idx))
+        return _EvalEpisodeResult(
+            reached_goal, int(rollout_steps), failure_reason, settings.starts.is_provided(episode_idx), sum(call_times), len(call_times)
+        )
 
 
 class RolloutWorker:
@@ -470,12 +477,12 @@ class RolloutWorker:
             return None
         kwargs = dict(spec.policy_kwargs)
         policy_type = kwargs.pop("policy_type")
+        kwargs["simulator"] = self.simulator
         if policy_type == "safeflow":
-            kwargs["simulator"] = self.simulator
             kwargs["planner_config"] = spec.config
         policy = PolicyFactory.create(policy_type, **kwargs).to(torch.device("cpu")).eval()
         if spec.policy_state_dict is not None:
-            policy.load_state_dict(spec.policy_state_dict)
+            load_policy_state_dict(policy, spec.policy_state_dict)
         return policy
 
     def __call__(self, task: int | tuple[int, int]) -> _CollectionAttemptResult | _EvalEpisodeResult:
@@ -602,8 +609,10 @@ def rollout_policy_with_action_fn(
     reset_fn: Callable[[], None] | None = None,
     action_noise_std: float = 0.0,
     action_noise_rng: np.random.Generator | None = None,
+    call_times: list[float] | None = None,
 ) -> tuple[bool, int, str | None]:
-    """Returns (reached_goal, steps_taken, failure_reason).
+    """Returns (reached_goal, steps_taken, failure_reason). The wall-clock duration of every ``action_fn`` call that
+    returned an action is appended to ``call_times``.
 
     failure_reason is None on success, else one of "timeout" (ran out of steps
     without reaching tolerance), "solve_failure" (action_fn itself raised) or
@@ -618,6 +627,7 @@ def rollout_policy_with_action_fn(
     if termination.update(state):
         return True, 0, None
     for step in range(1, num_steps + 1):
+        call_start = time.perf_counter()
         try:
             action = action_fn(simulator.observe(state))
         except PlannerSolveError as exc:
@@ -629,8 +639,10 @@ def rollout_policy_with_action_fn(
             # 1-indexed loop counter) overcounts the actually-executed steps
             # by one -- step - 1 matches every other return in this function,
             # each of which only reaches `step` after simulator.step() ran.
-            print(f"Policy solve failed during evaluation at step={step}: {exc}")
+            print(f"Safeflow policy solve failed during evaluation at step={step}: {exc}")
             return False, step - 1, "solve_failure"
+        if call_times is not None:
+            call_times.append(time.perf_counter() - call_start)
         state = simulator.step(state, apply_execution_noise(simulator, action, action_noise_std, action_noise_rng))
         if simulator.collides(state):
             return False, step, "collision"
@@ -674,6 +686,8 @@ def _summarize_evaluation(results: list[_EvalEpisodeResult]) -> DaggerEvalMetric
     successes = config_successes = config_episodes = random_successes = random_episodes = 0
     timeout_failures = solve_failures = collision_failures = 0
     steps_taken: list[int] = []
+    inference_seconds = sum(res.inference_seconds for res in results)
+    inference_calls = sum(res.inference_calls for res in results)
     for res in results:
         successes += int(res.reached_goal)
         steps_taken.append(res.rollout_steps)
@@ -702,6 +716,7 @@ def _summarize_evaluation(results: list[_EvalEpisodeResult]) -> DaggerEvalMetric
         timeout_failures=timeout_failures,
         solve_failures=solve_failures,
         collision_failures=collision_failures,
+        mean_inference_ms=1000.0 * inference_seconds / inference_calls if inference_calls else None,
     )
 
 

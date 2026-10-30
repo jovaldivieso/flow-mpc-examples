@@ -354,8 +354,8 @@ def load_policy(
             if action_scale_raw is not None:
                 policy_kwargs["action_scale"] = list(action_scale_raw)
         policy_kwargs["num_inference_steps"] = num_inference_steps
+    policy_kwargs["simulator"] = simulator
     if policy_type == "safeflow":
-        policy_kwargs["simulator"] = simulator
         policy_kwargs["planner_config"] = planner_config
         if isinstance(flow_config_raw, Mapping):
             policy_kwargs["flow_init"] = flow_config_raw.get("safeflow_init", "previous_safe")

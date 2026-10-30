@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
-from systems.kinematic_collision_system import KinematicCollisionSystem
+from systems.triple_integrator import TripleIntegratorBase
 from planning.casadi_planner import CasadiPlanner
 from planning.ompl_initial_guess import OmplInitialGuess
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Planner
 
-PlannerBuilder = Callable[[KinematicCollisionSystem, Mapping[str, Any]], Planner]
+PlannerBuilder = Callable[[TripleIntegratorBase, Mapping[str, Any]], Planner]
 
 
-def build_ompl_casadi_planner(simulator: KinematicCollisionSystem, config: Mapping[str, Any]) -> Planner:
+def build_ompl_casadi_planner(simulator: TripleIntegratorBase, config: Mapping[str, Any]) -> Planner:
     """The MPC with the goal configuration and the first guess of an OMPL RRT-Connect path (``OmplInitialGuess``)."""
     path_planner = OmplPlanner(simulator, config)
     return CasadiPlanner(
@@ -37,7 +37,7 @@ class PlannerFactory:
     @staticmethod
     def create(
         planner_name: str,
-        simulator: KinematicCollisionSystem,
+        simulator: TripleIntegratorBase,
         config: Mapping[str, Any],
     ) -> Planner:
         try:

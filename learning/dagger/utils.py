@@ -106,6 +106,8 @@ def print_rollout_metrics(label: str, prefix: str, metrics: DaggerEvalMetrics) -
             f"  {prefix}_failure_breakdown: timeout={metrics.timeout_failures} "
             f"solve_failure={metrics.solve_failures} collision={metrics.collision_failures} (of {total_failures} failures)"
         )
+    if metrics.mean_inference_ms is not None:
+        print(f"  {prefix}_mean_inference_time: {metrics.mean_inference_ms:.1f} ms per policy call")
 
 
 def evaluation_seed_specs(

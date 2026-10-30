@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from systems.kinematic_collision_system import KinematicCollisionSystem
+from systems.triple_integrator import TripleIntegratorBase
 
 
 class PlannerSolveError(RuntimeError):
@@ -11,7 +11,7 @@ class PlannerSolveError(RuntimeError):
     pass
 
 
-def goal_configuration(simulator: KinematicCollisionSystem, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
+def goal_configuration(simulator: TripleIntegratorBase, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
     """The configuration of ``goal`` nearest to ``q_reference``, or ``PlannerSolveError`` if there is none."""
     try:
         return simulator.goal_configuration(goal, q_reference)

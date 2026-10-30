@@ -14,6 +14,7 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from planning.casadi_planner import CasadiPlanner
+from planning.casadi_graph import GraphSolution
 from planning.casadi_projector import CasadiTrajectoryProjector
 from planning.planner import PlannerSolveError
 from test.planner_fixtures import pose_goal
@@ -323,14 +324,53 @@ class ProjectionFeasibilityTests(unittest.TestCase):
 
         obs_config = _validated_config(obstacles=[{"position": target_tcp, "radius": 0.05}])
         obs_sim = FrankaSystem(obs_config)
-        self.assertTrue(obs_sim.is_collision_free(state))
-        self.assertFalse(obs_sim.is_collision_free(rollout_q[-1]))
+        self.assertTrue(obs_sim.collision.is_collision_free(state))
+        self.assertFalse(obs_sim.collision.is_collision_free(rollout_q[-1]))
 
         projector = CasadiTrajectoryProjector(obs_sim, obs_config, horizon=HORIZON)
         projected = projector.project(state, proposal)
         projected_q = obs_sim.rollout_positions(state, projected)
         for q in projected_q[1:]:
-            self.assertTrue(obs_sim.is_collision_free(q), "projected trajectory collided with obstacle")
+            self.assertTrue(obs_sim.collision.is_collision_free(q), "projected trajectory collided with obstacle")
+
+
+class PerStepProjectionTests(unittest.TestCase):
+    """Every Euler step is a converged solve, linearized along its own proposal, whose solution has to clear the obstacles."""
+
+    def setUp(self) -> None:
+        self.state = _rest_state(FrankaSystem(_validated_config()))
+        rollout_q = FrankaSystem(_validated_config()).rollout_positions(self.state, _moving_chunk())
+        self.config = _validated_config(
+            terminal_velocity_weight=500.0,
+            obstacles=[{"position": FrankaSystem(_validated_config()).tcp_position(rollout_q[-1]).tolist(), "radius": 0.05}],
+        )
+        self.simulator = FrankaSystem(self.config)
+        self.projector = CasadiTrajectoryProjector(self.simulator, self.config, horizon=HORIZON)
+
+    def test_the_obstacles_are_linearized_at_every_step(self) -> None:
+        real_halfspaces = self.simulator.collision.halfspaces
+        calls: list[int] = []
+        self.simulator.collision.halfspaces = lambda q: calls.append(len(q)) or real_halfspaces(q)
+
+        for _ in range(3):  # the Euler steps of one tick
+            self.projector.project(self.state, _moving_chunk())
+
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_every_projection_clears_the_obstacles(self) -> None:
+        for _ in range(3):
+            projected = self.projector.project(self.state, _moving_chunk())
+            for q in self.simulator.rollout_positions(self.state, projected)[1:]:
+                self.assertTrue(self.simulator.collision.is_collision_free(q))
+
+    def test_a_solution_that_still_penetrates_an_obstacle_is_a_failed_projection(self) -> None:
+        simulator = self.simulator
+        simulator.collision.obstacles[:] = [(simulator.tcp_position(self.state[: simulator.n]), 0.05)]  # on the TCP of the start
+        at_start = np.tile(self.state[:, None], (1, HORIZON + 1))
+        self.projector._graph.solve = lambda: GraphSolution(at_start, np.zeros((simulator.nu, HORIZON)))
+
+        with self.assertRaises(PlannerSolveError):
+            self.projector.project(self.state, _moving_chunk())
 
 
 if __name__ == "__main__":

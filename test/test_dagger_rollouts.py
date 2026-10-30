@@ -573,6 +573,47 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         self.assertEqual(metrics.timeout_failures, 1)
         self.assertEqual(metrics.solve_failures, 1)
 
+    def test_the_mean_inference_time_pools_the_calls_that_returned_an_action(self) -> None:
+        simulator = _FakeSimulator(goal_threshold=1000.0)
+        durations = iter([0.010, 0.030, 0.020])  # the call that fails is not timed
+
+        def action_fn(observation: np.ndarray) -> np.ndarray:
+            if float(np.asarray(observation)[0]) == 5.0:
+                raise PlannerSolveError("forced failure for test")
+            return np.array([0.0])
+
+        clock = mock.patch("learning.dagger.rollouts.time.perf_counter", side_effect=self._clock(durations))
+        with clock:
+            metrics = evaluate_policy_rollouts(
+                simulator=simulator, num_episodes=2, num_steps=3, seed_start=0, action_fn=action_fn,
+                initial_states=[[0.0], [5.0]],
+            )
+
+        assert metrics is not None
+        self.assertAlmostEqual(metrics.mean_inference_ms, 20.0)
+
+    @staticmethod
+    def _clock(durations):
+        """A perf_counter whose consecutive (start, end) readings are ``durations`` apart."""
+        readings: list[float] = []
+        now = 0.0
+        for duration in durations:
+            readings += [now, now + duration]
+            now += duration + 1.0
+        return iter(readings + [now] * 20).__next__
+
+    def test_an_evaluation_in_which_every_call_fails_has_no_inference_time(self) -> None:
+        def failing(observation: np.ndarray) -> np.ndarray:
+            raise PlannerSolveError("forced failure for test")
+
+        metrics = evaluate_policy_rollouts(
+            simulator=_FakeSimulator(goal_threshold=1000.0), num_episodes=1, num_steps=2, seed_start=0,
+            action_fn=failing, initial_states=[[0.0]],
+        )
+
+        assert metrics is not None
+        self.assertIsNone(metrics.mean_inference_ms)
+
     def test_an_episode_that_touches_an_obstacle_fails_as_a_collision_even_at_the_goal(self) -> None:
         # the state steps to 1.0, which is both at the goal and inside the obstacle
         simulator = _FakeSimulator(goal_threshold=1.0, collision_threshold=1.0)
