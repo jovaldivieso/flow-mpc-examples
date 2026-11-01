@@ -95,7 +95,7 @@ class PointMassSystem(TripleIntegratorBase):
         return float(np.linalg.norm(np.asarray(state, dtype=float)[: self.n] - self.goal)), 0.0
 
     def goal_task_error(self, q: np.ndarray, goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        """The position error to the goal, with the identity as Jacobian."""
+        """The position error to the goal, with the identity as the Jacobian of the error (``e(q + dq) = e(q) - dq``)."""
         error = np.asarray(goal, dtype=float) - np.asarray(q, dtype=float)[: self.n]
         return error, np.eye(self.n), float(np.linalg.norm(error))
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping
 
+from planning.casadi_graph import SLACK_TOLERANCE
 from systems.config_fields import (
     ConfigurationError,
     read_bool,
@@ -21,6 +22,9 @@ class PlannerConfig:
     r_weight: float = 0.1
     r_diag: tuple[float, ...] = ()
     terminal_cost_multiplier: float = 10.0
+    # Read by CasadiPlanner: the obstacle slack [m] its solutions may use. Above SLACK_TOLERANCE a state the strict solve
+    # rejects is still labelled (the plan that brakes at the least violation); the projector always keeps SLACK_TOLERANCE.
+    expert_slack_tolerance: float = SLACK_TOLERANCE
     # Read by CasadiTrajectoryProjector (planning/casadi_projector.py); a config
     # that omits them gets these defaults.
     terminal_velocity_weight: float = 1.0
@@ -34,6 +38,8 @@ class PlannerConfig:
             raise ConfigurationError("'horizon' must be positive.")
         if self.terminal_cost_multiplier <= 0:
             raise ConfigurationError("'terminal_cost_multiplier' must be positive.")
+        if self.expert_slack_tolerance < SLACK_TOLERANCE:
+            raise ConfigurationError(f"'expert_slack_tolerance' must be at least {SLACK_TOLERANCE}.")
         if self.terminal_velocity_weight <= 0:
             raise ConfigurationError("'terminal_velocity_weight' must be positive.")
         if self.fallback_terminal_velocity_tol < 0:
@@ -54,6 +60,7 @@ class PlannerConfig:
             r_weight=read_float(config, "R_weight", defaults.r_weight),
             r_diag=read_positive_vector(config["R_diag"], key="R_diag") if "R_diag" in config else (),
             terminal_cost_multiplier=read_float(config, "terminal_cost_multiplier", defaults.terminal_cost_multiplier),
+            expert_slack_tolerance=read_float(config, "expert_slack_tolerance", defaults.expert_slack_tolerance),
             terminal_velocity_weight=read_float(config, "terminal_velocity_weight", defaults.terminal_velocity_weight),
             fallback_terminal_velocity_tol=read_float(
                 config, "fallback_terminal_velocity_tol", defaults.fallback_terminal_velocity_tol
@@ -73,11 +80,13 @@ class OmplConfig:
     ompl_speed: float = 2.0
     # Distance [rad] from the optimized trajectory at which a new path is planned from where the arm is
     ompl_replan_distance: float = 0.5
+    # Length [rad] of the path ahead of the arm that the MPC heads for
+    ompl_lookahead: float = 1.5
     ompl_timeout: float = 5.0  # [s] per RRT-Connect solve
     ompl_seed: int = 0
 
     def __post_init__(self) -> None:
-        positive = ("ompl_speed", "ompl_replan_distance", "ompl_timeout")
+        positive = ("ompl_speed", "ompl_replan_distance", "ompl_lookahead", "ompl_timeout")
         for name in positive:
             if getattr(self, name) <= 0:
                 raise ConfigurationError(f"'{name}' must be positive.")

@@ -1,0 +1,88 @@
+# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm with a table: starts and goals drawn at random.
+# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
+system: franka
+dt: 0.1
+# The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
+# chunk length, at most this) of its planned jerks.
+horizon: 20
+# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0]: Q_diag weights the squared
+# position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
+# terminal_cost_multiplier the terminal node's Q cost.
+Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
+         2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+         0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
+# 1 / max_jerk^2
+R_diag: [4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3]
+terminal_cost_multiplier: 10.0
+# Obstacle slack [m] the expert accepts: where it cannot clear an obstacle within the limits (the arm too fast to brake in
+# time) its plan brakes at the least violation instead of failing, so those states are labelled too
+expert_slack_tolerance: 0.05
+# Limits of the arm [rad/s^2, rad/s^3]; joint position and velocity limits come from the URDF
+max_acceleration: 5.0
+max_jerk: 15.0
+
+# The expert planner (planning/planner_factory.py): ompl_casadi (the MPC with an OMPL RRT-Connect path as goal and first guess)
+expert: ompl_casadi
+
+# Settings of the OMPL path (ompl_casadi)
+ompl_speed: 0.5                 # rad/s the path is traversed at (its timing as the initial guess)
+ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner drove the arm away): plan a new path
+ompl_lookahead: 1.5              # rad of path length ahead of the arm that the MPC heads for
+ompl_timeout: 5.0               # s per RRT-Connect solve
+ompl_seed: 0
+
+# Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
+pos_tol: 0.03
+vel_tol: 0.01
+
+# Weight of the projector's soft rest at the end of the chunk (only the safeflow policy reads it): 100 leaves a terminal
+# velocity of about 0.003 rad/s
+terminal_velocity_weight: 100.0
+
+# Random start configurations and goal poses (the TCP pose of a random configuration): minimum TCP-to-goal distance [m]
+min_start_goal_distance: 0.3
+
+# The table: a 2 x 9 grid of spheres (0.14 m apart, at most sqrt(2) radii, so the four spheres of a cell leave no hole), a slab
+# 0.2 m thick at z = 0.4 .. 0.6 m, x = 0.30 .. 0.64 m, y = -0.66 .. 0.66 m, its front edge 0.3 m from the base. It is wide
+# enough that the arm cannot go down at its sides, only in front of it.
+obstacles:
+  - position: [0.40, -0.56, 0.50]
+    radius: 0.10
+  - position: [0.40, -0.42, 0.50]
+    radius: 0.10
+  - position: [0.40, -0.28, 0.50]
+    radius: 0.10
+  - position: [0.40, -0.14, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.00, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.14, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.28, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.42, 0.50]
+    radius: 0.10
+  - position: [0.40, 0.56, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.56, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.42, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.28, 0.50]
+    radius: 0.10
+  - position: [0.54, -0.14, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.00, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.14, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.28, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.42, 0.50]
+    radius: 0.10
+  - position: [0.54, 0.56, 0.50]
+    radius: 0.10
+
+initial_state_seed: 0
+action_noise_seed: 0
+

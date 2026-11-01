@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
@@ -25,9 +26,13 @@ from .policy_action import _policy_action_fn, apply_execution_noise
 from .workers import RolloutWorkerSpec, _init_rollout_worker, _run_worker_task
 
 
+MAX_CAUSE_LENGTH = 100  # characters of a failure cause kept for the round summary
+
+
 class _CollectionAttemptResult(NamedTuple):
     frames: list[dict[str, object]] | None
     discard_reason: str | None
+    failure_cause: str | None
     reached_goal: bool
     rollout_steps: int
     expert_executed_steps: int
@@ -77,7 +82,7 @@ class _CollectionEpisode:
     actor_is_expert: list[bool]
     planner_failures: int = 0
     policy_solve_fallbacks: int = 0
-    discard_reason: str | None = None
+    failure_cause: str | None = None
     reached_goal: bool = False
 
 
@@ -85,8 +90,9 @@ class RolloutCollector:
     """Collects the episodes of a DAgger round: every visited state is labeled with the expert's plan from it, whoever
     executes the step (the expert or the policy, mixed by ``expert_mixing_beta``).
 
-    An episode whose expert planner fails to solve is discarded (``discard_reason``); a failed policy solve falls back
-    to the expert's action of that step.
+    An episode whose expert planner fails to solve ends there and keeps the states it labeled before (``failure_cause``);
+    when that is its first state, nothing is left and the episode is discarded (``discard_reason``). A failed policy
+    solve falls back to the expert's action of that step.
     """
 
     def __init__(
@@ -177,7 +183,8 @@ class RolloutCollector:
                 f"goal={np.array2string(np.asarray(simulator.goal), precision=6)}"
             )
             episode.planner_failures += 1
-            episode.discard_reason = "the expert planner failed to solve"
+            episode.failure_cause = _failure_cause(exc)
+            episode.rollout_steps = step - 1
             return False
 
         use_expert_action = bool(episode.mixing_rng.random() < settings.expert_mixing_beta)
@@ -220,9 +227,11 @@ class RolloutCollector:
         stats_delta = {
             name: count - stats_before.get(name, 0) for name, count in self.expert_planner.statistics.items()
         }
+        discarded = episode.failure_cause is not None and not episode.frames
         return _CollectionAttemptResult(
-            frames=None if episode.discard_reason is not None else episode.frames,
-            discard_reason=episode.discard_reason,
+            frames=None if discarded else episode.frames,
+            discard_reason=f"the expert planner failed to solve at the first state: {episode.failure_cause}" if discarded else None,
+            failure_cause=episode.failure_cause,
             reached_goal=episode.reached_goal,
             rollout_steps=episode.rollout_steps,
             expert_executed_steps=sum(episode.actor_is_expert),
@@ -231,6 +240,12 @@ class RolloutCollector:
             policy_solve_fallbacks=episode.policy_solve_fallbacks,
             expert_statistics=stats_delta,
         )
+
+
+def _failure_cause(error: Exception) -> str:
+    """The first line of what made a solve fail: the solver's own error when there is one, else the error itself."""
+    lines = str(error.__cause__ or error).strip().splitlines()
+    return lines[0][:MAX_CAUSE_LENGTH] if lines else type(error).__name__
 
 
 class _CollectionTally:
@@ -243,6 +258,8 @@ class _CollectionTally:
         self.steps_taken: list[int] = []
         self.expert_executed_steps = self.total_executed_steps = 0
         self.planner_failures = self.discarded_episodes = self.policy_solve_fallbacks = 0
+        self.truncated_episodes = 0
+        self.expert_failure_causes: Counter[str] = Counter()
         self.expert_statistics: dict[str, int] = {name: 0 for name in expert_planner.statistics}
 
     def record(self, result: _CollectionAttemptResult) -> None:
@@ -252,6 +269,8 @@ class _CollectionTally:
         self.policy_solve_fallbacks += result.policy_solve_fallbacks
         for name, delta in result.expert_statistics.items():
             self.expert_statistics[name] = self.expert_statistics.get(name, 0) + delta
+        if result.failure_cause is not None:
+            self.expert_failure_causes[result.failure_cause] += 1
         if result.discard_reason is not None:
             self.discarded_episodes += 1
             print(
@@ -259,6 +278,7 @@ class _CollectionTally:
                 "retrying with a new initial state and goal."
             )
             return
+        self.truncated_episodes += int(result.failure_cause is not None)
         self.total_executed_steps += result.total_executed_steps
         self.expert_executed_steps += result.expert_executed_steps
         if not result.frames:
@@ -283,6 +303,8 @@ class _CollectionTally:
             discarded_episodes=self.discarded_episodes,
             planner_failures=self.planner_failures,
             policy_solve_fallbacks=self.policy_solve_fallbacks,
+            truncated_episodes=self.truncated_episodes,
+            expert_failure_causes=dict(self.expert_failure_causes),
             expert_statistics=self.expert_statistics,
         )
 
@@ -312,7 +334,8 @@ def collect_dagger_rollouts(
 
     Every visited state is labeled with the expert's plan from that state (its next ``prediction_horizon`` planned
     actions, the length of the policy's chunk), whoever executes the step. An episode whose expert planner fails to
-    solve is dropped as a whole and retried from a fresh initial state and goal.
+    solve ends there and keeps the states labeled before the failure; one that fails at its first state has none, and is
+    dropped and retried from a fresh initial state and goal.
     """
     # Scoped to initial-state/goal sampling only: action-noise and expert-mixing
     # randomness always keep varying by round_index, regardless of this flag.

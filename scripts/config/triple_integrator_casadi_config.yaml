@@ -26,6 +26,7 @@ expert: casadi
 # Settings of the OMPL path (ompl_casadi)
 ompl_speed: 0.5                 # m/s the path is traversed at (its timing as the initial guess)
 ompl_replan_distance: 0.5       # m from the MPC's last solution (the learner drove the point away): plan a new path
+ompl_lookahead: 1.5              # m of path length ahead of the arm that the MPC heads for
 ompl_timeout: 5.0               # s per RRT-Connect solve
 ompl_seed: 0
 

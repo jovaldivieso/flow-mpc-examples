@@ -18,7 +18,9 @@ def build_ompl_casadi_planner(simulator: TripleIntegratorBase, config: Mapping[s
     return CasadiPlanner(
         simulator,
         PlannerConfig.from_mapping(config),
-        initial_guess_generator=OmplInitialGuess(OmplPlanner(simulator, ompl_config), ompl_config.ompl_replan_distance),
+        initial_guess_generator=OmplInitialGuess(
+            OmplPlanner(simulator, ompl_config), ompl_config.ompl_replan_distance, ompl_config.ompl_lookahead
+        ),
     )
 
 

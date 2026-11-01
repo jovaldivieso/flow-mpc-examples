@@ -188,14 +188,22 @@ class FrankaSystem(TripleIntegratorBase):
         return self.data.oMf[self.tcp_id].copy()
 
     def goal_task_error(self, q: np.ndarray, goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-        """The TCP position error and the rotation vector of the orientation error (world frame), and the 6 x n
-        Jacobian of the TCP in the world-aligned frame, in ``q``."""
+        """The pose error of the TCP to the goal as the logarithm ``xi = log(T^-1 T_goal)`` in se(3) (translation part
+        ``rho``, rotation vector ``phi``, in the TCP frame, like the policy observes the goal), its 6 x n Jacobian in ``q``
+        with ``xi(q + dq) = xi(q) - J dq`` to first order, and the distance [m] of the TCP to the goal position.
+
+        With the twist ``nu = J_b dq`` of the TCP in its own frame (the body Jacobian), ``T`` moves as ``T exp(nu)``, so
+        ``T^-1 T_goal`` moves as ``exp(-nu) T^-1 T_goal``, a left perturbation: ``d xi = -J_l(xi)^-1 nu`` (``J_l`` the left
+        Jacobian of SE(3)). ``rho`` is the translation of the screw that carries the TCP onto the goal, which couples to
+        the rotation; it equals the position error in the TCP frame when there is no rotation error.
+        """
         q = np.asarray(q, dtype=float)[: self.n]
         placement, target = self.tcp_placement(q), self.vector_pose(goal)
-        position_error = target.translation - placement.translation
-        error = np.concatenate([position_error, pin.log3(target.rotation @ placement.rotation.T)])
-        jacobian = pin.computeFrameJacobian(self.model, self.data, q, self.tcp_id, pin.LOCAL_WORLD_ALIGNED)
-        return error, np.array(jacobian), float(np.linalg.norm(position_error))
+        relative = placement.actInv(target)
+        error = np.array(pin.log6(relative).vector)
+        body_jacobian = np.array(pin.computeFrameJacobian(self.model, self.data, q, self.tcp_id, pin.LOCAL))
+        jacobian = np.array(pin.Jlog6(relative.inverse())) @ body_jacobian
+        return error, jacobian, float(np.linalg.norm(relative.translation))
 
     def tcp_position(self, q: np.ndarray) -> np.ndarray:
         """The 3-D position of the TCP in configuration ``q`` (what the viewers draw)."""

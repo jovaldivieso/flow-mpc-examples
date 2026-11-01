@@ -654,6 +654,11 @@ class PointMassSystemTests(unittest.TestCase):
             x = simulator.predict_next_state(x, action)
             np.testing.assert_allclose(positions[k + 1], x[:n])
         np.testing.assert_allclose(positions[0], state[:n])
+        # the states of a rollout carry the velocities and accelerations of those positions
+        states = simulator.rollout_states(state, actions)
+        np.testing.assert_allclose(states[:, :n], positions)
+        np.testing.assert_allclose(states[-1], x)
+        self.assertEqual(states.shape, (len(actions) + 1, simulator.nx))
 
     def test_the_viewers_draw_the_position_padded_to_three_axes(self) -> None:
         np.testing.assert_array_equal(self.simulator.tcp_position(np.array([0.5, -0.25])), [0.5, -0.25, 0.0])

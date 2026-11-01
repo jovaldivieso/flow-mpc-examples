@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import numpy as np
+import pinocchio as pin
 import torch
 import yaml
 
@@ -52,6 +53,31 @@ class PoseGuidanceOnTheArmTests(unittest.TestCase):
         cls.goal = _arm_goal()
         cls.simulator = _arm(cls.goal)
 
+    def test_the_jacobian_of_the_task_error_is_its_derivative_whatever_the_orientation_error(self) -> None:
+        rng = np.random.default_rng(1)
+        for angle in (0.05, 0.5, 1.5, 2.8):
+            q = Q_GOAL + 0.1 * rng.standard_normal(7)
+            placement = self.simulator.tcp_placement(q)
+            axis = rng.standard_normal(3)
+            rotated = pin.exp3(angle * axis / np.linalg.norm(axis)) @ placement.rotation
+            goal = np.concatenate([placement.translation + 0.1, rotated.ravel()])
+
+            error, jacobian, distance = self.simulator.goal_task_error(q, goal)
+
+            relative = placement.actInv(pin.SE3(rotated, goal[:3]))
+            np.testing.assert_allclose(error, pin.log6(relative).vector, atol=1e-12)
+            self.assertAlmostEqual(distance, float(np.linalg.norm(goal[:3] - placement.translation)))
+
+            step = 1e-6
+            derivative = np.zeros((6, 7))
+            for joint in range(7):
+                delta = np.zeros(7)
+                delta[joint] = step
+                derivative[:, joint] = (
+                    self.simulator.goal_task_error(q + delta, goal)[0] - self.simulator.goal_task_error(q - delta, goal)[0]
+                ) / (2 * step)
+            np.testing.assert_allclose(derivative, -jacobian, atol=1e-6, err_msg=f"orientation error of {angle} rad")
+
     def test_close_to_the_goal_the_chunk_moves_the_tcp_toward_it_and_keeps_its_rest(self) -> None:
         guidance = PoseGuidance(self.simulator, HORIZON)
         q = Q_GOAL + 0.03 * np.random.default_rng(0).standard_normal(7)
@@ -65,6 +91,24 @@ class PoseGuidanceOnTheArmTests(unittest.TestCase):
         self.assertLess(self.simulator.goal_errors(after)[0], 0.5 * self.simulator.goal_errors(before)[0])
         np.testing.assert_allclose(after[7:], 0.0, atol=1e-3)  # the final velocity and acceleration are kept
         self.assertTrue(np.all(np.abs(guided) <= self.simulator.max_action + 1e-9))
+
+    def test_close_to_the_goal_the_chunk_comes_to_rest_and_far_from_it_the_motion_is_left(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        proposal = np.full((HORIZON, 7), 0.5)  # a chunk that ends moving
+        near = _rest_at(self.simulator, Q_GOAL + 0.03)
+        far = _rest_at(self.simulator, Q_READY)
+
+        guidance._start_distance = 5.0  # the episode started very far away: the goal is close
+        close = guidance.guide(*near, proposal)
+        guidance._start_distance = 1e-6  # the goal is as far as the start
+        away = guidance.guide(*far, proposal)
+
+        n = self.simulator.n
+        moving = _final_state(self.simulator, near[1], proposal)
+        for guided, state, rested in ((close, near[1], True), (away, far[1], False)):
+            final = _final_state(self.simulator, state, guided)
+            speed = np.linalg.norm(final[n:])
+            self.assertEqual(speed < 0.05 * np.linalg.norm(moving[n:]), rested)
 
     def test_far_from_the_goal_the_chunk_is_left_as_proposed(self) -> None:
         guidance = PoseGuidance(self.simulator, HORIZON)

@@ -180,12 +180,16 @@ class SystemSimulator(ABC):
         up to what the policy cannot see); here the policy sees the observation itself."""
         return np.concatenate([np.asarray(environment_state, dtype=float), np.asarray(state, dtype=float)])
 
-    def rollout_positions(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
-        """The positions ``(len(actions) + 1, n)`` of the plant applying ``actions`` from ``state``, row 0 the current one."""
+    def rollout_states(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """The states ``(len(actions) + 1, nx)`` of the plant applying ``actions`` from ``state``, row 0 the current one."""
         states = [np.asarray(state, dtype=float)]
         for action in actions:
             states.append(self.predict_next_state(states[-1], action))
-        return np.array(states)[:, : self.n]
+        return np.array(states)
+
+    def rollout_positions(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """The positions ``(len(actions) + 1, n)`` of the plant applying ``actions`` from ``state``, row 0 the current one."""
+        return self.rollout_states(state, actions)[:, : self.n]
 
     def reset(self, initial_state: np.ndarray) -> np.ndarray:
         """Start a rollout: a copy of ``initial_state``."""

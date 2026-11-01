@@ -23,20 +23,21 @@ class CasadiTrajectoryProjector:
     -------------------------------------------------
     State & Action           as in ``CasadiPlanner`` (x_k = [q_k, v_k, a_k], u_k = j_k).
     Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
-                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by all obstacles.
-    Parameters               x_init, u_ref, and linearized obstacle half-spaces (A_coll, b_coll) evaluated along the
-                             rollout of u_ref from x_init at the first Euler step of a control tick and at its last.
+                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by its free-space half-spaces.
+    Parameters               x_init, u_ref, and the linearized free-space half-spaces (A_coll, b_coll): at every node
+                             the set of each bounding sphere around its last step of the rollout of u_ref from x_init,
+                             linearized along that rollout (``SphereCollisionModel.halfspaces``).
 
     Cost                     min_{X, U, S}  sum_{k=0..N-1} ||(u_k - u_ref,k) / u_max||_2^2
-                                            + beta ||[v_N, a_N]||_2^2 + w_s ||S||_F^2
+                                            + beta ||[v_N, a_N]||_2^2 + w_1 sum(S) + w_2 ||S||_F^2
                              with beta = terminal_velocity_weight (driving the horizon to rest, a soft version of
-                             SafeFlowMPC's Eq. 12 so the problem stays feasible from high speed) and w_s = 10^5.
+                             SafeFlowMPC's Eq. 12 so the problem stays feasible from high speed), w_1 = 10^4 and w_2 = 1.
 
     Constraints              x_0 = x_init
                              x_{k+1} = A_d x_k + B_d u_k                 triple integrator (``sim.casadi_dynamics``)
                              -u_max <= u_k <= u_max                      action limits, k = 0 .. N-1
                              x_lower <= x_k <= x_upper                   position, velocity, acceleration limits, k = 1 .. N
-                             A_coll,k q_k + s_k >= b_coll,k,  s_k >= 0   linearized sphere-obstacle half-spaces, k = 1 .. N
+                             A_coll,k q_k + s_k >= b_coll,k,  s_k >= 0   linearized free-space half-spaces, k = 1 .. N
 
     The task goal is not part of the problem: the projector never reads the goal of its ``simulator`` (only the dynamics,
     the limits and the obstacles), so it can share the simulator of the rollout instead of holding a copy of its own.
@@ -44,15 +45,16 @@ class CasadiTrajectoryProjector:
     Solver Choice (``Opti`` + ``fatrop``)
     -------------------------------------
     During flow ODE integration, ``project`` is called at every Euler step, so solver latency dominates inference time.
-    The triple-integrator dynamics, state/action box limits, and linearized obstacle half-spaces are affine and the
+    The triple-integrator dynamics, state/action box limits, and linearized free-space half-spaces are affine and the
     tracking + terminal-rest objective is strictly convex quadratic, so the projection is a convex QP with the stage
     structure of an optimal control problem, solved in a few ms by **FATROP** (see ``CasadiKinematicGraph``) started from
     the previous solution across adjacent Euler steps and control ticks.
 
     Every Euler step of a tick is one such solve to convergence, linearized along the rollout of its own proposal. The
-    half-spaces are first-order, so a solution that still penetrates an obstacle is linearized again around itself and
-    solved once more (``CasadiKinematicGraph.solve``); if it still penetrates, the projection has failed, as it does in
-    SafeFlowMPC when the slack of its filter exceeds a tolerance (see above for what a failed projection does).
+    half-spaces are first-order, so a solution that still penetrates an obstacle or has a slack above the tolerance is
+    linearized again around itself and solved once more (``CasadiKinematicGraph.solve``); if it is still rejected, the
+    projection has failed, as it does in SafeFlowMPC when the slack of its filter exceeds a tolerance (see above for what
+    a failed projection does).
 
     Initial guess strategy
     ----------------------
@@ -127,10 +129,8 @@ class CasadiTrajectoryProjector:
         return states if within_limits and at_rest and collision_free else None
 
     def _linearize(self, x0: np.ndarray, u_ref: np.ndarray) -> None:
-        """Linearize the obstacles along the rollout of the proposal ``u_ref`` from ``x0``."""
-        if self._graph.num_collision_pairs == 0:
-            return
-        self._graph.set_collision_halfspaces(*self.sim.collision.halfspaces(self.sim.rollout_positions(x0, u_ref)[1:]))
+        """Linearize the obstacles along the rollout of the proposal ``u_ref`` from ``x0``, which the graph already holds."""
+        self._graph.update_collision_halfspaces(self.sim.rollout_positions(x0, u_ref)[1:])
 
     def _solve(self) -> GraphSolution:
         """The converged solution of the problem set, which has to be clear of the obstacles."""
@@ -169,15 +169,15 @@ class CasadiTrajectoryProjector:
 
         try:
             try:
-                self._linearize(x0, u_ref)
                 self._set_problem(self._graph, self.u_ref_param, x0, u_ref, state_guess, u_guess)
+                self._linearize(x0, u_ref)
                 sol = self._solve()
             except RuntimeError:
                 # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
                 # prediction: a cold restart resolves most of those
                 cold_states, cold_actions = self._hold_still_guess(x0)
-                self._linearize(x0, u_ref)
                 self._set_problem(self._graph, self.u_ref_param, x0, u_ref, cold_states, cold_actions)
+                self._linearize(x0, u_ref)
                 sol = self._solve()
             self._prev_X_sol = sol.states
             self._prev_U_sol = sol.actions

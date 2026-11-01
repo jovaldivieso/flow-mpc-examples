@@ -27,6 +27,7 @@ PINNED_EXPERT_SETTINGS = {
     "horizon": 20,
     "ompl_speed": 2.0,
     "ompl_replan_distance": 0.5,
+    "ompl_lookahead": 1.5,
     "ompl_timeout": 5.0,
     "ompl_seed": 0,
     "pos_tol": 0.005,

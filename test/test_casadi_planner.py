@@ -203,7 +203,7 @@ class PlannerBehaviorTests(unittest.TestCase):
         planner.plan(simulator.observe(state))
         planner.plan(simulator.observe(state))
 
-        self.assertEqual(planner.statistics, {"trajectory_optimizations": 2})
+        self.assertEqual(planner.statistics, {"trajectory_optimizations": 2, "relaxed_solutions": 0})
 
     def test_q_and_r_diagonals_must_match_the_state_and_action_dimensions(self) -> None:
         # The config does not know the system's dimensions; its scalar settings are validated when it is loaded
@@ -392,6 +392,16 @@ class InitialGuessGeneratorTests(unittest.TestCase):
         np.testing.assert_allclose(planner.goal_configuration, q_goal + 0.01)
         self.assertEqual(generator.calls[:2], ["begin_goal", "initial_plan"])
 
+    def test_the_planner_heads_for_the_target_of_the_generator_when_it_has_one(self) -> None:
+        simulator, planner, generator, state, q_goal = self._planner_and_state()
+        target = state[: simulator.n] + 0.1
+        generator.target = lambda q: target
+
+        planner.plan(simulator.observe(state))
+
+        np.testing.assert_allclose(planner._graph.opti.value(planner.goal_param)[: simulator.n], target)
+        np.testing.assert_allclose(planner.goal_configuration, q_goal)  # the goal configuration stays the end of the plan
+
     def test_the_generator_hears_of_new_goals_and_resets_and_sees_the_last_solution(self) -> None:
         simulator, planner, generator, state, _ = self._planner_and_state(plan_to_goal=False)
 
@@ -420,7 +430,7 @@ class InitialGuessGeneratorTests(unittest.TestCase):
         with mock.patch.object(planner, "_solve", side_effect=PlannerSolveError("forced")):
             with self.assertRaises(PlannerSolveError):
                 planner.plan(simulator.observe(state))
-        self.assertEqual(planner.statistics, {"trajectory_optimizations": 0})
+        self.assertEqual(planner.statistics, {"trajectory_optimizations": 0, "relaxed_solutions": 0})
 
     def test_the_planner_and_the_projector_compose_the_problem_skeleton(self) -> None:
         from planning.casadi_graph import CasadiKinematicGraph

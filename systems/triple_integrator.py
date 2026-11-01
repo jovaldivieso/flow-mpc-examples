@@ -170,8 +170,8 @@ class TripleIntegratorBase(SystemSimulator):
     @abstractmethod
     def goal_task_error(self, q: np.ndarray, goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
         """What moves the configuration ``q`` toward ``goal``: the task-space error ``e`` (m,) (the position error, then
-        the orientation error where there is one), the Jacobian ``J`` (m, n) with ``dx = J dq``, and the position error
-        norm (the first part of ``e``)."""
+        the orientation error where there is one), the Jacobian ``J`` (m, n) of the error with ``e(q + dq) = e(q) - J dq``
+        to first order, and the distance of the configuration to the goal position."""
 
     @abstractmethod
     def tcp_position(self, q: np.ndarray) -> np.ndarray:

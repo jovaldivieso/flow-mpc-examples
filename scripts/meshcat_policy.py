@@ -138,7 +138,8 @@ def main() -> None:
         position_error, rotation_error = dyn.goal_errors(rollout.states[-1])
         print(
             f"seed {seed}: {rollout.outcome}{' (' + rollout.detail + ')' if rollout.detail else ''} after {len(rollout.chunks)} steps | "
-            f"final error {position_error:.4f} | "
+            f"final position error {position_error:.4f} m, rotation error {rotation_error:.3f} rad, "
+            f"max joint speed {np.abs(rollout.states[-1][dyn.n : 2 * dyn.n]).max():.4f} rad/s | "
             f"largest planned excursion of the policy {max([np.abs(np.diff(dyn.rollout_positions(s, c), axis=0)).sum(axis=0).max() for s, c in zip(rollout.states, rollout.chunks)], default=0.0):.2f}"
         )
         rollouts.append((seed, goal, rollout))

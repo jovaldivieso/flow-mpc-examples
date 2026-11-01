@@ -67,7 +67,7 @@ def append_round_summary(
     collection_rounds = [r["aggregation_failures"] for r in rounds if "aggregation_failures" in r]
     summary["total_aggregation_failures"] = {
         key: sum(r[key] for r in collection_rounds)
-        for key in ("attempted_episodes", "discarded_episodes", "planner_failures", "policy_solve_fallbacks")
+        for key in ("attempted_episodes", "discarded_episodes", "truncated_episodes", "planner_failures", "policy_solve_fallbacks")
     }
     total_expert_statistics = Counter()
     for round_entry in rounds:

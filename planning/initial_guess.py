@@ -10,7 +10,8 @@ class InitialGuessGenerator(ABC):
 
     It is asked for a plan before every solve. A plan it returns ends at the goal configuration (which the planner then
     drives to) and is where the solve starts from; if that solve fails the plan itself is the solution. Returning none
-    leaves the planner to warm start from its own previous solution.
+    leaves the planner to warm start from its own previous solution. Before every solve it is also asked where to head
+    for (``target``), so that its plan keeps guiding the optimizer instead of only starting it.
     """
 
     @abstractmethod
@@ -25,6 +26,11 @@ class InitialGuessGenerator(ABC):
     def initial_plan(self, observation: np.ndarray, q: np.ndarray, last_positions: np.ndarray | None) -> Plan | None:
         """A plan from the configuration ``q`` of ``observation`` to its goal, or none. ``last_positions`` are the
         planner's previous solution (rows of configurations), none right after a reset or a new goal."""
+
+    def target(self, q: np.ndarray) -> np.ndarray | None:
+        """The configuration the optimizer heads for from ``q``, e.g. a point ahead on the path of its last plan, or
+        none: the goal configuration. It heads for the goal configuration unless a subclass says otherwise."""
+        return None
 
     @property
     def statistics(self) -> dict[str, int]:

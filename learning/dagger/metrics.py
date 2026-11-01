@@ -34,12 +34,16 @@ class DaggerEvalMetrics:
     # so it is a little more than a call alone takes); None when no call returned an action
     mean_inference_ms: float | None = None
     # Collection bookkeeping, only populated by collect_dagger_rollouts: how many episode attempts it took,
-    # how many were dropped (expert solve failure), how many expert solves failed, and how many times the
+    # how many were dropped (expert solve failure at the first state), how many expert solves failed, and how many times the
     # policy's own solve failed and the expert action was used instead.
     attempted_episodes: int = 0
     discarded_episodes: int = 0
     planner_failures: int = 0
     policy_solve_fallbacks: int = 0
+    # Episodes the expert planner failed in after their first state (they end there and keep what they labeled), and the
+    # number of expert failures per cause, whether the episode was truncated or discarded
+    truncated_episodes: int = 0
+    expert_failure_causes: Mapping[str, int] = field(default_factory=dict)
     # What the expert planner did during the collection (``Planner.statistics``, e.g. the OMPL paths it planned and
     # replanned), as the change over the collection
     expert_statistics: Mapping[str, int] = field(default_factory=dict)
@@ -92,10 +96,13 @@ class DaggerEvalMetrics:
             "aggregation_failures": {
                 "attempted_episodes": self.attempted_episodes,
                 "discarded_episodes": self.discarded_episodes,
+                "truncated_episodes": self.truncated_episodes,
                 "planner_failures": self.planner_failures,
                 "policy_solve_fallbacks": self.policy_solve_fallbacks,
             }
         }
+        if self.expert_failure_causes:
+            summary["aggregation_failures"]["expert_failure_causes"] = dict(self.expert_failure_causes)
         if self.expert_statistics:
             summary["expert_statistics"] = dict(self.expert_statistics)
         return summary

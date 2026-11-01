@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from learning.models.rest_projection import RestProjection
+from learning.models.smoothness import SmoothSpread
 from systems.triple_integrator import TripleIntegratorBase
 
 GUIDANCE_DECAY = 10.0  # alpha of the guidance weight (SafeFlowMPC, Eq. 14)
@@ -18,8 +20,10 @@ class PoseGuidance:
     reads no goal of its simulator. ``guide`` turns the proposed chunk of jerks into the chunk of the same plant whose
     positions are moved toward the goal, once per Euler step of the flow, before the projection.
 
-    For the positions q_k, k = 1..H, of the proposed chunk, the task error e_k (position, then orientation) gives the
-    damped Gauss-Newton step dq_k = (J^T J + a I)^-1 J^T e_k, and the positions are moved by w_k dq_k with
+    For the positions q_k, k = 1..H, of the proposed chunk, the task error e_k (the logarithm of the pose of the goal in the
+    TCP frame, in se(3)) and its Jacobian J_k, with e(q + dq) = e(q) - J dq (the body Jacobian times the left Jacobian of
+    SE(3), J_l^-1), give the damped Gauss-Newton step dq_k = (J^T J + a I)^-1 J^T e_k, and the
+    positions are moved by w_k dq_k with
 
         w_k = min(1, exp(-alpha (d_k / d_0 - beta))) k / H,
 
@@ -30,13 +34,19 @@ class PoseGuidance:
 
     M the linear map from the jerks of one joint to [q_1..q_H, v_H, a_H] (the exact triple integrator), so that the
     final velocity and acceleration of the chunk, which the policy brings to rest, are kept.
+
+    The moves of the positions are first spread along the chunk by the smoothness metric of CHOMP (``SmoothSpread``), so
+    that the correction is smooth in velocity and acceleration instead of the sum of one step per position.
     """
 
     def __init__(self, simulator: TripleIntegratorBase, horizon: int) -> None:
         self.sim = simulator
         self.horizon = int(horizon)
         self._start_distance: float | None = None
-        self._correction = self._correction_map()
+        jerk_to_state = self._jerk_to_state()
+        self._correction = self._correction_map(jerk_to_state)
+        self._rest = RestProjection(jerk_to_state[self.horizon :])
+        self._spread = SmoothSpread(self.horizon)
 
     @property
     def max_action(self) -> np.ndarray:
@@ -47,8 +57,8 @@ class PoseGuidance:
         """A new episode: the start distance is the one of its first call."""
         self._start_distance = None
 
-    def _correction_map(self) -> np.ndarray:
-        """The (H, H + 2) map from the wanted changes of [q_1..q_H, v_H, a_H] of a joint to its change of jerks."""
+    def _jerk_to_state(self) -> np.ndarray:
+        """The (H + 2, H) linear map from the jerks of one joint to [q_1..q_H, v_H, a_H] (the exact triple integrator)."""
         n, horizon = self.sim.n, self.horizon
         jerk_to_state = np.zeros((horizon + 2, horizon))
         for column in range(horizon):
@@ -59,18 +69,26 @@ class PoseGuidance:
                 state = np.array(self.sim.casadi_dynamics(state, jerk), dtype=float).ravel()
                 jerk_to_state[step, column] = state[0]
             jerk_to_state[horizon, column], jerk_to_state[horizon + 1, column] = state[n], state[2 * n]
+        return jerk_to_state
+
+    def _correction_map(self, jerk_to_state: np.ndarray) -> np.ndarray:
+        """The (H, H + 2) map from the wanted changes of [q_1..q_H, v_H, a_H] of a joint to its change of jerks."""
+        horizon = self.horizon
         weights = np.concatenate([np.ones(horizon), np.full(2, REST_WEIGHT)])
         weighted = jerk_to_state * weights[:, None]
         gram = weighted.T @ weighted
         ridge = JERK_RIDGE * np.linalg.norm(gram, 2)
         return np.linalg.solve(gram + ridge * np.eye(horizon), weighted.T * weights[None, :])
 
+    def _closeness(self, distance: float) -> float:
+        """1 once the goal is closer than ``GUIDANCE_ONSET`` of the start distance, falling off exponentially beyond it."""
+        return min(1.0, float(np.exp(-GUIDANCE_DECAY * (distance / self._start_distance - GUIDANCE_ONSET))))
+
     def _weight(self, distance: float, step: int) -> float:
-        closeness = min(1.0, float(np.exp(-GUIDANCE_DECAY * (distance / self._start_distance - GUIDANCE_ONSET))))
-        return closeness * (step + 1) / self.horizon
+        return self._closeness(distance) * (step + 1) / self.horizon
 
     def guide(self, environment_state: np.ndarray, state: np.ndarray, proposal: np.ndarray) -> np.ndarray:
-        """The proposed chunk (H, nu) moved toward the goal."""
+        """The proposed chunk (H, nu) moved toward the goal and brought toward rest."""
         sim, horizon = self.sim, self.horizon
         x0 = sim.state_from_policy(state)
         goal = sim.observation_from_policy(environment_state, state)[: sim.goal_dim]
@@ -81,6 +99,12 @@ class PoseGuidance:
             error, jacobian, distance = sim.goal_task_error(q, goal)
             damped = jacobian.T @ jacobian + JACOBIAN_DAMPING * np.eye(sim.n)
             moves[step] = self._weight(distance, step) * np.linalg.solve(damped, jacobian.T @ error)
+        moves[:horizon] = self._spread(moves[:horizon])
+        guided = proposal + self._correction @ moves
+        final = sim.rollout_states(x0, guided)[-1]
+        guided = self._rest(
+            guided, final[sim.n : 2 * sim.n], final[2 * sim.n :], self._closeness(sim.goal_task_error(final[: sim.n], goal)[2])
+        )
         # The guidance never takes a jerk past its limit; a proposal beyond it is left to the projection
         bound = np.maximum(sim.max_action, np.abs(proposal))
-        return np.clip(proposal + self._correction @ moves, -bound, bound)
+        return np.clip(guided, -bound, bound)

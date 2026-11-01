@@ -349,9 +349,9 @@ class PerStepProjectionTests(unittest.TestCase):
         self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
 
     def test_the_obstacles_are_linearized_at_every_step(self) -> None:
-        real_halfspaces = self.simulator.collision.halfspaces
+        real_sets_along = self.simulator.collision.sets_along
         calls: list[int] = []
-        self.simulator.collision.halfspaces = lambda q: calls.append(len(q)) or real_halfspaces(q)
+        self.simulator.collision.sets_along = lambda q_current, q: calls.append(len(q)) or real_sets_along(q_current, q)
 
         for _ in range(3):  # the Euler steps of one tick
             self.projector.project(self.state, _moving_chunk())

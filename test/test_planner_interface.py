@@ -94,7 +94,7 @@ class PlannerInterfaceTests(unittest.TestCase):
 
     def test_a_planner_keeps_no_statistics_unless_it_says_so(self) -> None:
         self.assertEqual(OmplPlanner(self.simulator, OmplConfig.from_mapping(self.config)).statistics, {})
-        self.assertEqual(CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).statistics, {"trajectory_optimizations": 0})
+        self.assertEqual(CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).statistics, {"trajectory_optimizations": 0, "relaxed_solutions": 0})
         ompl_casadi = PlannerFactory.create("ompl_casadi", self.simulator, self.config)
         self.assertIn("ompl_paths", ompl_casadi.statistics)
         self.assertIsInstance(ompl_casadi.initial_guess_generator, OmplInitialGuess)

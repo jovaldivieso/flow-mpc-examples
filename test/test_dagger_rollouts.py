@@ -248,14 +248,15 @@ class CollectionStatisticsTests(unittest.TestCase):
 
 
 class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
-    """A failed episode is dropped as a whole and retried from a fresh initial state.
+    """An episode whose expert fails at its first state is dropped and retried from a fresh initial state; one that fails
+    later ends there and keeps the states it labeled.
 
     The fake simulator's first attempt starts from the explicit initial state [0.0]; every later attempt
     starts from a sampled state in [-1, 1] and reaches the goal after one step (goal_threshold=-10), so a
     retry is recognisable by its start state and by the number of planner calls.
     """
 
-    def test_planner_solve_failure_drops_the_episode_and_the_retry_is_saved(self) -> None:
+    def test_planner_solve_failure_at_the_first_state_drops_the_episode_and_the_retry_is_saved(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
         planner = _FailThenSucceedPlanner(safe_action=[1.0])
         writer = _FakeDatasetWriter()
@@ -273,18 +274,25 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
             (metrics.attempted_episodes, metrics.discarded_episodes, metrics.planner_failures, metrics.policy_solve_fallbacks),
             (2, 1, 1, 0),
         )
+        self.assertEqual((metrics.truncated_episodes, dict(metrics.expert_failure_causes)), (0, {"forced solver failure for test": 1}))
 
-    def test_frames_of_a_dropped_episode_are_never_written_even_after_several_good_steps(self) -> None:
-        # The planner fails on step 3 of every attempt (calls 3, 6, 9): the two collected frames before it must be dropped
+    def test_an_episode_whose_expert_fails_later_keeps_the_states_it_labeled(self) -> None:
+        # The planner fails on its third call: the two states labeled before it stay, and the episode is not retried
         simulator = _FakeSimulator(collision_threshold=2.5, goal_threshold=100.0)
-        planner = _FailOnCallPlanner(action=[1.0], fail_calls={3, 6, 9})
+        planner = _FailOnCallPlanner(action=[1.0], fail_calls={3})
         writer = _FakeDatasetWriter()
 
-        with self.assertRaisesRegex(RuntimeError, "Too many failed DAgger rollout attempts"):
-            _collect(simulator, planner, writer, steps=5, initial_states=[[0.0]])
+        metrics, output = _collect(simulator, planner, writer, steps=5, initial_states=[[0.0]])
 
-        self.assertEqual(writer.frames, [])
-        self.assertEqual(writer.episode_boundaries, [])
+        self.assertEqual(len(writer.frames), 2)
+        self.assertEqual(writer.episode_boundaries, [2])
+        self.assertEqual(planner.call_count, 3)
+        self.assertEqual(
+            (metrics.num_episodes, metrics.success_rate, metrics.attempted_episodes, metrics.discarded_episodes),
+            (1, 0.0, 1, 0),
+        )
+        self.assertEqual((metrics.truncated_episodes, metrics.planner_failures), (1, 1))
+        self.assertNotIn("Discarding DAgger episode", output)
 
     def test_gives_up_after_three_times_the_requested_episodes(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
@@ -297,10 +305,9 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual(planner.call_count, 6)  # 3 * trajectories_per_iteration attempts, one solve each
         self.assertEqual(writer.frames, [])
 
-    def test_dropped_policy_steps_are_not_counted_in_the_execution_mixing_stats(self) -> None:
+    def test_the_steps_of_a_truncated_episode_are_counted_in_the_execution_mixing_stats(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=0.7)
-        # First attempt: step 1 succeeds (state 0.0 -> 0.4), step 2 planner fails -> attempt dropped.
-        # Second attempt: starts at 0.5, step 1 (0.5 -> 0.9 >= 0.7) reaches goal in 1 step!
+        # Step 1: the policy moves 0.0 -> 0.4, short of the goal; the expert's solve at step 2 fails, which ends the episode
         planner = _FailOnCallPlanner(action=[0.5], fail_calls={2})
         policy_calls = 0
 
@@ -311,14 +318,12 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
 
         writer = _FakeDatasetWriter()
 
-        metrics, output = _collect(
-            simulator, planner, writer, beta=0.0, policy_action_fn=policy, initial_states=[[0.0], [0.5]]
-        )
+        metrics, output = _collect(simulator, planner, writer, beta=0.0, policy_action_fn=policy, initial_states=[[0.0]])
 
-        self.assertEqual(metrics.num_episodes, 1)
-        self.assertEqual(policy_calls, 2)
+        self.assertEqual((metrics.num_episodes, metrics.truncated_episodes), (1, 1))
+        self.assertEqual(policy_calls, 1)
         self.assertIn("realized_expert_fraction=0.000", output)
-        self.assertIn("executed_steps=1", output)  # only the retry's step, not the dropped episode's
+        self.assertIn("executed_steps=1", output)
         # The dataset carries the expert's relabelled plan (a step of 0.5), not what the policy executed (0.4)
         _assert_label_is_the_plan_of_one_step(self, writer.frames[0], 0.5)
 

@@ -69,6 +69,25 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         self.assertIs(type(self.planner), CasadiPlanner)
         self.assertIsInstance(self.guess, OmplInitialGuess)
 
+    def test_the_mpc_heads_for_the_point_ahead_on_the_path_not_for_its_end(self) -> None:
+        self.planner.plan(self._first_observation())
+
+        target = self.guess.target(self.simulator.reset(self.start)[:N])
+
+        self.assertIsNotNone(target)
+        self.assertGreater(np.linalg.norm(target - self.planner.goal_configuration), 0.1)
+        self.assertLessEqual(np.linalg.norm(target - self.start[:N]), self.guess.lookahead + 1e-9)
+        np.testing.assert_allclose(self.planner._graph.opti.value(self.planner.goal_param)[:N], target, atol=1e-9)
+
+    def test_the_target_is_none_before_a_path_and_after_a_reset(self) -> None:
+        self.assertIsNone(self.guess.target(self.start[:N]))
+        self.planner.plan(self._first_observation())
+        self.assertIsNotNone(self.guess.target(self.start[:N]))
+
+        self.planner.reset()
+
+        self.assertIsNone(self.guess.target(self.start[:N]))
+
     def test_it_reaches_the_goal_pose_and_comes_to_rest(self) -> None:
         reached = _closed_loop(self.simulator, self.planner, self.start, 80)
 
@@ -149,6 +168,7 @@ class OmplCasadiPlannerTests(unittest.TestCase):
                 "ompl_replans": replans,
                 "ompl_path_failures": failures,
                 "trajectory_optimizations": optimizations,
+                "relaxed_solutions": 0,
                 "trajectory_fallbacks": 0,
             }
 

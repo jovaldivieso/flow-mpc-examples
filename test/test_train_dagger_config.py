@@ -199,20 +199,30 @@ class DaggerEvalMetricsSummaryTests(unittest.TestCase):
 
     def test_the_collection_summary_has_the_failures_and_the_expert_statistics_when_there_are_any(self) -> None:
         collected = self._metrics(
-            attempted_episodes=12, discarded_episodes=2, planner_failures=2, policy_solve_fallbacks=1,
-            expert_statistics={"ompl_paths": 10},
+            attempted_episodes=12, discarded_episodes=2, truncated_episodes=3, planner_failures=5,
+            policy_solve_fallbacks=1, expert_statistics={"ompl_paths": 10},
         )
 
         self.assertEqual(
             collected.collection_summary(),
             {
                 "aggregation_failures": {
-                    "attempted_episodes": 12, "discarded_episodes": 2, "planner_failures": 2, "policy_solve_fallbacks": 1,
+                    "attempted_episodes": 12, "discarded_episodes": 2, "truncated_episodes": 3, "planner_failures": 5,
+                    "policy_solve_fallbacks": 1,
                 },
                 "expert_statistics": {"ompl_paths": 10},
             },
         )
         self.assertNotIn("expert_statistics", self._metrics().collection_summary())
+
+    def test_the_collection_summary_counts_the_expert_failures_by_cause(self) -> None:
+        collected = self._metrics(expert_failure_causes={"slack too large": 2, "solver failed": 1})
+
+        self.assertEqual(
+            collected.collection_summary()["aggregation_failures"]["expert_failure_causes"],
+            {"slack too large": 2, "solver failed": 1},
+        )
+        self.assertNotIn("expert_failure_causes", self._metrics().collection_summary()["aggregation_failures"])
 
 
 class DaggerTrainerSummaryYamlTests(unittest.TestCase):
@@ -246,14 +256,16 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
                 latest_checkpoint=checkpoint_dir / "flow_dagger_checkpoint.pt",
                 iteration_checkpoint=checkpoint_dir / "flow_dagger_iter_002.pt",
             )
-            for round_index, (attempts, discarded, planner_failures, fallbacks) in ((3, (12, 2, 1, 5)), (4, (9, 1, 1, 0))):
+            for round_index, (attempts, discarded, truncated, planner_failures, fallbacks) in (
+                (3, (12, 2, 4, 6, 5)), (4, (9, 1, 0, 1, 0))
+            ):
                 trainer.save_round_summary(
                     round_index=round_index,
                     train_loss=0.3,
                     eval_metrics=eval_metrics,
                     aggregation_metrics=DaggerEvalMetrics(
                         success_rate=0.8, mean_steps=50.0, min_steps=5, max_steps=90, num_episodes=10,
-                        attempted_episodes=attempts, discarded_episodes=discarded,
+                        attempted_episodes=attempts, discarded_episodes=discarded, truncated_episodes=truncated,
                         planner_failures=planner_failures, policy_solve_fallbacks=fallbacks,
                     ),
                 )
@@ -268,11 +280,17 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
             self.assertNotIn("aggregation_failures", summary["rounds"][0])
             self.assertEqual(
                 summary["rounds"][1]["aggregation_failures"],
-                {"attempted_episodes": 12, "discarded_episodes": 2, "planner_failures": 1, "policy_solve_fallbacks": 5},
+                {
+                    "attempted_episodes": 12, "discarded_episodes": 2, "truncated_episodes": 4, "planner_failures": 6,
+                    "policy_solve_fallbacks": 5,
+                },
             )
             self.assertEqual(
                 summary["total_aggregation_failures"],
-                {"attempted_episodes": 21, "discarded_episodes": 3, "planner_failures": 2, "policy_solve_fallbacks": 5},
+                {
+                    "attempted_episodes": 21, "discarded_episodes": 3, "truncated_episodes": 4, "planner_failures": 7,
+                    "policy_solve_fallbacks": 5,
+                },
             )
             # a run whose expert keeps no statistics reports none
             self.assertNotIn("expert_statistics", summary["rounds"][1])

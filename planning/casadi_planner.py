@@ -1,7 +1,7 @@
 import casadi as ca
 import numpy as np
 
-from .casadi_graph import CasadiKinematicGraph
+from .casadi_graph import SLACK_TOLERANCE, CasadiKinematicGraph
 from .initial_guess import InitialGuessGenerator
 from .planner_config import PlannerConfig
 from .planner import Plan, Planner, PlannerSolveError, goal_configuration
@@ -19,26 +19,33 @@ class CasadiPlanner(Planner):
     ---------------------------------------------
     State (nx = 3n)          x_k = [q_k, v_k, a_k]: joint positions, velocities, and accelerations.
     Action (nu = n)          u_k = j_k: joint jerks.
-    Goal                     x_goal = [q_goal, 0, 0]: goal configuration at rest (from ``FrankaKinematics`` IK).
+    Goal                     x_goal = [q_goal, 0, 0]: goal configuration at rest (from ``FrankaKinematics`` IK), or,
+                             when the initial guess generator gives a path (``InitialGuessGenerator.target``), the
+                             configuration ahead of the arm on it, at rest.
     Decision variables       X = [x_0 .. x_N] (nx, N + 1), U = [u_0 .. u_{N-1}] (nu, N), and (when obstacles are
-                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by all obstacles.
-    Parameters               x_init, x_goal, and linearized obstacle half-spaces (A_coll, b_coll).
+                             present) slack S = [s_1 .. s_N] (n_spheres, N), one per sphere shared by its free-space half-spaces.
+    Parameters               x_init, x_goal, and the linearized free-space half-spaces (A_coll, b_coll): at every node
+                             the set of each bounding sphere around its last step of the initial guess from x_init,
+                             linearized along it (``SphereCollisionModel.halfspaces``).
 
     Cost                     min_{X, U, S}  sum_{k=0..N-1} ( ||x_k - x_goal||_Q^2 + ||u_k||_R^2 )
-                                            + alpha ||x_N - x_goal||_Q^2 + w_s ||S||_F^2
-                             with Q = diag(Q_diag), R = diag(R_diag), alpha = terminal_cost_multiplier, w_s = 10^5.
+                                            + alpha ||x_N - x_goal||_Q^2 + w_1 sum(S) + w_2 ||S||_F^2
+                             with Q = diag(Q_diag), R = diag(R_diag), alpha = terminal_cost_multiplier, w_1 = 10^4, w_2 = 1.
 
     Constraints              as in ``CasadiKinematicGraph``: the initial state, the triple-integrator dynamics, the
-                             jerk and state limits, and the linearized sphere-obstacle half-spaces.
+                             jerk and state limits, and the linearized free-space half-spaces.
 
     Solver Choice (``Opti`` + ``fatrop``)
     -------------------------------------
-    The triple-integrator dynamics, box limits, and 1st-order Taylor obstacle half-spaces ``n^T J_s(q_ref,k) q_k >= b_k``
+    The triple-integrator dynamics, box limits, and 1st-order Taylor free-space half-spaces ``n^T J_s(q_ref,k) q_k >= b_k``
     are all affine in ``(X, U, S)`` and the cost is convex quadratic, so the problem is a convex QP with the stage
     structure of an optimal control problem. **FATROP** (an interior point method with a Riccati recursion over the
-    stages) solves it in time linear in the horizon, and in the number of obstacles: the slack is one per sphere, so
-    more obstacles only add half-space rows to a stage. See ``CasadiKinematicGraph`` for the layout FATROP needs. If the first pass penetrates a spherical obstacle, one re-linearization pass around the solved
-    trajectory refines the half-spaces.
+    stages) solves it in time linear in the horizon, and the stage does not grow with the number of obstacles: a set
+    holds at most a fixed number of half-spaces per sphere. See ``CasadiKinematicGraph`` for the layout FATROP needs.
+    If the first pass penetrates a spherical obstacle or leaves a slack above ``SLACK_TOLERANCE``, one re-linearization
+    pass around the solved trajectory refines the half-spaces. A solution is accepted up to ``expert_slack_tolerance``
+    (``SLACK_TOLERANCE`` unless the config sets it higher): where the arm cannot clear an obstacle within the limits,
+    the plan that brakes with the least violation is still the expert's label (``relaxed_solutions`` counts them).
 
     Initial guess strategy
     ----------------------
@@ -66,6 +73,7 @@ class CasadiPlanner(Planner):
         # The scalars of the config are used as they are; only what depends on the system's dimensions is checked (and
         # completed) here
         self.terminal_cost_multiplier = config.terminal_cost_multiplier
+        self.slack_tolerance = config.expert_slack_tolerance
         q_diag = config.q_diag or [10.0] * simulator.nx
         if len(q_diag) != simulator.nx:
             raise ValueError(
@@ -86,6 +94,7 @@ class CasadiPlanner(Planner):
         self.goal_configuration: np.ndarray | None = None
         self.optimizations = 0  # NLP solves since the planner was built
         self.fallbacks = 0  # solves that failed from a plan, for which the plan was the solution
+        self.relaxed_solutions = 0  # solves whose slack is above SLACK_TOLERANCE (a state the strict solve rejects)
 
         # Cost: distance to the goal state and effort over the horizon, and the terminal distance
         self.goal_param = self._graph.parameter(self.sim.nx)
@@ -108,15 +117,13 @@ class CasadiPlanner(Planner):
 
     @property
     def statistics(self) -> dict[str, int]:
-        """The NLP solves since the planner was built (``trajectory_optimizations``) and, with an initial guess
-        generator, its own counters and the solves that failed from its plan (``trajectory_fallbacks``)."""
+        """The NLP solves since the planner was built (``trajectory_optimizations``), those that use more obstacle slack
+        than ``SLACK_TOLERANCE`` (``relaxed_solutions``) and, with an initial guess generator, its own counters and the
+        solves that failed from its plan (``trajectory_fallbacks``)."""
+        counters = {"trajectory_optimizations": self.optimizations, "relaxed_solutions": self.relaxed_solutions}
         if self.initial_guess_generator is None:
-            return {"trajectory_optimizations": self.optimizations}
-        return {
-            **self.initial_guess_generator.statistics,
-            "trajectory_optimizations": self.optimizations,
-            "trajectory_fallbacks": self.fallbacks,
-        }
+            return counters
+        return {**self.initial_guess_generator.statistics, **counters, "trajectory_fallbacks": self.fallbacks}
 
     def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
         """The plan from the state of ``observation``: the planned joint positions (N + 1 rows, row 0 the current
@@ -153,7 +160,11 @@ class CasadiPlanner(Planner):
     def _solve(self, x0: np.ndarray, initial_plan: Plan | None) -> None:
         """Solve the NLP from ``x0`` and keep the solution."""
         self._graph.set_state(x0)
-        self._graph.set_value(self.goal_param, np.concatenate([self.goal_configuration, np.zeros(2 * self.n_joints)]))
+        heads_for = self.goal_configuration
+        if self.initial_guess_generator is not None:
+            target = self.initial_guess_generator.target(x0[: self.n_joints])
+            heads_for = self.goal_configuration if target is None else target
+        self._graph.set_value(self.goal_param, np.concatenate([heads_for, np.zeros(2 * self.n_joints)]))
 
         if initial_plan is not None:
             states_guess, actions_guess = self._states_through(x0, initial_plan)
@@ -168,7 +179,7 @@ class CasadiPlanner(Planner):
         self._graph.update_collision_halfspaces(states_guess[: self.n_joints, 1:].T)
 
         try:
-            sol = self._graph.solve()
+            sol = self._graph.solve(self.slack_tolerance)
         except RuntimeError:
             # A warm start can leave the solver stuck at a locally infeasible point once the actual state has drifted from
             # what the previous solve predicted (execution noise, or during DAgger the actions of a still untrained
@@ -177,7 +188,7 @@ class CasadiPlanner(Planner):
             self._graph.set_initial(cold_states, cold_actions)
             self._graph.update_collision_halfspaces(cold_states[: self.n_joints, 1:].T)
             try:
-                sol = self._graph.solve()
+                sol = self._graph.solve(self.slack_tolerance)
             except RuntimeError as exc:
                 raise PlannerSolveError(
                     "CasADi planner solve failed (both warm-started and cold-restarted). "
@@ -187,6 +198,7 @@ class CasadiPlanner(Planner):
         self.last_X_sol = sol.states
         self.last_U_sol = sol.actions
         self.optimizations += 1
+        self.relaxed_solutions += sol.max_slack > SLACK_TOLERANCE
 
     def _states_through(self, x0: np.ndarray, plan: Plan) -> tuple[np.ndarray, np.ndarray]:
         """The states (nx, N + 1) and actions (nu, N) of the plant moving through the configurations of ``plan`` (its

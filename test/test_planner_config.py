@@ -11,6 +11,7 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
+from planning.casadi_graph import SLACK_TOLERANCE
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.planner_config import OmplConfig, PlannerConfig
 from planning.planner_factory import PlannerFactory
@@ -99,6 +100,7 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
         for key, value in (
             ("ompl_speed", -1.0),
             ("ompl_replan_distance", 0.0),
+            ("ompl_lookahead", 0.0),
             ("ompl_timeout", 0.0),
         ):
             with self.subTest(key=key):
@@ -137,6 +139,7 @@ class PlannerConfigTests(unittest.TestCase):
         planner = PlannerConfig.from_mapping({})
 
         self.assertEqual((planner.expert, planner.horizon, planner.r_weight), ("casadi", 20, 0.1))
+        self.assertEqual(planner.expert_slack_tolerance, SLACK_TOLERANCE)
         self.assertEqual((planner.q_diag, planner.r_diag), ((), ()))  # the planner completes them for its system
         self.assertEqual(PlannerConfig.from_mapping({"R_weight": 0.3}).r_weight, 0.3)
         self.assertEqual(PlannerConfig.from_mapping({"R_diag": [1.0, 2.0]}).r_diag, (1.0, 2.0))
@@ -144,7 +147,8 @@ class PlannerConfigTests(unittest.TestCase):
     def test_what_the_mapping_sets_is_read(self) -> None:
         planner = PlannerConfig.from_mapping(
             {"expert": "ompl_casadi", "horizon": 7, "Q_diag": [1.0] * 6, "terminal_cost_multiplier": 3.0,
-             "terminal_velocity_weight": 2.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9},
+             "terminal_velocity_weight": 2.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9,
+             "expert_slack_tolerance": 0.03},
         )
 
         self.assertEqual((planner.expert, planner.horizon, planner.q_diag), ("ompl_casadi", 7, (1.0,) * 6))
@@ -153,12 +157,13 @@ class PlannerConfigTests(unittest.TestCase):
              planner.max_consecutive_fallbacks),
             (3.0, 2.0, 0.5, 9),
         )
+        self.assertEqual(planner.expert_slack_tolerance, 0.03)
 
     def test_wrong_types_and_values_are_rejected(self) -> None:
         for bad in ({"Q_diag": [1.0, 0.0]}, {"Q_diag": []}, {"Q_diag": 1.0}, {"R_diag": [1.0, 0.0]}, {"horizon": 2.5}, {"R_weight": "x"},
                     {"R_weight": 0.0}, {"horizon": 0}, {"terminal_cost_multiplier": 0.0},
                     {"terminal_velocity_weight": -1.0}, {"fallback_terminal_velocity_tol": -0.1},
-                    {"max_consecutive_fallbacks": 0}):
+                    {"max_consecutive_fallbacks": 0}, {"expert_slack_tolerance": SLACK_TOLERANCE / 2}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
                 PlannerConfig.from_mapping(bad)
 
