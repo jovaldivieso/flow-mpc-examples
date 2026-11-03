@@ -61,7 +61,7 @@ class LoadDaggerTrainingConfigTests(unittest.TestCase):
         # instead of at CLI runtime.
         expected_keys = {
             "dagger_iterations", "trajectories_per_iteration",
-            "steps_per_trajectory", "action_noise_std", "training_curriculum",
+            "steps_per_trajectory", "action_noise_std", "training_curriculum", "regions",
             "round_seeds", "restart_round_seed", "initial_states", "goal_states",
             "tolerance_overrides", "eval_tolerance_overrides",
             "expert_beta_per_iteration",

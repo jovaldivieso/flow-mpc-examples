@@ -64,10 +64,10 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
     """Returning the unprojected proposal on any solve failure bypasses every
     constraint the projector exists to enforce. The projector falls back to
     the last known-safe trajectory (SafeFlowMPC Theorem 2) whenever one
-    exists. On a true cold-start failure there is no such trajectory --
-    exactly the situation the paper's Assumption 2 assumes away -- so this
-    raises PlannerSolveError instead of fabricating a fallback with no
-    safety basis.
+    exists, and at the start of an episode (Assumption 2) to holding still,
+    which is safe when the arm is at rest and clear of the obstacles. Where
+    there is no safe trajectory it raises PlannerSolveError instead of
+    fabricating a fallback with no safety basis.
     """
 
     def setUp(self) -> None:
@@ -98,7 +98,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         expected_plan = self.projector._revalidate_fallback(perturbed_state, shifted_actions)
         self.assertIsNotNone(expected_plan)
 
-        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             fallback_chunk = self.projector.project(perturbed_state, self.q_ref)
@@ -106,16 +106,46 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         np.testing.assert_allclose(fallback_chunk, shifted_actions.T)
         self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
 
-    def test_raises_on_cold_start_failure_instead_of_returning_the_proposal(self) -> None:
-        # No previously-solved safe trajectory exists (first call ever, or
-        # right after reset()) -- SafeFlowMPC's safety guarantee (Theorem 2)
-        # assumes one always exists (Assumption 2), so there is no
-        # paper-faithful fallback action here. Must fail loudly rather than
-        # silently returning the unverified, unprojected proposal.
+    def test_a_cold_start_failure_holds_still_when_at_rest_and_clear_of_the_obstacles(self) -> None:
+        # No previously-solved safe trajectory exists (first call ever, or right after reset()): the safe trajectory of
+        # Assumption 2 is holding still, never the unprojected proposal.
         self.projector.reset()
-        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            chunk = self.projector.project(self.state0, self._moving_proposal())
+
+        np.testing.assert_array_equal(chunk, _zero_chunk())
+        self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
+        self.assertIsNotNone(self.projector._prev_U_sol)  # the next tick shifts the plan that was held
+
+    def test_a_cold_start_failure_raises_when_holding_still_is_not_safe(self) -> None:
+        # In motion, holding still (zero jerk) does not come to rest within the horizon: no safe trajectory, so the
+        # failure is loud instead of returning the unverified, unprojected proposal.
+        moving = self.state0.copy()
+        moving[self.simulator.n] = 0.5
+        self.projector.reset()
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with self.assertRaises(PlannerSolveError):
+            self.projector.project(moving, self.q_ref)
+
+    def test_a_cold_start_failure_is_not_solved_a_second_time_from_the_same_guess(self) -> None:
+        self.projector.reset()
+        solves = []
+
+        def failing_solve():
+            solves.append(1)
+            raise RuntimeError("forced failure")
+
+        self.projector._graph._solve_once = failing_solve
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
             self.projector.project(self.state0, self.q_ref)
+
+        self.assertEqual(len(solves), 1)
+
+    def _moving_proposal(self) -> np.ndarray:
+        return _moving_chunk()
 
     def test_consecutive_fallbacks_stay_at_rest_instead_of_drifting_away(self) -> None:
         # Regression test for padding the fallback's extra control slot with
@@ -127,7 +157,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # terminal velocity bounded, not drifting further away with each
         # additional fallback.
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
@@ -150,7 +180,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # than the default (5) must raise rather than be accepted.
         self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
@@ -167,7 +197,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # raise, as long as it's genuinely the same tick throughout.
         self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for _ in range(20):  # far more than max_consecutive_fallbacks (5)
@@ -260,7 +290,8 @@ class ProjectionFeasibilityTests(unittest.TestCase):
         self.assertLessEqual(projector._prev_X_sol[joint].max(), upper + 1e-6)
 
     def test_a_feasible_plan_of_the_expert_is_tracked_closely(self) -> None:
-        # The projector only corrects what is unsafe: an action chunk the expert planned stays almost untouched
+        # The projector only corrects what is unsafe: the first actions of a chunk the expert planned stay almost untouched,
+        # the later ones give way to the rest at the end of the horizon
         simulator = self.simulator
         simulator.set_goal(pose_goal(simulator, Q_READY))
         state = _rest_state(simulator)
@@ -269,7 +300,22 @@ class ProjectionFeasibilityTests(unittest.TestCase):
 
         projected = self.projector.project(state, reference)
 
-        np.testing.assert_allclose(projected, reference, atol=0.15 * simulator.max_action.max())
+        head = self.projector.full_weight_steps
+        np.testing.assert_allclose(projected[:head], reference[:head], atol=0.15 * simulator.max_action.max())
+
+    def test_the_executed_first_action_is_tracked_closer_with_decaying_weights_than_with_uniform_ones(self) -> None:
+        state = _rest_state(self.simulator)
+        proposal = _zero_chunk()
+        proposal[:, 0] = 5.0  # keeps accelerating, so the rest at the end costs deviation somewhere
+        uniform = CasadiTrajectoryProjector(
+            self.simulator, PlannerConfig.from_mapping({**self.config, "projection_full_weight_steps": HORIZON}), horizon=HORIZON
+        )
+
+        decaying = self.projector.project(state, proposal)[:, 0]
+        self.projector.reset()
+        flat = uniform.project(state, proposal)[:, 0]
+
+        self.assertLess(abs(decaying[0] - 5.0), abs(flat[0] - 5.0))
 
     def test_the_next_chunk_guess_is_the_actions_shifted_by_one_step(self) -> None:
         projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
@@ -368,7 +414,7 @@ class PerStepProjectionTests(unittest.TestCase):
         simulator = self.simulator
         simulator.collision.obstacles[:] = [(simulator.tcp_position(self.state[: simulator.n]), 0.05)]  # on the TCP of the start
         at_start = np.tile(self.state[:, None], (1, HORIZON + 1))
-        self.projector._graph.solve = lambda: GraphSolution(at_start, np.zeros((simulator.nu, HORIZON)))
+        self.projector._graph.solve = lambda: GraphSolution(at_start, np.zeros((simulator.nu, HORIZON)), penetrates=True)
 
         with self.assertRaises(PlannerSolveError):
             self.projector.project(self.state, _moving_chunk())

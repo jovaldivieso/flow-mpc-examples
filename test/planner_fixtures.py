@@ -60,13 +60,13 @@ def initial_guess(planner, observation: np.ndarray, initial_plan=None) -> tuple[
     """The (states (nx, N + 1), actions (nu, N)) a ``CasadiPlanner`` starts its first solve of ``plan`` from."""
     graph = planner._graph
     guessed = {}
-    solve = graph.opti.solve
+    solve = graph._solve_once
 
     def recording_solve():
         if not guessed:
-            guessed["states"], guessed["actions"] = (np.asarray(graph.opti.debug.value(v, graph.opti.initial())) for v in (graph.X, graph.U))
+            guessed["states"], guessed["actions"] = graph.initial_guess
         return solve()
 
-    graph.opti.solve = recording_solve
+    graph._solve_once = recording_solve
     planner.plan(observation, initial_plan)
     return guessed["states"], guessed["actions"]

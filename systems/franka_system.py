@@ -16,9 +16,10 @@ joint position limits narrowed by ``JOINT_LIMIT_MARGIN``, the velocity limits sc
 acceleration and jerk limits from the config). No masses or torques: a joint tracking controller is assumed to
 follow the motion.
 
-The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. Start configurations
-are sampled well inside the joint limits and free of spherical obstacles, goals as the TCP pose of such a configuration.
-The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the orientation is
+The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. An episode is drawn
+from the modes of the config's ``sampling`` (``franka_sampling``): the start is a configuration, the goal a pose, both in
+regions of TCP positions and hand directions that inverse kinematics reaches well inside the joint limits and free of
+spherical obstacles. The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the orientation is
 not tested (``goal_errors`` reports it).
 """
 
@@ -37,20 +38,17 @@ from .franka_config import (
     validate_franka_config,
 )
 from .franka_kinematics import franka_kinematics
+from .franka_sampling import EpisodeSampler, SamplingMode
 from .franka_model import Q_READY, TCP_FRAME, build_model, build_robot
 from .triple_integrator import PlantLimits, TripleIntegratorBase
 
 
-# Random start/goal configurations stay inside the joint margins, within SAMPLING_RADIUS of Q_READY, with the TCP in
-# WORKSPACE_BOUNDS in front of the base and every joint frame at least FLOOR_CLEARANCE above the floor (z = 0)
+# Sampled configurations stay JOINT_SAMPLING_MARGIN (a fraction of the range) inside the joint limits, with every joint
+# frame at least FLOOR_CLEARANCE above the floor (z = 0)
 JOINT_SAMPLING_MARGIN = 0.1
-SAMPLING_RADIUS = 1.0
-WORKSPACE_BOUNDS = ((0.2, 0.8), (-0.6, 0.6), (0.1, 0.8))
 FLOOR_CLEARANCE = 0.1
-Region = tuple[tuple[float, float], tuple[float, float], tuple[float, float]]  # TCP box: (x, y, z), each (min, max)
-CONFIGURATION_ATTEMPTS = 25000  # rejection samples per configuration
-GOAL_POSE_ATTEMPTS = 100  # sampled poses per goal that has a tool axis (each one is a multi-start inverse kinematics)
-
+BRAKING_MARGIN = 1.5  # of the stopping distance at the acceleration limits: braking within the jerk limits takes longer
+START_ATTEMPTS = 100  # starts drawn for a start in motion that can brake
 
 
 class FrankaSystem(TripleIntegratorBase):
@@ -91,24 +89,15 @@ class FrankaSystem(TripleIntegratorBase):
         self.data = model.createData()
         self.kinematics = kinematics
         self.tcp_id = model.getFrameId(TCP_FRAME)
-        goal_region = fields.get("goal_region", {})
-        self.start_region = self._region(fields.get("start_region"))
-        self.goal_region = self._region(goal_region or None)
-        self.goal_tool_axis = None if "tool_axis" not in goal_region else self._unit(goal_region["tool_axis"])
-        self.goal_tool_tilt = float(goal_region.get("tool_tilt", 0.0))
+        self.sampler = EpisodeSampler(
+            {name: SamplingMode.from_fields(mode) for name, mode in fields["sampling"].items()},
+            fields["sampling_modes"],
+            lambda position, rotation: self.kinematics.solve_ik(position, rotation, Q_READY, self._is_valid),
+        )
+        self._mode: SamplingMode | None = None  # the mode of the episode whose goal was drawn, until its start is
         self._mesh_collision: tuple | None = None  # (obstacles, geometry model, geometry data), built on first use
         self._cached_goal: np.ndarray | None = None  # the goal whose joint configuration is cached, and that configuration
         self._cached_q_goal: np.ndarray | None = None
-
-    @staticmethod
-    def _region(raw: Mapping[str, Any] | None) -> Region:
-        """The TCP box of a config's region, ``WORKSPACE_BOUNDS`` if it has none."""
-        return WORKSPACE_BOUNDS if raw is None else tuple((float(raw[axis][0]), float(raw[axis][1])) for axis in "xyz")
-
-    @staticmethod
-    def _unit(vector: Any) -> np.ndarray:
-        vector = np.asarray(vector, dtype=float)
-        return vector / np.linalg.norm(vector)
 
     @property
     def environment_dim(self) -> int:
@@ -118,6 +107,7 @@ class FrankaSystem(TripleIntegratorBase):
         """Reset for a new rollout. The cached joint configuration of the goal is dropped, so one rollout never reuses
         what was solved for another."""
         state = super().reset(initial_state)
+        self._mode = None
         self._cached_goal = None
         self._cached_q_goal = None
         return state
@@ -217,6 +207,10 @@ class FrankaSystem(TripleIntegratorBase):
         """Bounding sphere centers (S, 3), position Jacobians (S, 3, n), and radii (S,) at configuration ``q``."""
         return self.kinematics.collision_spheres(np.asarray(q, dtype=float)[: self.n])
 
+    def collision_spheres_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Bounding sphere centers (H, S, 3), position Jacobians (H, S, 3, n), and radii (S,) at every row of ``q_trajectory``."""
+        return self.kinematics.collision_spheres_along(np.asarray(q_trajectory, dtype=float)[:, : self.n])
+
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray = Q_READY) -> np.ndarray:
         """The collision-free joint configuration of the ``goal`` pose (cached per goal)."""
         pose = self.vector_pose(goal)
@@ -246,58 +240,46 @@ class FrankaSystem(TripleIntegratorBase):
         return [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self.coordinate_names]
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
-        return self._sample_configuration_in(rng, self.start_region)
+        return self.sampler.configuration(self._episode_mode(rng).start, rng)
 
-    def _sample_configuration_in(self, rng: np.random.Generator, region: Region) -> np.ndarray:
-        """Random collision-free arm configuration near ``Q_READY`` inside the joint limits, with the TCP in ``region`` and
-        every joint frame above the floor."""
-        lower, upper = self.model.lowerPositionLimit, self.model.upperPositionLimit
-        margin = JOINT_SAMPLING_MARGIN * (upper - lower)
-        sample_low = np.maximum(lower + margin, Q_READY - SAMPLING_RADIUS)
-        sample_high = np.minimum(upper - margin, Q_READY + SAMPLING_RADIUS)
-        (x_min, x_max), (y_min, y_max), (z_min, z_max) = region
-        for _ in range(CONFIGURATION_ATTEMPTS):
-            q = rng.uniform(sample_low, sample_high)
-            tcp = self.tcp_placement(q).translation
-            if (
-                x_min <= tcp[0] <= x_max
-                and y_min <= tcp[1] <= y_max
-                and z_min <= tcp[2] <= z_max
-                and self._is_valid(q)
-            ):
-                return q
-        raise RuntimeError(f"Unable to sample an arm configuration in the workspace in {CONFIGURATION_ATTEMPTS} attempts.")
+    def _sample_start(self, rng: np.random.Generator) -> np.ndarray:
+        mode = self._episode_mode(rng)
+        for _ in range(START_ATTEMPTS):
+            q = self._sample_configuration(rng)
+            velocity = mode.start_speed * self.state_upper_bounds[self.n : 2 * self.n] * rng.uniform(-1.0, 1.0, self.n)
+            if self._can_brake(q, velocity):
+                return np.concatenate([q, velocity, np.zeros(self.n)])
+        raise RuntimeError(f"Unable to sample a start in motion that can brake within {START_ATTEMPTS} attempts.")
 
-    def _is_valid(self, q: np.ndarray) -> bool:
-        """Every joint frame at least ``FLOOR_CLEARANCE`` above the floor and no obstacle touched."""
-        self.tcp_placement(q)
-        return all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:]) and self.collision.is_collision_free(q)
+    def _can_brake(self, q: np.ndarray, velocity: np.ndarray) -> bool:
+        """True if the arm moving at ``velocity`` from ``q`` can stop inside the joint limits and clear of the obstacles: along
+        the path of its stopping distance, ``BRAKING_MARGIN`` times that at the acceleration limits."""
+        stop = BRAKING_MARGIN * velocity * np.abs(velocity) / (2 * self.max_acceleration)
+        path = q + stop * np.linspace(0.0, 1.0, 5)[:, None]
+        in_limits = np.all(path >= self.model.lowerPositionLimit) and np.all(path <= self.model.upperPositionLimit)
+        return bool(in_limits and self.collision.trajectory_is_collision_free(path))
 
-    def _tool_rotation(self, rng: np.random.Generator) -> np.ndarray:
-        """A hand rotation whose tool axis (z) points along ``goal_tool_axis`` within ``goal_tool_tilt``, at a random roll."""
-        axis = self.goal_tool_axis
-        helper = np.array([0.0, 0.0, 1.0]) if abs(axis[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
-        side = np.cross(axis, helper)
-        side /= np.linalg.norm(side)
-        tilt, heading = self.goal_tool_tilt * rng.uniform(), rng.uniform(0.0, 2 * np.pi)
-        z = np.cos(tilt) * axis + np.sin(tilt) * (np.cos(heading) * side + np.sin(heading) * np.cross(axis, side))
-        a = np.cross(z, helper)
-        a /= np.linalg.norm(a)
-        roll = rng.uniform(0.0, 2 * np.pi)
-        x = np.cos(roll) * a + np.sin(roll) * np.cross(z, a)
-        return np.column_stack([x, np.cross(z, x), z])
+    def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
+        self._episode_mode(rng)
+        try:
+            return super().random_initial_state(rng)
+        finally:
+            self._mode = None
+
+    def _episode_mode(self, rng: np.random.Generator) -> SamplingMode:
+        """The mode of the episode: drawn with its goal, or with its start when the goal is not drawn."""
+        if self._mode is None:
+            self._mode = self.sampler.draw_mode(rng)
+        return self._mode
 
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
-        """The TCP pose of a random configuration (so it is reachable); with a ``tool_axis`` in the goal region, a pose of
-        the box with the hand along it that inverse kinematics reaches without a collision."""
-        if self.goal_tool_axis is None:
-            return self.pose_vector(self.tcp_placement(self._sample_configuration_in(rng, self.goal_region)))
-        low, high = (np.array(bound) for bound in zip(*self.goal_region))
-        for _ in range(GOAL_POSE_ATTEMPTS):
-            position, rotation = rng.uniform(low, high), self._tool_rotation(rng)
-            try:
-                self.kinematics.solve_ik(position, rotation, Q_READY, self._is_valid)
-            except RuntimeError:
-                continue
-            return np.concatenate([position, rotation.ravel()])
-        raise RuntimeError(f"Unable to sample a goal pose in the region in {GOAL_POSE_ATTEMPTS} attempts.")
+        self._mode = None
+        return self.sampler.goal(self._episode_mode(rng).goal, rng)
+
+    def _is_valid(self, q: np.ndarray) -> bool:
+        """Inside the joint margins, every joint frame at least ``FLOOR_CLEARANCE`` above the floor and no obstacle touched."""
+        margin = JOINT_SAMPLING_MARGIN * (self.model.upperPositionLimit - self.model.lowerPositionLimit)
+        if np.any(q < self.model.lowerPositionLimit + margin) or np.any(q > self.model.upperPositionLimit - margin):
+            return False
+        self.tcp_placement(q)
+        return all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:]) and self.collision.is_collision_free(q)

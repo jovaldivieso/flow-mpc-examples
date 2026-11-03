@@ -73,7 +73,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
         first_action = _first_action(planner, simulator, state)
         self.assertIsNotNone(planner.last_X_sol)
 
-        real_solve = planner._graph.opti.solve
+        real_solve = planner._graph._solve_once
         calls = {"count": 0}
 
         def failing_once():
@@ -82,7 +82,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
                 raise RuntimeError("forced warm-start failure")
             return real_solve()
 
-        planner._graph.opti.solve = failing_once
+        planner._graph._solve_once = failing_once
         state = simulator.step(state, first_action)
         try:
             second_action = _first_action(planner, simulator, state)
@@ -96,7 +96,7 @@ class MpcWarmStartFailureRecoveryTests(unittest.TestCase):
         simulator, planner, _ = _build()
         state = simulator.reset(_start_near_the_ready_pose(simulator))
         planner.reset()
-        planner._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        planner._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         with self.assertRaises(PlannerSolveError):
             planner.plan(simulator.observe(state))
 
@@ -399,7 +399,7 @@ class InitialGuessGeneratorTests(unittest.TestCase):
 
         planner.plan(simulator.observe(state))
 
-        np.testing.assert_allclose(planner._graph.opti.value(planner.goal_param)[: simulator.n], target)
+        np.testing.assert_allclose(planner._graph.value(planner.goal_param)[: simulator.n], target)
         np.testing.assert_allclose(planner.goal_configuration, q_goal)  # the goal configuration stays the end of the plan
 
     def test_the_generator_hears_of_new_goals_and_resets_and_sees_the_last_solution(self) -> None:

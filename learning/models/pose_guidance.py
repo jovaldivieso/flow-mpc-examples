@@ -80,12 +80,10 @@ class PoseGuidance:
         ridge = JERK_RIDGE * np.linalg.norm(gram, 2)
         return np.linalg.solve(gram + ridge * np.eye(horizon), weighted.T * weights[None, :])
 
-    def _closeness(self, distance: float) -> float:
-        """1 once the goal is closer than ``GUIDANCE_ONSET`` of the start distance, falling off exponentially beyond it."""
-        return min(1.0, float(np.exp(-GUIDANCE_DECAY * (distance / self._start_distance - GUIDANCE_ONSET))))
-
-    def _weight(self, distance: float, step: int) -> float:
-        return self._closeness(distance) * (step + 1) / self.horizon
+    def _closeness(self, distance: np.ndarray | float) -> np.ndarray | float:
+        """1 once the goal is closer than ``GUIDANCE_ONSET`` of the start distance, falling off exponentially beyond it
+        (of every distance of an array)."""
+        return np.minimum(1.0, np.exp(-GUIDANCE_DECAY * (np.asarray(distance, dtype=float) / self._start_distance - GUIDANCE_ONSET)))
 
     def guide(self, environment_state: np.ndarray, state: np.ndarray, proposal: np.ndarray) -> np.ndarray:
         """The proposed chunk (H, nu) moved toward the goal and brought toward rest."""
@@ -94,16 +92,17 @@ class PoseGuidance:
         goal = sim.observation_from_policy(environment_state, state)[: sim.goal_dim]
         if self._start_distance is None:
             self._start_distance = max(sim.goal_task_error(x0[: sim.n], goal)[2], 1e-6)
+        tasks = [sim.goal_task_error(q, goal) for q in sim.rollout_positions(x0, proposal)[1:]]
+        errors, jacobians, distances = (np.array(values) for values in zip(*tasks))
+        damped = np.einsum("hmi,hmj->hij", jacobians, jacobians) + JACOBIAN_DAMPING * np.eye(sim.n)
+        steps = np.linalg.solve(damped, np.einsum("hmi,hm->hi", jacobians, errors)[..., None])[..., 0]
+        weights = self._closeness(distances) * np.arange(1, horizon + 1) / horizon
         moves = np.zeros((horizon + 2, sim.n))
-        for step, q in enumerate(sim.rollout_positions(x0, proposal)[1:]):
-            error, jacobian, distance = sim.goal_task_error(q, goal)
-            damped = jacobian.T @ jacobian + JACOBIAN_DAMPING * np.eye(sim.n)
-            moves[step] = self._weight(distance, step) * np.linalg.solve(damped, jacobian.T @ error)
-        moves[:horizon] = self._spread(moves[:horizon])
+        moves[:horizon] = self._spread(weights[:, None] * steps)
         guided = proposal + self._correction @ moves
         final = sim.rollout_states(x0, guided)[-1]
         guided = self._rest(
-            guided, final[sim.n : 2 * sim.n], final[2 * sim.n :], self._closeness(sim.goal_task_error(final[: sim.n], goal)[2])
+            guided, final[sim.n : 2 * sim.n], final[2 * sim.n :], float(self._closeness(sim.goal_task_error(final[: sim.n], goal)[2]))
         )
         # The guidance never takes a jerk past its limit; a proposal beyond it is left to the projection
         bound = np.maximum(sim.max_action, np.abs(proposal))

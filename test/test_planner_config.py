@@ -40,12 +40,14 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
     def test_overridden_values_are_accepted_and_pass_through(self) -> None:
         raw_config = _load_raw_config()
         raw_config["terminal_velocity_weight"] = 42.0
+        raw_config["projection_full_weight_steps"] = 5
         raw_config["fallback_terminal_velocity_tol"] = 0.007
         raw_config["max_consecutive_fallbacks"] = 3
 
         validated = validate_system_config(raw_config=raw_config)
 
         self.assertEqual(validated["terminal_velocity_weight"], 42.0)
+        self.assertEqual(validated["projection_full_weight_steps"], 5)
         self.assertEqual(validated["fallback_terminal_velocity_tol"], 0.007)
         self.assertEqual(validated["max_consecutive_fallbacks"], 3)
 
@@ -59,6 +61,7 @@ class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
         validated = validate_system_config(raw_config=raw_config)
 
         self.assertEqual(validated["terminal_velocity_weight"], 1.0)
+        self.assertEqual(validated["projection_full_weight_steps"], 3)
         self.assertEqual(validated["fallback_terminal_velocity_tol"], 1e-2)
         self.assertEqual(validated["max_consecutive_fallbacks"], 5)
 
@@ -162,7 +165,7 @@ class PlannerConfigTests(unittest.TestCase):
     def test_wrong_types_and_values_are_rejected(self) -> None:
         for bad in ({"Q_diag": [1.0, 0.0]}, {"Q_diag": []}, {"Q_diag": 1.0}, {"R_diag": [1.0, 0.0]}, {"horizon": 2.5}, {"R_weight": "x"},
                     {"R_weight": 0.0}, {"horizon": 0}, {"terminal_cost_multiplier": 0.0},
-                    {"terminal_velocity_weight": -1.0}, {"fallback_terminal_velocity_tol": -0.1},
+                    {"terminal_velocity_weight": -1.0}, {"projection_full_weight_steps": 0}, {"fallback_terminal_velocity_tol": -0.1},
                     {"max_consecutive_fallbacks": 0}, {"expert_slack_tolerance": SLACK_TOLERANCE / 2}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
                 PlannerConfig.from_mapping(bad)
@@ -312,39 +315,59 @@ class ExpertConfigValidationTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=raw_config)
 
-    def test_start_and_goal_regions_are_validated(self) -> None:
+    def test_the_sampling_modes_are_validated_and_default_to_the_workspace(self) -> None:
         raw_config = _load_raw_config()
-        for key in ("start_region", "goal_region"):
+        for key in ("sampling", "sampling_modes"):
             raw_config.pop(key, None)
         validated = validate_system_config(raw_config=raw_config)
-        self.assertNotIn("start_region", validated)
-        self.assertNotIn("goal_region", validated)
+        self.assertEqual(list(validated["sampling"]), ["workspace"])
+        self.assertEqual(validated["sampling_modes"], ["workspace"])
+        workspace = validated["sampling"]["workspace"]
+        self.assertEqual((workspace["weight"], workspace["start_speed"]), (1.0, 0.0))
+        self.assertEqual(workspace["start"], workspace["goal"])
+        self.assertEqual(workspace["start"]["tool_axis"], [1.0, 0.0, -1.0])
 
         box = {"x": [0.3, 0.6], "y": [-0.2, 0.2], "z": [0.1, 0.3]}
-        raw_config["start_region"] = box
-        raw_config["goal_region"] = {**box, "tool_axis": [1, 0, 0], "tool_tilt": 0.4}
+        raw_config["sampling"] = {
+            "under": {"weight": 2, "start": box, "goal": {**box, "tool_axis": [1, 0, 0], "tool_tilt": 0.4}, "start_speed": 0.3},
+            "anywhere": {},
+        }
         validated = validate_system_config(raw_config=raw_config)
-        self.assertEqual(validated["start_region"], box)
-        self.assertEqual(validated["goal_region"], {**box, "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4})
+        under = validated["sampling"]["under"]
+        self.assertEqual((under["weight"], under["start_speed"]), (2.0, 0.3))
+        self.assertEqual(under["start"], {**box, "tool_axis": [1.0, 0.0, -1.0], "tool_tilt": 0.9})
+        self.assertEqual(under["goal"], {**box, "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4})
+        self.assertEqual(validated["sampling_modes"], ["under", "anywhere"])
         self.assertEqual(validate_system_config(raw_config=validated), validated)
 
+        raw_config["sampling_modes"] = ["anywhere"]
+        self.assertEqual(validate_system_config(raw_config=raw_config)["sampling_modes"], ["anywhere"])
+
+    def test_invalid_sampling_is_rejected(self) -> None:
+        box = {"x": [0.3, 0.6], "y": [-0.2, 0.2], "z": [0.1, 0.3]}
         for key, bad in (
-            ("start_region", {"x": [0.3, 0.6], "y": [-0.2, 0.2]}),  # missing axis
-            ("start_region", {**box, "z": [0.3, 0.1]}),  # min above max
-            ("start_region", {**box, "z": [0.1]}),  # not a pair
-            ("start_region", {**box, "extra": 1}),  # unknown key
-            ("start_region", {**box, "tool_axis": [1, 0, 0]}),  # starts have no hand direction
-            ("start_region", [0.3, 0.6]),  # not a mapping
-            ("goal_region", {**box, "tool_tilt": 0.4}),  # a tilt without an axis
-            ("goal_region", {**box, "tool_axis": [0, 0, 0]}),  # no direction
-            ("goal_region", {**box, "tool_axis": [1, 0]}),  # wrong length
-            ("goal_region", {**box, "tool_axis": [1, 0, 0], "tool_tilt": -0.1}),
+            ("sampling", {}),  # no mode
+            ("sampling", [box]),  # not a mapping
+            ("sampling", {"a": None}),  # a mode that is not a mapping
+            ("sampling", {"a": {"extra": 1}}),  # unknown key
+            ("sampling", {"a": {"weight": 0}}),
+            ("sampling", {"a": {"start_speed": 1.5}}),
+            ("sampling", {"a": {"start": {"x": [0.3, 0.6], "y": [-0.2, 0.2]}}}),  # missing axis
+            ("sampling", {"a": {"start": {**box, "z": [0.3, 0.1]}}}),  # min above max
+            ("sampling", {"a": {"start": {**box, "z": [0.1]}}}),  # not a pair
+            ("sampling", {"a": {"start": {**box, "extra": 1}}}),  # unknown key
+            ("sampling", {"a": {"start": [0.3, 0.6]}}),  # not a mapping
+            ("sampling", {"a": {"goal": {**box, "tool_axis": [0, 0, 0]}}}),  # no direction
+            ("sampling", {"a": {"goal": {**box, "tool_axis": [1, 0]}}}),  # wrong length
+            ("sampling", {"a": {"goal": {**box, "tool_tilt": -0.1}}}),
+            ("sampling", {"a": {"goal": {**box, "tool_tilt": 4.0}}}),
+            ("sampling_modes", []),
+            ("sampling_modes", ["missing"]),
         ):
             with self.subTest(key=key, bad=bad):
                 invalid = {**_load_raw_config(), key: bad}
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=invalid)
-
 
 if __name__ == "__main__":
     unittest.main()

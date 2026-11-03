@@ -69,7 +69,8 @@ class TripleIntegratorBase(SystemSimulator):
         self.pos_tol = float(fields["pos_tol"])
         self.vel_tol = float(fields["vel_tol"])
         obstacles = [(np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in fields["obstacles"]]
-        self.collision = SphereCollisionModel(obstacles, self.collision_spheres, n)
+        self.collision = SphereCollisionModel(obstacles, self.collision_spheres, self.collision_spheres_along, n)
+        self._free_rollouts: dict[int, tuple[np.ndarray, np.ndarray]] = {}  # by the number of actions, built when first asked for
 
     # --- the properties the base class declares ---------------------------------
 
@@ -152,6 +153,39 @@ class TripleIntegratorBase(SystemSimulator):
         stopped = q_next != q_free
         return np.concatenate([q_next, np.where(stopped, 0.0, v_next), np.where(stopped, 0.0, a_next)])
 
+    def _free_rollout(self, steps: int) -> tuple[np.ndarray, np.ndarray]:
+        """The maps ``P`` (steps * nx, nx) and ``G`` (steps * nx, steps * nu) of the states after 1..``steps`` steps of the
+        plant that nothing saturates: ``states = P x_0 + G u`` (the actions stacked), the step being the one of
+        ``casadi_dynamics``."""
+        if steps not in self._free_rollouts:
+            n, nx, nu, dt = self.n, self.nx, self.nu, self.dt
+            eye = np.eye(n)
+            step_state = np.eye(nx)
+            step_state[:n, n : 2 * n], step_state[:n, 2 * n :], step_state[n : 2 * n, 2 * n :] = dt * eye, dt**2 / 2 * eye, dt * eye
+            step_action = np.vstack([dt**3 / 6 * eye, dt**2 / 2 * eye, dt * eye])
+            powers = [np.eye(nx)]
+            for _ in range(steps):
+                powers.append(step_state @ powers[-1])
+            free_to_state = np.zeros((steps * nx, steps * nu))
+            for row in range(steps):
+                for column in range(row + 1):
+                    free_to_state[row * nx : (row + 1) * nx, column * nu : (column + 1) * nu] = powers[row - column] @ step_action
+            self._free_rollouts[steps] = (np.vstack(powers[1:]), free_to_state)
+        return self._free_rollouts[steps]
+
+    def rollout_states(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
+        """The states ``(len(actions) + 1, nx)`` of the plant applying ``actions`` from ``state``, row 0 the current one.
+        As long as no jerk, state limit or position limit saturates, the plant is linear and the rollout is one matrix
+        product; a rollout that saturates somewhere is stepped through ``predict_next_state``."""
+        state_array, actions = np.asarray(state, dtype=float), np.asarray(actions, dtype=float)
+        if len(actions) == 0 or np.any(np.abs(actions) > self.max_action):
+            return super().rollout_states(state_array, actions)
+        free_from_state, free_to_state = self._free_rollout(len(actions))
+        states = (free_from_state @ state_array + free_to_state @ actions.ravel()).reshape(len(actions), self.nx)
+        if np.any(states < self.state_lower_bounds) or np.any(states > self.state_upper_bounds):
+            return super().rollout_states(state_array, actions)
+        return np.vstack([state_array[None], states])
+
     # --- goal and kinematics: what a concrete system supplies -------------------
 
     @abstractmethod
@@ -161,6 +195,11 @@ class TripleIntegratorBase(SystemSimulator):
     @abstractmethod
     def collision_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Bounding sphere centers (S, d), position Jacobians (S, d, n), and radii (S,) at configuration ``q``."""
+
+    @abstractmethod
+    def collision_spheres_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``collision_spheres`` at every row of ``q_trajectory`` (H, n) in one call: centers (H, S, d), position
+        Jacobians (H, S, d, n), and radii (S,)."""
 
     @abstractmethod
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
@@ -207,12 +246,16 @@ class TripleIntegratorBase(SystemSimulator):
 
     # --- sampling ---------------------------------------------------------------
 
+    def _sample_start(self, rng: np.random.Generator) -> np.ndarray:
+        """A random start state: at rest at a random configuration."""
+        return np.concatenate([self._sample_configuration(rng), np.zeros(2 * self.n)])
+
     def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
-        """Rest state at a random configuration at least ``min_start_goal_distance`` (position error) from the goal."""
+        """A random start state at least ``min_start_goal_distance`` (position error) from the goal."""
         for _ in range(SAMPLING_ATTEMPTS):
-            q = self._sample_configuration(rng)
-            if self.goal_errors(q)[0] > self.min_start_goal_distance:
-                return np.concatenate([q, np.zeros(2 * self.n)])
+            state = self._sample_start(rng)
+            if self.goal_errors(state)[0] > self.min_start_goal_distance:
+                return state
         raise RuntimeError(
             f"Unable to sample a start {self.min_start_goal_distance} away from the goal in {SAMPLING_ATTEMPTS} attempts."
         )

@@ -147,6 +147,20 @@ class CollisionHalfspacesTests(unittest.TestCase):
             if np.all(A[0] @ (Q_MID + delta) >= b[0]):
                 self.assertTrue(self.model.is_collision_free(Q_MID + delta))
 
+    def test_a_trajectory_is_collision_free_exactly_when_every_node_is(self) -> None:
+        def penetrates(q: np.ndarray) -> bool:  # one obstacle at a time, as the definition reads
+            centers, _, radii = self.simulator.collision_spheres(q)
+            return any(np.any(np.linalg.norm(centers - position, axis=1) < radii + radius) for position, radius in self.model.obstacles)
+
+        rng = np.random.default_rng(2)
+        for _ in range(10):
+            q_trajectory = Q_MID + 0.6 * rng.standard_normal((8, 7))
+            expected = not any(penetrates(q) for q in q_trajectory)
+            self.assertEqual(self.model.trajectory_is_collision_free(q_trajectory), expected)
+            for q in q_trajectory:
+                self.assertEqual(self.model.is_collision_free(q), not penetrates(q))
+        self.assertTrue(self.model.trajectory_is_collision_free(np.zeros((0, 7))))
+
     def test_without_obstacles_there_are_no_rows(self) -> None:
         simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=[]))
 

@@ -14,15 +14,20 @@ COLLISION_BUFFER = 0.005  # [m] safety margin of the free-space sets around the 
 
 # q -> bounding sphere centers (S, d), position Jacobians (S, d, n), and radii (S,)
 SphereFunction = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
+# (H, n) configurations -> the same at every row: centers (H, S, d), Jacobians (H, S, d, n), and radii (S,)
+TrajectorySphereFunction = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
 
 
 class SphereCollisionModel:
-    """Static spherical obstacles ``(center, radius)`` and the bounding spheres (``spheres``) of a system with ``n``
-    configuration coordinates."""
+    """Static spherical obstacles ``(center, radius)`` and the bounding spheres of a system with ``n`` configuration
+    coordinates: ``spheres`` at one configuration and ``spheres_along`` at the rows of a trajectory in one call."""
 
-    def __init__(self, obstacles: list[tuple[np.ndarray, float]], spheres: SphereFunction, n: int) -> None:
+    def __init__(
+        self, obstacles: list[tuple[np.ndarray, float]], spheres: SphereFunction, spheres_along: TrajectorySphereFunction, n: int
+    ) -> None:
         self.obstacles = obstacles
         self.spheres = spheres
+        self.spheres_along = spheres_along
         self.n = int(n)
         self.free_space = FreeSpaceSets(obstacles, COLLISION_BUFFER)
 
@@ -31,10 +36,22 @@ class SphereCollisionModel:
         if not self.obstacles:
             return True
         centers, _, radii = self.spheres(np.asarray(q, dtype=float)[: self.n])
-        for obs_pos, obs_radius in self.obstacles:
-            if np.any(np.linalg.norm(centers - obs_pos[None, :], axis=1) < radii + obs_radius):
-                return False
-        return True
+        return not self._penetrates(centers[None], radii)
+
+    def trajectory_is_collision_free(self, q_trajectory: np.ndarray) -> bool:
+        """True if no bounding sphere penetrates any obstacle at any row of ``q_trajectory`` (H, n)."""
+        q_traj = np.asarray(q_trajectory, dtype=float)
+        if not self.obstacles or len(q_traj) == 0:
+            return True
+        centers, _, radii = self.spheres_along(q_traj[:, : self.n])
+        return not self._penetrates(centers, radii)
+
+    def _penetrates(self, centers: np.ndarray, radii: np.ndarray) -> bool:
+        """Whether a sphere of ``centers`` (H, S, d) and ``radii`` (S,) penetrates an obstacle, at any of the H rows."""
+        positions = np.array([position for position, _ in self.obstacles], dtype=float)
+        obstacle_radii = np.array([radius for _, radius in self.obstacles], dtype=float)
+        distances = np.linalg.norm(centers[:, :, None, :] - positions, axis=-1)  # (H, S, obstacles)
+        return bool(np.any(distances < radii[None, :, None] + obstacle_radii))
 
     @property
     def num_spheres(self) -> int:
@@ -57,9 +74,8 @@ class SphereCollisionModel:
         horizon = len(q_traj)
         if not self.obstacles:
             return np.zeros((horizon, 0, 0, 3)), np.zeros((horizon, 0, 0))
-        start, _, radii = self.spheres(np.asarray(q_current, dtype=float)[: self.n])
-        centers = np.stack([self.spheres(q)[0] for q in q_traj])
-        previous = np.concatenate([start[None], centers[:-1]])
+        centers, _, radii = self.spheres_along(np.vstack([np.asarray(q_current, dtype=float)[None, : self.n], q_traj]))
+        previous, centers = centers[:-1], centers[1:]  # the set of a node is around the motion from the previous one
         normals, offsets = self.free_space.build(previous.reshape(-1, 3), centers.reshape(-1, 3), np.tile(radii, horizon))
         return normals.reshape(horizon, len(radii), -1, 3), offsets.reshape(horizon, len(radii), -1)
 
@@ -76,8 +92,7 @@ class SphereCollisionModel:
         horizon = len(q_traj)
         if normals.shape[1] == 0:
             return np.zeros((horizon, 0, self.n)), np.zeros((horizon, 0))
-        spheres = [self.spheres(q) for q in q_traj]
-        centers, jacobians = np.stack([sphere[0] for sphere in spheres]), np.stack([sphere[1] for sphere in spheres])
+        centers, jacobians, _ = self.spheres_along(q_traj)
         # (H, S, K, n): the gradient of normal . center(q) in q, and its value at every node
         a_vec = np.einsum("hski,hsin->hskn", normals, jacobians)
         value = np.einsum("hski,hsi->hsk", normals, centers)

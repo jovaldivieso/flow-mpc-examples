@@ -28,6 +28,7 @@ class PlannerConfig:
     # Read by CasadiTrajectoryProjector (planning/casadi_projector.py); a config
     # that omits them gets these defaults.
     terminal_velocity_weight: float = 1.0
+    projection_full_weight_steps: int = 3
     fallback_terminal_velocity_tol: float = 1e-2
     max_consecutive_fallbacks: int = 5
 
@@ -42,6 +43,8 @@ class PlannerConfig:
             raise ConfigurationError(f"'expert_slack_tolerance' must be at least {SLACK_TOLERANCE}.")
         if self.terminal_velocity_weight <= 0:
             raise ConfigurationError("'terminal_velocity_weight' must be positive.")
+        if self.projection_full_weight_steps <= 0:
+            raise ConfigurationError("'projection_full_weight_steps' must be positive.")
         if self.fallback_terminal_velocity_tol < 0:
             raise ConfigurationError("'fallback_terminal_velocity_tol' must be non-negative.")
         if self.max_consecutive_fallbacks <= 0:
@@ -62,6 +65,9 @@ class PlannerConfig:
             terminal_cost_multiplier=read_float(config, "terminal_cost_multiplier", defaults.terminal_cost_multiplier),
             expert_slack_tolerance=read_float(config, "expert_slack_tolerance", defaults.expert_slack_tolerance),
             terminal_velocity_weight=read_float(config, "terminal_velocity_weight", defaults.terminal_velocity_weight),
+            projection_full_weight_steps=read_int(
+                config, "projection_full_weight_steps", defaults.projection_full_weight_steps
+            ),
             fallback_terminal_velocity_tol=read_float(
                 config, "fallback_terminal_velocity_tol", defaults.fallback_terminal_velocity_tol
             ),

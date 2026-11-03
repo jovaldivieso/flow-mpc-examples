@@ -16,8 +16,9 @@ class CasadiTrajectoryProjector:
     ``project`` takes the current state (as the policy observes it, see ``SystemSimulator.state_from_policy``) and a
     proposed action chunk ``u_ref`` (H, nu) and returns the closest safe action chunk (H, nu), whose first row is
     executed. Each call keeps its solution as the warm start of the next. If a solve fails, the previous safe solution shifted by one step is revalidated and reused (SafeFlowMPC, Theorem 2) for at
-    most ``max_consecutive_fallbacks`` ticks in a row; else it raises ``PlannerSolveError``. The unprojected proposal
-    is never returned.
+    most ``max_consecutive_fallbacks`` ticks in a row; else it raises ``PlannerSolveError``. At the start of an episode
+    the safe solution (Assumption 2) is holding still, which holds when the arm is at rest and clear of the obstacles. The
+    unprojected proposal is never returned.
 
     Problem (Direct Multiple Shooting, Horizon N = H)
     -------------------------------------------------
@@ -28,10 +29,15 @@ class CasadiTrajectoryProjector:
                              the set of each bounding sphere around its last step of the rollout of u_ref from x_init,
                              linearized along that rollout (``SphereCollisionModel.halfspaces``).
 
-    Cost                     min_{X, U, S}  sum_{k=0..N-1} ||(u_k - u_ref,k) / u_max||_2^2
+    Cost                     min_{X, U, S}  sum_{k=0..N-1} c_k ||(u_k - u_ref,k) / u_max||_2^2
                                             + beta ||[v_N, a_N]||_2^2 + w_1 sum(S) + w_2 ||S||_F^2
                              with beta = terminal_velocity_weight (driving the horizon to rest, a soft version of
                              SafeFlowMPC's Eq. 12 so the problem stays feasible from high speed), w_1 = 10^4 and w_2 = 1.
+                             The tracking weights are c_k = 1 for the first m = projection_full_weight_steps actions and
+                             c_k = 1 / (k + 1) after them (the weighting of the authors' safety filter, which tracks its
+                             first nodes in full and lets the later ones decay): the actions that get executed stay close to
+                             the proposal, while the later ones give way to the rest at the end. With uniform weights the
+                             projection spreads that braking over every action, the executed first one included.
 
     Constraints              x_0 = x_init
                              x_{k+1} = A_d x_k + B_d u_k                 triple integrator (``sim.casadi_dynamics``)
@@ -71,6 +77,7 @@ class CasadiTrajectoryProjector:
         if int(horizon) < 1:
             raise ValueError("'horizon' must be at least 1.")
         self.terminal_velocity_weight = config.terminal_velocity_weight
+        self.full_weight_steps = config.projection_full_weight_steps
         # How close to zero the rest velocity and acceleration of a reused trajectory must be
         self.fallback_terminal_velocity_tol = config.fallback_terminal_velocity_tol
         self.max_consecutive_fallbacks = config.max_consecutive_fallbacks
@@ -84,9 +91,12 @@ class CasadiTrajectoryProjector:
         """The projection problem and its ``u_ref``."""
         graph = CasadiKinematicGraph(self.sim, self.N)
         max_action = np.asarray(self.sim.max_action, dtype=float).reshape(-1, 1)
-        # Cost: track the proposed chunk (each action divided by its limit) and come to rest at the end of the horizon
+        # Cost: track the proposed chunk (each action divided by its limit, the later ones less) and come to rest at the end
         u_ref = graph.parameter(self.sim.nu, self.N)
-        tracking = ca.sumsqr((graph.U - u_ref) / ca.repmat(ca.DM(max_action), 1, self.N))
+        steps = np.arange(1, self.N + 1)
+        weights = np.where(steps <= self.full_weight_steps, 1.0, 1.0 / steps)
+        deviation = (graph.U - u_ref) / ca.repmat(ca.DM(max_action), 1, self.N)
+        tracking = ca.sumsqr(deviation * ca.repmat(ca.DM(np.sqrt(weights)).T, self.sim.nu, 1))
         graph.minimize(tracking + self.terminal_velocity_weight * ca.sumsqr(graph.X[self.rest_idx, self.N]))
         return graph, u_ref
 
@@ -125,7 +135,7 @@ class CasadiTrajectoryProjector:
             states[:, 1:] <= np.asarray(self.sim.state_upper_bounds)[:, None] + tolerance
         )
         at_rest = np.all(np.abs(states[self.rest_idx, self.N]) <= self.fallback_terminal_velocity_tol)
-        collision_free = all(self.sim.collision.is_collision_free(states[: self.sim.n, k]) for k in range(1, self.N + 1))
+        collision_free = self.sim.collision.trajectory_is_collision_free(states[: self.sim.n, 1:].T)
         return states if within_limits and at_rest and collision_free else None
 
     def _linearize(self, x0: np.ndarray, u_ref: np.ndarray) -> None:
@@ -135,7 +145,7 @@ class CasadiTrajectoryProjector:
     def _solve(self) -> GraphSolution:
         """The converged solution of the problem set, which has to be clear of the obstacles."""
         solution = self._graph.solve()
-        if not all(self.sim.collision.is_collision_free(solution.states[: self.sim.n, k]) for k in range(1, self.N + 1)):
+        if solution.penetrates:
             raise RuntimeError("The projection penetrates an obstacle.")
         return solution
 
@@ -173,6 +183,8 @@ class CasadiTrajectoryProjector:
                 self._linearize(x0, u_ref)
                 sol = self._solve()
             except RuntimeError:
+                if self._prev_X_sol is None:
+                    raise  # the attempt already started from holding still
                 # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
                 # prediction: a cold restart resolves most of those
                 cold_states, cold_actions = self._hold_still_guess(x0)
@@ -186,7 +198,7 @@ class CasadiTrajectoryProjector:
             return self._prev_U_sol.T.copy()
         except RuntimeError as exc:
             budget_left = not is_new_control_tick or self._consecutive_fallback_count < self.max_consecutive_fallbacks
-            if self._prev_U_sol is not None and budget_left:
+            if budget_left:  # without a previous solution u_guess holds still
                 revalidated = self._revalidate_fallback(x0, u_guess)
                 if revalidated is not None:
                     warnings.warn(

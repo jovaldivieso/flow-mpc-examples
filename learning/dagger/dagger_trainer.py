@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import gc
+import time
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -22,15 +23,18 @@ from learning.models.policy import ActionPolicy
 from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.planner_factory import PlannerFactory
 
+from .coverage import CoverageMetrics, DatasetCoverage
 from .dagger_config import DaggerConfig
+from .episode_starts import EpisodeStarts
 from .metrics import DaggerEvalMetrics
 from .collection import collect_dagger_rollouts
 from .evaluation import evaluate_policy_rollouts
 from .policy_action import build_policy_action
-from .round_summary import append_round_summary
+from .round_summary import RoundTiming, append_round_summary
 from .workers import RolloutWorkerSpec
 from .utils import (
     apply_config_overrides,
+    evaluation_seed_specs,
     print_rollout_metrics,
     resolve_initial_state_seed,
     resolve_round_steps,
@@ -43,6 +47,7 @@ from .utils import (
 WEIGHT_DECAY = 1e-7
 MIN_LEARNING_RATE = 1e-7
 ROLLOUT_DEVICE = torch.device("cpu")
+COVERAGE_EPISODES = 50  # evaluation starts whose coverage by the dataset is measured, per set of modes
 
 
 def _validate_resumable_dataset_schema(
@@ -89,6 +94,8 @@ class DaggerTrainer:
         self.initial_state_seed = 0
         self.obs_feature_names: list[str] = []
         self.state_dim = self.action_dim = self.prediction_horizon = 0
+        self.timing = RoundTiming()  # the phases of the round under way
+        self._round_started = time.perf_counter()
 
     def setup(self) -> None:
         set_seed(self.cfg.seed)
@@ -136,6 +143,9 @@ class DaggerTrainer:
         self.ema = ExponentialMovingAverage(self.policy)
         if self.cfg.init_checkpoint is not None:
             self._load_init_checkpoint(self.cfg.init_checkpoint)
+
+        for name in self.cfg.regions:  # a region the system cannot sample in fails now, not rounds into the run
+            self._apply_runtime_config_overrides(copy.deepcopy(dict(self.seeded_config)), region=name)
 
         self.cfg.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -249,6 +259,7 @@ class DaggerTrainer:
         assert self.optimizer is not None
         assert self.device is not None
         print(f"\n=== {label} ===")
+        started = time.perf_counter()
         dataset = LeRobotDataset(
             repo_id=self.cfg.repo_id,
             root=self.cfg.dataset_root,
@@ -274,6 +285,7 @@ class DaggerTrainer:
         )
         mean_loss = self.train_policy_steps(loader, steps)
         print(f"  mean_step_loss={mean_loss:.6f}")
+        self.timing.add_training(time.perf_counter() - started)
         return mean_loss
 
     def _policy_spec(self, policy_type: str) -> PolicySpec:
@@ -297,9 +309,14 @@ class DaggerTrainer:
         return PolicyFactory.create(self._policy_spec(policy_type), simulator, planner_config).to(device).eval()
 
     def _apply_runtime_config_overrides(
-        self, config: dict[str, Any], *, tolerance_overrides: Mapping[str, float] | None = None
+        self,
+        config: dict[str, Any],
+        *,
+        tolerance_overrides: Mapping[str, float] | None = None,
+        region: str | None = None,
     ) -> dict[str, Any]:
-        """Inject the training config's solver/dynamics tuning knobs (tolerances), if set.
+        """Inject the training config's solver/dynamics tuning knobs (tolerances), if set, and the sampling boxes of
+        the named ``region``.
 
         tolerance_overrides defaults to self.cfg.tolerance_overrides (the
         collection/training value) when not given -- evaluate_current_policy
@@ -311,6 +328,8 @@ class DaggerTrainer:
             tolerance_overrides if tolerance_overrides is not None else self.cfg.tolerance_overrides
         )
         merged_config = apply_config_overrides(config, effective_tolerance_overrides or {})
+        if region is not None:
+            merged_config = apply_config_overrides(merged_config, self.cfg.regions[region])
         return validate_system_config(merged_config)
 
     def _sync_rollout_policy(self) -> None:
@@ -335,17 +354,22 @@ class DaggerTrainer:
             need_expert=need_expert,
         )
 
-    def evaluate_current_policy(self, label: str, policy_type: str | None = None) -> DaggerEvalMetrics | None:
+    def evaluate_current_policy(
+        self, label: str, policy_type: str | None = None, region: str | None = None
+    ) -> DaggerEvalMetrics | None:
         """Evaluate the weights being trained as a policy of ``policy_type`` (the trained one by default): the weights
-        of a flow policy also make a safe flow policy, which runs the same episodes with its projector."""
+        of a flow policy also make a safe flow policy, which runs the same episodes with its projector. The episodes
+        start and end as the system config samples them, or in the named ``region``."""
         assert self.rollout_policy is not None
         assert self.seeded_config is not None
         if self.cfg.eval_episodes == 0:
             return None
+        started = time.perf_counter()
         policy_type = policy_type or self.cfg.policy_type
         eval_config = self._apply_runtime_config_overrides(
             copy.deepcopy(dict(self.seeded_config)),
             tolerance_overrides=self.cfg.eval_tolerance_overrides,
+            region=region,
         )
         simulator = SystemFactory.create(eval_config["system"], eval_config)
 
@@ -367,14 +391,64 @@ class DaggerTrainer:
             reset_fn=policy.reset,
             action_noise_std=self.cfg.eval_action_noise_std,
             action_noise_seed=self.action_noise_seed,
-            initial_states=self.cfg.initial_states,
-            goal_states=self.cfg.goal_states,
+            initial_states=self.cfg.initial_states if region is None else None,
+            goal_states=self.cfg.goal_states if region is None else None,
             num_workers=self.cfg.num_workers,
             worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True, policy_type=policy_type),
         )
         if metrics is not None:
             print_rollout_metrics(label, "eval", metrics)
+        self.timing.add_evaluation(policy_type, time.perf_counter() - started, region)
         return metrics
+
+    def evaluate_regions(self, stage: str) -> dict[str, dict[str, DaggerEvalMetrics | None]]:
+        """The evaluation in every region, by region and policy type: the trained one and, for a flow policy, safeflow."""
+        results: dict[str, dict[str, DaggerEvalMetrics | None]] = {}
+        for name in self.cfg.regions:
+            results[name] = {
+                self.cfg.policy_type: self.evaluate_current_policy(
+                    f"{stage} {self.cfg.policy_type} evaluation in region '{name}'", region=name
+                )
+            }
+            if self.cfg.policy_type == "flow":
+                results[name]["safeflow"] = self.evaluate_current_policy(
+                    f"{stage} safeflow evaluation in region '{name}'", "safeflow", region=name
+                )
+        return results
+
+    def measure_coverage(self) -> dict[str, CoverageMetrics] | None:
+        """How well the dataset covers the starts of the evaluation episodes, on all the modes ('random') and in every region."""
+        if self.cfg.eval_episodes == 0:
+            return None
+        assert self.seeded_config is not None
+        started = time.perf_counter()
+        coverage = DatasetCoverage.from_dataset(self.cfg.dataset_root)
+        seeds = evaluation_seed_specs(min(self.cfg.eval_episodes, COVERAGE_EPISODES), self.cfg.eval_seed_start)
+        results: dict[str, CoverageMetrics] = {}
+        for name in ("random", *self.cfg.regions):
+            region = None if name == "random" else name
+            config = self._apply_runtime_config_overrides(
+                copy.deepcopy(dict(self.seeded_config)), tolerance_overrides=self.cfg.eval_tolerance_overrides, region=region
+            )
+            simulator = SystemFactory.create(config["system"], config)
+            starts = EpisodeStarts.from_specs(
+                simulator,
+                self.cfg.initial_states if region is None else None,
+                self.cfg.goal_states if region is None else None,
+            )
+            queries = np.array(
+                [
+                    np.concatenate(list(simulator.policy_observation(simulator.observe(starts.begin(simulator, index, seed))).values()))
+                    for index, seed in enumerate(seeds)
+                ]
+            )
+            results[name] = coverage.measure(queries)
+            print(
+                f"Coverage of the {name} starts: median distance {results[name].median:.2f}, "
+                f"{100 * results[name].far_fraction:.0f}% farther than the dataset's own episodes (p90)"
+            )
+        self.timing.coverage = time.perf_counter() - started
+        return results
 
     def save_round_summary(
         self,
@@ -385,6 +459,9 @@ class DaggerTrainer:
         safeflow_eval_metrics: DaggerEvalMetrics | None = None,
         latest_checkpoint: str | None = None,
         iteration_checkpoint: str | None = None,
+        region_eval_metrics: Mapping[str, Mapping[str, DaggerEvalMetrics | None]] | None = None,
+        timing: RoundTiming | None = None,
+        coverage: Mapping[str, CoverageMetrics] | None = None,
     ) -> None:
         """Persist a round-by-round YAML summary with success and failure stats."""
 
@@ -397,7 +474,19 @@ class DaggerTrainer:
             safeflow_eval_metrics,
             latest_checkpoint,
             iteration_checkpoint,
+            region_eval_metrics,
+            timing,
+            coverage,
         )
+
+    def _start_round(self) -> None:
+        self.timing = RoundTiming()
+        self._round_started = time.perf_counter()
+
+    def _finish_round(self) -> RoundTiming:
+        """The timing of the round that is over."""
+        self.timing.total = time.perf_counter() - self._round_started
+        return self.timing
 
     def save_checkpoints(self, training_round: int) -> None:
         assert self.policy is not None
@@ -437,6 +526,7 @@ class DaggerTrainer:
         assert self.seeded_config is not None
 
         if not self.cfg.start_with_aggregation:
+            self._start_round()
             self.train_on_aggregate(
                 "Initial offline training pass",
                 0,
@@ -446,6 +536,8 @@ class DaggerTrainer:
             initial_safeflow = (
                 self.evaluate_current_policy("Round 0 safeflow evaluation", "safeflow") if self.cfg.policy_type == "flow" else None
             )
+            initial_regions = self.evaluate_regions("Round 0")
+            initial_coverage = self.measure_coverage()
 
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_iter_000.pt"
@@ -457,6 +549,9 @@ class DaggerTrainer:
                 safeflow_eval_metrics=initial_safeflow,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
+                region_eval_metrics=initial_regions,
+                timing=self._finish_round(),
+                coverage=initial_coverage,
             )
             if self.cfg.dagger_iterations == 0:
                 print("No DAgger refinements requested (--dagger-iterations 0).")
@@ -471,6 +566,7 @@ class DaggerTrainer:
             rounds = range(self.cfg.dagger_iterations)
 
         for index in rounds:
+            self._start_round()
             if self.cfg.start_with_aggregation:
                 schedule = index
                 display = index + 1
@@ -493,13 +589,14 @@ class DaggerTrainer:
                 else self.initial_state_seed
             )
             collection_config = self._apply_runtime_config_overrides(
-                copy.deepcopy(dict(self.seeded_config))
+                copy.deepcopy(dict(self.seeded_config)), region=mode if mode in self.cfg.regions else None
             )
             collection_config = apply_config_overrides(
                 collection_config, {"randomize_goal": True}
             )
             print(f"Aggregation goal source: {mode}")
 
+            collection_started = time.perf_counter()
             simulator = SystemFactory.create(collection_config["system"], collection_config)
             planner = PlannerFactory.create(collection_config["expert"], simulator, collection_config)
 
@@ -559,6 +656,7 @@ class DaggerTrainer:
                 writer.finalize()
                 del writer
                 gc.collect()
+            self.timing.collection = time.perf_counter() - collection_started
 
             print_rollout_metrics(
                 label=f"Round {display} aggregation"
@@ -585,6 +683,9 @@ class DaggerTrainer:
                 else None
             )
 
+            region_eval_metrics = self.evaluate_regions(f"{stage} {display}")
+            coverage = self.measure_coverage()
+
             latest_checkpoint = self.cfg.checkpoint_dir / "flow_dagger_checkpoint.pt"
             iteration_checkpoint = self.cfg.checkpoint_dir / f"flow_dagger_iter_{index:03d}.pt"
             self.save_checkpoints(training_round=index)
@@ -596,5 +697,8 @@ class DaggerTrainer:
                 safeflow_eval_metrics=safeflow_eval_metrics,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
+                region_eval_metrics=region_eval_metrics,
+                timing=self._finish_round(),
+                coverage=coverage,
             )
 

@@ -28,11 +28,13 @@ SLACK_TOLERANCE = 1e-3  # [m]
 
 
 class GraphSolution(NamedTuple):
-    """The states (nx, N + 1) and actions (nu, N) of a solve, and the largest obstacle slack [m] it uses."""
+    """The states (nx, N + 1) and actions (nu, N) of a solve, the largest obstacle slack [m] it uses, and whether a bounding
+    sphere still penetrates an obstacle at one of its nodes."""
 
     states: np.ndarray
     actions: np.ndarray
     max_slack: float = 0.0
+    penetrates: bool = False
 
 
 class CasadiKinematicGraph:
@@ -91,6 +93,9 @@ class CasadiKinematicGraph:
     fails. A solution that is still rejected raises ``RuntimeError``.
 
     ``X`` and ``U`` are the symbolic expressions its owner builds its cost from; everything else of ``opti`` stays here.
+    ``Opti`` only describes the problem: a solve calls the CasADi function ``Opti.to_function`` makes of it, with the
+    values of the parameters and the initial values of the variables as its inputs, and a solve the solver reports as
+    failed raises ``RuntimeError``.
     """
 
     def __init__(self, simulator: TripleIntegratorBase, horizon: int) -> None:
@@ -100,7 +105,9 @@ class CasadiKinematicGraph:
         nx, nu, N, n = self.sim.nx, self.sim.nu, self.N, self.n_joints
 
         self.opti = ca.Opti()
-        self.x0_param = self.opti.parameter(nx)
+        self._parameters: list[ca.MX] = []  # the parameters, with their values, in the order of the inputs of the solver
+        self._values: list[np.ndarray] = []
+        self.x0_param = self.parameter(nx)
 
         num_spheres, set_size = self.sim.collision.num_spheres, self.sim.collision.free_space.size
         self.num_halfspaces = P = num_spheres * set_size
@@ -109,18 +116,27 @@ class CasadiKinematicGraph:
 
         # The variables stage by stage, in the order FATROP reads them: x_k (k = 0 .. N), u_k (k < N), s_k (k >= 1)
         self._x, self._u, self._s = [], [], []
+        self._state_index = np.zeros((N + 1, nx), dtype=int)  # where x_k and u_k are in the vector of all variables
+        self._action_index = np.zeros((N, nu), dtype=int)
+        self._num_variables = 0
         for k in range(N + 1):
             self._x.append(self.opti.variable(nx))
+            self._state_index[k] = self._num_variables + np.arange(nx)
+            self._num_variables += nx
             if k < N:
                 self._u.append(self.opti.variable(nu))
+                self._action_index[k] = self._num_variables + np.arange(nu)
+                self._num_variables += nu
             if P > 0 and k >= 1:
                 self._s.append(self.opti.variable(num_spheres))
+                self._num_variables += num_spheres
         self.X = ca.horzcat(*self._x)
         self.U = ca.horzcat(*self._u)
+        self.set_initial(0.0, 0.0)
         if P > 0:
             self.slack = ca.vertcat(*self._s)
-            self.A_coll = self.opti.parameter(P * N, n)
-            self.b_coll = self.opti.parameter(P * N)
+            self.A_coll = self.parameter(P * N, n)
+            self.b_coll = self.parameter(P * N)
             # Each sphere's slack serves its half-spaces (row index = sphere * set_size + i)
             sphere_of_row = ca.DM(np.kron(np.eye(num_spheres), np.ones((set_size, 1))))
 
@@ -159,33 +175,56 @@ class CasadiKinematicGraph:
             objective = objective + SLACK_LINEAR_WEIGHT * ca.sum1(self.slack) + SLACK_QUADRATIC_WEIGHT * ca.sumsqr(self.slack)
         self.opti.minimize(objective)
         self.opti.solver("fatrop", FATROP_OPTIONS)
+        outputs = [self.X, self.U] + ([self.slack] if self.num_halfspaces > 0 else [])
+        self._solver = self.opti.to_function("solve", [*self._parameters, self.opti.x], outputs)
 
     def parameter(self, rows: int, cols: int = 1) -> ca.MX:
         """A parameter of its owner's cost, set with ``set_value``."""
-        return self.opti.parameter(rows, cols)
+        parameter = self.opti.parameter(rows, cols)
+        self._parameters.append(parameter)
+        self._values.append(np.zeros((rows, cols)))
+        return parameter
+
+    def _slot(self, parameter: ca.MX) -> int:
+        return next(slot for slot, known in enumerate(self._parameters) if known is parameter)
 
     def set_value(self, parameter: ca.MX, value: np.ndarray) -> None:
-        self.opti.set_value(parameter, value)
+        """The value of ``parameter`` for the next solves: a matrix of its shape, or a vector for a column."""
+        slot = self._slot(parameter)
+        shape, array = self._values[slot].shape, np.asarray(value, dtype=float)
+        if array.shape != shape and not (shape[1] == 1 and array.shape == (shape[0],)):
+            raise ValueError(f"A parameter of shape {shape} cannot take a value of shape {array.shape}.")
+        self._values[slot] = array.reshape(shape)
+
+    def value(self, parameter: ca.MX) -> np.ndarray:
+        """The value of ``parameter`` the next solve uses (a vector for a column)."""
+        value = self._values[self._slot(parameter)]
+        return value[:, 0] if value.shape[1] == 1 else value
 
     def set_state(self, x0: np.ndarray) -> None:
         """The state the horizon starts from."""
         self._q_current = np.asarray(x0, dtype=float)[: self.n_joints]
-        self.opti.set_value(self.x0_param, x0)
+        self.set_value(self.x0_param, x0)
 
     def set_initial(self, states: np.ndarray, actions: np.ndarray) -> None:
-        """The initial values of the variables of the next solve."""
-        states = np.broadcast_to(states, (self.sim.nx, self.N + 1))
-        actions = np.broadcast_to(actions, (self.sim.nu, self.N))
-        for k in range(self.N + 1):
-            self.opti.set_initial(self._x[k], states[:, k])
-        for k in range(self.N):
-            self.opti.set_initial(self._u[k], actions[:, k])
+        """The initial values of the states and actions of the next solves, kept until they are set again (the slack
+        starts at zero)."""
+        self._initial_states = np.array(np.broadcast_to(states, (self.sim.nx, self.N + 1)), dtype=float)
+        self._initial_actions = np.array(np.broadcast_to(actions, (self.sim.nu, self.N)), dtype=float)
+
+    @property
+    def initial_guess(self) -> tuple[np.ndarray, np.ndarray]:
+        """The initial states (nx, N + 1) and actions (nu, N) of the next solve."""
+        return self._initial_states.copy(), self._initial_actions.copy()
+
+    @property
+    def iterations(self) -> int:
+        """The iterations of the last solve."""
+        return int(self._solver.stats()["iter_count"])
 
     def reset(self) -> None:
-        """Nothing of the last episode is reused: the initial values are sticky on the ``Opti`` object."""
+        """Nothing of the last episode is reused: the initial values go back to zero."""
         self.set_initial(0.0, 0.0)
-        for stage_slack in self._s:
-            self.opti.set_initial(stage_slack, 0.0)
 
     def update_collision_halfspaces(self, q_ref: np.ndarray) -> None:
         """The free-space sets along ``q_ref`` (N, n_joints), the set of each node being the one around the motion of the
@@ -196,37 +235,47 @@ class CasadiKinematicGraph:
 
     def _linearize_sets(self, q_ref: np.ndarray) -> None:
         A, b = self.sim.collision.linearize(self._sets, q_ref)
-        self.opti.set_value(self.A_coll, A.reshape(-1, self.n_joints))
-        self.opti.set_value(self.b_coll, b.reshape(-1))
+        self.set_value(self.A_coll, A.reshape(-1, self.n_joints))
+        self.set_value(self.b_coll, b.reshape(-1))
 
     def solve(self, slack_tolerance: float = SLACK_TOLERANCE) -> GraphSolution:
         """Solve from the initial values set; raises ``RuntimeError`` if the solver fails or the slack of the solution
         exceeds ``slack_tolerance`` (the relinearization of a rejected first solution always judges by
         ``SLACK_TOLERANCE``)."""
-        sol = self._refine_if_rejected(self.opti.solve())
-        max_slack = self._max_slack(sol)
+        states, actions, max_slack, penetrates = self._refine_if_rejected(*self._solve_once())
         if max_slack > slack_tolerance:
             raise RuntimeError(f"The obstacle slack of the solution exceeds {slack_tolerance} m.")
-        return GraphSolution(sol.value(self.X), sol.value(self.U), max_slack)
+        return GraphSolution(states, actions, max_slack, penetrates)
 
-    def _max_slack(self, sol: ca.OptiSol) -> float:
-        return float(np.max(sol.value(self.slack))) if self.num_halfspaces > 0 else 0.0
+    def _solve_once(self) -> tuple[np.ndarray, np.ndarray, float]:
+        """One solve from the initial values: the states (nx, N + 1), the actions (nu, N) and the largest slack of the
+        solution. Raises ``RuntimeError`` if the solver reports a failure."""
+        initial = np.zeros(self._num_variables)
+        initial[self._state_index] = self._initial_states.T
+        initial[self._action_index] = self._initial_actions.T
+        outputs = self._solver(*self._values, initial)
+        statistics = self._solver.stats()
+        if not statistics["success"]:
+            raise RuntimeError(f"The solver failed (return status {statistics['return_status']}).")
+        max_slack = float(np.max(np.array(outputs[2]))) if self.num_halfspaces > 0 else 0.0
+        return np.array(outputs[0]), np.array(outputs[1]), max_slack
 
-    def _is_rejected(self, sol: ca.OptiSol) -> bool:
-        positions = sol.value(self.X)[: self.n_joints]
-        penetrates = not all(self.sim.collision.is_collision_free(positions[:, k]) for k in range(1, self.N + 1))
-        return penetrates or self._max_slack(sol) > SLACK_TOLERANCE
+    def _penetrates(self, states: np.ndarray) -> bool:
+        return not self.sim.collision.trajectory_is_collision_free(states[: self.n_joints, 1:].T)
 
-    def _refine_if_rejected(self, sol: ca.OptiSol) -> ca.OptiSol:
+    def _refine_if_rejected(
+        self, states: np.ndarray, actions: np.ndarray, max_slack: float
+    ) -> tuple[np.ndarray, np.ndarray, float, bool]:
         """The half-spaces are only a linearization: if the solution still penetrates an obstacle or has too much slack,
         linearize the kinematics again around it (within the same sets) and solve once more. The first solution stays
-        when that solve fails."""
-        if self.num_halfspaces == 0 or not self._is_rejected(sol):
-            return sol
-        X_first = sol.value(self.X)
-        self.set_initial(X_first, sol.value(self.U))
-        self._linearize_sets(X_first[: self.n_joints, 1:].T)
+        when that solve fails. Returns the solution that stays, its largest slack and whether it penetrates an obstacle."""
+        penetrates = self._penetrates(states)
+        if self.num_halfspaces == 0 or not (penetrates or max_slack > SLACK_TOLERANCE):
+            return states, actions, max_slack, penetrates
+        self.set_initial(states, actions)
+        self._linearize_sets(states[: self.n_joints, 1:].T)
         try:
-            return self.opti.solve()
+            refined_states, refined_actions, refined_slack = self._solve_once()
         except RuntimeError:
-            return sol
+            return states, actions, max_slack, penetrates
+        return refined_states, refined_actions, refined_slack, self._penetrates(refined_states)

@@ -117,6 +117,11 @@ class PointMassSystem(TripleIntegratorBase):
         q_pos = np.asarray(q, dtype=float)[: self.n]
         return q_pos[None, :], np.eye(self.n)[None, :, :], np.zeros(1)
 
+    def collision_spheres_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """``collision_spheres`` at every row of ``q_trajectory`` (H, n): centers (H, 1, n), Jacobians (H, 1, n, n)."""
+        q_traj = np.asarray(q_trajectory, dtype=float)[:, : self.n]
+        return q_traj[:, None, :], np.tile(np.eye(self.n), (len(q_traj), 1, 1, 1)), np.zeros(1)
+
     def collides(self, state: np.ndarray) -> bool:
         """The point mass is its own bounding sphere: it collides when that sphere penetrates an obstacle."""
         return not self.collision.is_collision_free(np.asarray(state, dtype=float)[: self.n])

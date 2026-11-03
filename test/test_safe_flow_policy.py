@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import warnings
 from unittest import mock
 
 import numpy as np
@@ -222,30 +223,46 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
         self.assertEqual(steps_taken, 0)
         self.assertEqual(failure_reason, "solve_failure")
 
-    def test_projector_cold_start_failure_ends_the_episode_with_a_solve_failure(self) -> None:
-        # The same property through the real policy: with no previously
-        # solved safe trajectory to fall back on, a failing projector solve
-        # surfaces from select_action as a PlannerSolveError (see
-        # CasadiTrajectoryProjector.project), which the evaluation-side
-        # rollout turns into an episode-ending failure.
+    def _rollout_with_a_failing_projector(self, initial_state_edit=None):
         from learning.dagger.evaluation import rollout_policy_with_action_fn
         from learning.dagger.policy_action import build_policy_action
 
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator)
-        policy.projector._graph.opti.solve = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        policy.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         initial_state = _rest_state(simulator)
+        if initial_state_edit is not None:
+            initial_state_edit(simulator, initial_state)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            result = rollout_policy_with_action_fn(
+                simulator=simulator,
+                initial_state=initial_state,
+                num_steps=10,
+                action_fn=lambda observation: build_policy_action(simulator, policy, observation, torch.device("cpu")),
+                reset_fn=policy.reset,
+            )
+        return result, policy.projector.max_consecutive_fallbacks
 
-        reached_goal, steps_taken, failure_reason = rollout_policy_with_action_fn(
-            simulator=simulator,
-            initial_state=initial_state,
-            num_steps=10,
-            action_fn=lambda observation: build_policy_action(simulator, policy, observation, torch.device("cpu")),
-            reset_fn=policy.reset,
-        )
+    def test_projector_cold_start_failure_in_motion_ends_the_episode_with_a_solve_failure(self) -> None:
+        # The same property through the real policy: with no previously solved safe trajectory to fall back on (holding
+        # still is not one in motion), a failing projector solve surfaces from select_action as a PlannerSolveError (see
+        # CasadiTrajectoryProjector.project), which the evaluation-side rollout turns into an episode-ending failure.
+        def in_motion(simulator, state):
+            state[simulator.n] = 0.5
+
+        (reached_goal, steps_taken, failure_reason), _ = self._rollout_with_a_failing_projector(in_motion)
+
         self.assertFalse(reached_goal)
         self.assertEqual(steps_taken, 0)
         self.assertEqual(failure_reason, "solve_failure")
+
+    def test_projector_failures_at_rest_hold_still_instead_of_ending_the_episode(self) -> None:
+        (reached_goal, steps_taken, failure_reason), _ = self._rollout_with_a_failing_projector()
+
+        self.assertFalse(reached_goal)
+        self.assertEqual(steps_taken, 10)  # the arm held still for every step
+        self.assertNotEqual(failure_reason, "solve_failure")
 
 
 class SelectActionBatchSizeGuardTests(unittest.TestCase):
@@ -305,11 +322,13 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
 
     def test_projector_reads_its_tuning_from_the_validated_expert_config(self) -> None:
         planner_config = _validated_config(
-            terminal_velocity_weight=42.0, fallback_terminal_velocity_tol=0.007, max_consecutive_fallbacks=3,
+            terminal_velocity_weight=42.0, projection_full_weight_steps=5, fallback_terminal_velocity_tol=0.007,
+            max_consecutive_fallbacks=3,
         )
         policy = _build_safe_flow_policy(_build_simulator(), planner_config=planner_config)
 
         self.assertEqual(policy.projector.terminal_velocity_weight, 42.0)
+        self.assertEqual(policy.projector.full_weight_steps, 5)
         self.assertEqual(policy.projector.fallback_terminal_velocity_tol, 0.007)
         self.assertEqual(policy.projector.max_consecutive_fallbacks, 3)
 

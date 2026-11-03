@@ -47,6 +47,62 @@ class CasadiKinematicGraphTests(unittest.TestCase):
         self.assertEqual(graph.num_halfspaces, num_spheres * MAX_SET_SIZE)
         self.assertEqual(graph.opti.nx, (horizon + 1) * simulator.nx + horizon * simulator.nu + horizon * num_spheres)
 
+    def test_a_solve_the_solver_reports_as_failed_raises(self) -> None:
+        simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES[:1]))
+        state = rest_state(simulator)
+        state[simulator.n : 2 * simulator.n] = 100.0  # no jerk brings that velocity within its limit in a step
+        graph = CasadiKinematicGraph(simulator, 5)
+        graph.minimize(ca.sumsqr(graph.U))
+        graph.set_state(state)
+        graph.set_initial(np.tile(state[:, None], (1, 6)), np.zeros((simulator.nu, 5)))
+        graph.update_collision_halfspaces(np.tile(state[: simulator.n], (5, 1)))
+
+        with self.assertRaisesRegex(RuntimeError, "solver failed"):
+            graph.solve()
+
+    def test_a_good_solve_after_a_failed_one_succeeds_again(self) -> None:
+        simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES[:1]))
+        state = rest_state(simulator)
+        graph = CasadiKinematicGraph(simulator, 5)
+        graph.minimize(ca.sumsqr(graph.U))
+        fast = state.copy()
+        fast[simulator.n : 2 * simulator.n] = 100.0
+        for x0, succeeds in ((state, True), (fast, False), (state, True)):
+            graph.set_state(x0)
+            graph.set_initial(np.tile(x0[:, None], (1, 6)), np.zeros((simulator.nu, 5)))
+            graph.update_collision_halfspaces(np.tile(x0[: simulator.n], (5, 1)))
+            if succeeds:
+                np.testing.assert_allclose(graph.solve().states[:, 0], x0)
+            else:
+                with self.assertRaises(RuntimeError):
+                    graph.solve()
+
+    def test_a_parameter_takes_a_value_of_its_shape_only_and_gives_it_back(self) -> None:
+        simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES[:1]))
+        graph = CasadiKinematicGraph(simulator, 5)
+        owner = graph.parameter(3, 2)
+
+        graph.set_value(owner, np.arange(6.0).reshape(3, 2))
+        graph.set_state(np.arange(simulator.nx, dtype=float))
+
+        np.testing.assert_array_equal(graph.value(owner), np.arange(6.0).reshape(3, 2))
+        np.testing.assert_array_equal(graph.value(graph.x0_param), np.arange(simulator.nx, dtype=float))  # a column as a vector
+        for wrong in (np.zeros(6), np.zeros((2, 3)), np.zeros((3, 2, 1))):
+            with self.subTest(shape=wrong.shape), self.assertRaises(ValueError):
+                graph.set_value(owner, wrong)
+
+    def test_the_initial_values_are_kept_between_solves_until_a_reset(self) -> None:
+        simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES[:1]))
+        graph = CasadiKinematicGraph(simulator, 5)
+        states, actions = np.ones((simulator.nx, 6)), 2.0 * np.ones((simulator.nu, 5))
+
+        np.testing.assert_array_equal(graph.initial_guess[0], np.zeros((simulator.nx, 6)))  # zero before anything is set
+        graph.set_initial(states, actions)
+        np.testing.assert_array_equal(graph.initial_guess[0], states)
+        np.testing.assert_array_equal(graph.initial_guess[1], actions)
+        graph.reset()
+        np.testing.assert_array_equal(graph.initial_guess[1], np.zeros((simulator.nu, 5)))
+
     def test_a_solution_with_a_slack_above_the_tolerance_is_rejected(self) -> None:
         simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES[:1]))
         # an obstacle on the TCP of the rest state: its half-space cannot be satisfied from there within a step
@@ -110,7 +166,7 @@ class CasadiKinematicGraphTests(unittest.TestCase):
         iterations = []
         for _ in range(4):
             plan = planner.plan(simulator.observe(state))
-            iterations.append(planner._graph.opti.stats()["iter_count"])
+            iterations.append(planner._graph.iterations)
             state = simulator.step(state, plan.actions[0])
         self.assertLess(iterations[-1], iterations[0])
 

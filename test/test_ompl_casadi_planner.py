@@ -20,7 +20,7 @@ from planning.planner_factory import PlannerFactory
 from test.planner_fixtures import initial_guess, pinned_config, pose_goal
 
 N = 7
-SEED = 3  # a start and goal pair far enough apart for the MPC to plan a long motion
+SEED = 1  # a start and goal pair far enough apart for the MPC to plan a long motion
 
 
 def _step_along(simulator: FrankaSystem, planner: Planner, state: np.ndarray) -> np.ndarray:
@@ -77,7 +77,7 @@ class OmplCasadiPlannerTests(unittest.TestCase):
         self.assertIsNotNone(target)
         self.assertGreater(np.linalg.norm(target - self.planner.goal_configuration), 0.1)
         self.assertLessEqual(np.linalg.norm(target - self.start[:N]), self.guess.lookahead + 1e-9)
-        np.testing.assert_allclose(self.planner._graph.opti.value(self.planner.goal_param)[:N], target, atol=1e-9)
+        np.testing.assert_allclose(self.planner._graph.value(self.planner.goal_param)[:N], target, atol=1e-9)
 
     def test_the_target_is_none_before_a_path_and_after_a_reset(self) -> None:
         self.assertIsNone(self.guess.target(self.start[:N]))
