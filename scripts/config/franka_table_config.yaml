@@ -1,47 +1,39 @@
-# Expert (OMPL RRT-Connect + CasADi MPC) config for the Franka FR3 arm with a table: episodes drawn from the modes of
-# 'sampling' below (the learning config's regions restrict them to some of the modes).
+# Expert (OMPL RRT-Connect path timed by time-optimal trajectory generation) config for the Franka FR3 arm with a table:
+# episodes drawn from the modes of 'sampling' below (the learning config's regions restrict them to some of the modes).
 # State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
 system: franka
 dt: 0.1
-# The horizon (steps) of the expert's MPC. DAgger labels a state with the first prediction_horizon (the policy config's
-# chunk length, at most this) of its planned jerks.
-horizon: 20
-# Cost of the MPC, on the state x = [q, v, a] relative to the goal state [q_goal, 0, 0]: Q_diag weights the squared
-# position (first 7), velocity and acceleration (last 14) error at every node, R_diag the squared jerk,
-# terminal_cost_multiplier the terminal node's Q cost.
-Q_diag: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 20.0,
-         2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
-         0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2]
-# 1 / max_jerk^2
-R_diag: [4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3, 4.4e-3]
-terminal_cost_multiplier: 10.0
-# Obstacle slack [m] the expert accepts: where it cannot clear an obstacle within the limits (the arm too fast to brake in
-# time) its plan brakes at the least violation instead of failing, so those states are labelled too
-expert_slack_tolerance: 0.10
 # Limits of the arm [rad/s^2, rad/s^3]; joint position and velocity limits come from the URDF
 max_acceleration: 5.0
 max_jerk: 15.0
 
-# The expert planner (planning/planner_factory.py): ompl_casadi (the MPC with an OMPL RRT-Connect path as goal and first guess)
+# The expert planner (planning/planner_factory.py): ompl_casadi, the positions along an OMPL RRT-Connect path timed by
+# time-optimal trajectory generation, tracked by the safety projection's jerks
 expert: ompl_casadi
+# Rows of positions the expert plans per state. DAgger labels a state with the first prediction_horizon (the policy config's
+# chunk length, at most this) of them.
+horizon: 20
 
-# Settings of the OMPL path (ompl_casadi)
-ompl_speed: 0.5                 # rad/s the path is traversed at (its timing as the initial guess)
-ompl_replan_distance: 0.5       # rad from the MPC's last solution (the learner drove the arm away): plan a new path
-ompl_lookahead: 1.5              # rad of path length ahead of the arm that the MPC heads for
+# Settings of the OMPL path and its timing
 ompl_timeout: 5.0               # s per RRT-Connect solve
+ompl_candidates: 3              # RRT-Connect paths planned per path, the one the end effector travels the shortest along is kept
 ompl_seed: 0
+replan_distance: 0.5            # rad from the timed path (the learner drove the arm away): plan a new path
+progress_window: 1.5            # rad of path length ahead of the arm's progress searched for its nearest point on the path
+totg_velocity_scale: 0.8        # fractions of the velocity and acceleration limits the path is timed within
+totg_acceleration_scale: 0.5
+totg_max_deviation: 0.05        # rad the timed path may cut the corner of a waypoint
 
 # Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
 pos_tol: 0.03
 vel_tol: 0.01
 
-# Weight of the projector's soft rest at the end of the chunk (only the safeflow policy reads it): 100 leaves a terminal
-# velocity of about 0.003 rad/s
-terminal_velocity_weight: 100.0
-# Actions of the chunk the projector tracks in full (weight 1), the later ones with 1 / step; the executed first action stays
-# close to the proposal while the later ones give way to the rest
-projection_full_weight_steps: 3
+# The projection that tracks the positions (the expert's, and the safeflow policy's): the weights of the derivatives of the
+# tracking (the positions weigh 1) as in the authors' safety filter, and of the soft rest at the end of the chunk
+projection_velocity_weight: 0.001
+projection_acceleration_weight: 0.001
+projection_jerk_weight: 0.0001
+terminal_velocity_weight: 10.0
 
 # Minimum TCP-to-goal distance [m] of a start
 min_start_goal_distance: 0.3

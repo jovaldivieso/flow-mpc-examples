@@ -8,7 +8,7 @@ import yaml
 
 from systems.config_fields import ConfigurationError, read_float, require_only_known_keys
 from systems.system_factory import SystemFactory
-from planning.planner_config import OmplConfig, PlannerConfig
+from planning.planner_config import ExpertConfig, ProjectionConfig
 from planning.planner_factory import PlannerFactory
 
 
@@ -66,20 +66,9 @@ def _resolved_action_noise_seed(config: Mapping[str, Any]) -> int:
 
 
 # The keys of every config beside the ones of its system (``SystemFactory.config_keys``)
-COMMON_KEYS = OmplConfig.keys() | {
+COMMON_KEYS = ExpertConfig.keys() | ProjectionConfig.keys() | {
     "system",
     "dt",
-    "horizon",
-    "Q_diag",
-    "R_weight",
-    "R_diag",
-    "terminal_cost_multiplier",
-    "expert_slack_tolerance",
-    "expert",
-    "terminal_velocity_weight",
-    "projection_full_weight_steps",
-    "fallback_terminal_velocity_tol",
-    "max_consecutive_fallbacks",
     "initial_state_seed",
     "action_noise_seed",
     "done_hold_steps",
@@ -112,23 +101,11 @@ def validate_system_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
 
     config_out.update(SystemFactory.validate_config(system, raw_config))
 
-    planner_cfg = PlannerConfig.from_mapping(raw_config)
-    if planner_cfg.expert not in PlannerFactory.names():
-        raise ConfigurationError(f"'expert' must be one of {', '.join(PlannerFactory.names())}, got {planner_cfg.expert!r}.")
+    expert_config = ExpertConfig.from_mapping(raw_config)
+    if expert_config.expert not in PlannerFactory.names():
+        raise ConfigurationError(f"'expert' must be one of {', '.join(PlannerFactory.names())}, got {expert_config.expert!r}.")
+    config_out.update(asdict(expert_config))
     config_out.update(
-        {
-            **asdict(OmplConfig.from_mapping(raw_config)),
-            "expert": planner_cfg.expert,
-            "horizon": planner_cfg.horizon,
-            "R_weight": planner_cfg.r_weight,
-            "terminal_cost_multiplier": planner_cfg.terminal_cost_multiplier,
-            "expert_slack_tolerance": planner_cfg.expert_slack_tolerance,
-            "terminal_velocity_weight": planner_cfg.terminal_velocity_weight,
-            "projection_full_weight_steps": planner_cfg.projection_full_weight_steps,
-            "fallback_terminal_velocity_tol": planner_cfg.fallback_terminal_velocity_tol,
-            "max_consecutive_fallbacks": planner_cfg.max_consecutive_fallbacks,
-            **({"Q_diag": list(planner_cfg.q_diag)} if planner_cfg.q_diag else {}),
-            **({"R_diag": list(planner_cfg.r_diag)} if planner_cfg.r_diag else {}),
-        }
+        {ProjectionConfig.key(name): value for name, value in asdict(ProjectionConfig.from_mapping(raw_config)).items()}
     )
     return config_out

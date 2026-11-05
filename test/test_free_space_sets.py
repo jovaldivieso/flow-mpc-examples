@@ -95,7 +95,7 @@ class FreeSpaceSetsTests(unittest.TestCase):
 
 class CollisionHalfspacesTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=OBSTACLES))
+        self.simulator = FrankaSystem(pinned_config(obstacles=OBSTACLES))
         self.model = self.simulator.collision
 
     def test_the_rows_are_the_free_space_half_spaces_of_the_spheres_linearized_at_every_node(self) -> None:
@@ -161,8 +161,39 @@ class CollisionHalfspacesTests(unittest.TestCase):
                 self.assertEqual(self.model.is_collision_free(q), not penetrates(q))
         self.assertTrue(self.model.trajectory_is_collision_free(np.zeros((0, 7))))
 
+    def test_the_free_prefix_ends_at_the_first_row_that_penetrates_an_obstacle(self) -> None:
+        # a random trajectory around the middle pose, which reaches an obstacle
+        rng = np.random.default_rng(3)
+        q_trajectory = Q_MID + 0.6 * rng.standard_normal((40, 7))
+        rows_free = [self.model.is_collision_free(q) for q in q_trajectory]
+        self.assertIn(False, rows_free)  # the draw reaches an obstacle
+
+        free = self.model.free_prefix(q_trajectory)
+
+        self.assertEqual(free, rows_free.index(False))
+        self.assertTrue(self.model.trajectory_is_collision_free(q_trajectory[:free]))
+        self.assertFalse(self.model.trajectory_is_collision_free(q_trajectory[: free + 1]))
+
+    def test_the_free_prefix_is_every_row_of_a_free_trajectory_and_none_of_an_empty_one(self) -> None:
+        free_trajectory = np.tile(Q_MID, (5, 1))
+        self.assertTrue(self.model.is_collision_free(Q_MID))
+
+        self.assertEqual(self.model.free_prefix(free_trajectory), 5)
+        self.assertEqual(self.model.free_prefix(np.zeros((0, 7))), 0)
+
+    def test_the_free_prefix_is_zero_when_the_first_row_penetrates(self) -> None:
+        center = self.simulator.collision_spheres(Q_MID)[0][-1]
+        simulator = FrankaSystem(pinned_config(obstacles=[{"position": center.tolist(), "radius": 0.05}]))
+
+        self.assertEqual(simulator.collision.free_prefix(np.tile(Q_MID, (4, 1))), 0)
+
+    def test_without_obstacles_every_row_is_free(self) -> None:
+        simulator = FrankaSystem(pinned_config(obstacles=[]))
+
+        self.assertEqual(simulator.collision.free_prefix(np.tile(Q_MID, (4, 1))), 4)
+
     def test_without_obstacles_there_are_no_rows(self) -> None:
-        simulator = FrankaSystem(pinned_config(expert="casadi", obstacles=[]))
+        simulator = FrankaSystem(pinned_config(obstacles=[]))
 
         A, b = simulator.collision.halfspaces(Q_MID, np.tile(Q_MID, (4, 1)))
 

@@ -1,6 +1,6 @@
 """Settings and helpers the planner tests share.
 
-Behaviour tests pin the settings they depend on, so tuning ``scripts/config/franka_casadi_config.yaml`` cannot break them.
+Behaviour tests pin the settings they depend on, so tuning ``scripts/config/franka_config.yaml`` cannot break them.
 """
 
 from __future__ import annotations
@@ -17,19 +17,18 @@ from planning.ompl_planner import initialize_ompl
 initialize_ompl(0)  # the entry point of the planner tests: OMPL's seed and log level are set once per process
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXPERT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
+EXPERT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml")
 
 PINNED_EXPERT_SETTINGS = {
-    "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
-    "R_diag": [4.4e-3] * 7,
-    "terminal_cost_multiplier": 10.0,
     "expert": "ompl_casadi",
     "horizon": 20,
-    "ompl_speed": 2.0,
-    "ompl_replan_distance": 0.5,
-    "ompl_lookahead": 1.5,
     "ompl_timeout": 5.0,
     "ompl_seed": 0,
+    "replan_distance": 0.5,
+    "progress_window": 1.5,
+    "totg_velocity_scale": 0.8,
+    "totg_acceleration_scale": 0.5,
+    "totg_max_deviation": 0.05,
     "pos_tol": 0.005,
     "vel_tol": 0.05,
 }
@@ -54,19 +53,3 @@ def rest_state(simulator: FrankaSystem) -> np.ndarray:
 def pose_goal(simulator: FrankaSystem, q: np.ndarray) -> np.ndarray:
     """The goal pose of the TCP in the configuration ``q``."""
     return simulator.pose_vector(simulator.tcp_placement(q))
-
-
-def initial_guess(planner, observation: np.ndarray, initial_plan=None) -> tuple[np.ndarray, np.ndarray]:
-    """The (states (nx, N + 1), actions (nu, N)) a ``CasadiPlanner`` starts its first solve of ``plan`` from."""
-    graph = planner._graph
-    guessed = {}
-    solve = graph._solve_once
-
-    def recording_solve():
-        if not guessed:
-            guessed["states"], guessed["actions"] = graph.initial_guess
-        return solve()
-
-    graph._solve_once = recording_solve
-    planner.plan(observation, initial_plan)
-    return guessed["states"], guessed["actions"]

@@ -8,12 +8,13 @@ from typing import Any, Mapping
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 from planning.config import validate_system_config
+from systems.position_history import PositionHistory
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from systems.seed_utils import default_action_noise_seed_for_config
@@ -21,6 +22,8 @@ from learning.data_utils import build_dataset_features, create_collate_fn
 from learning.models.exponential_moving_average import ExponentialMovingAverage
 from learning.models.policy import ActionPolicy
 from learning.models.policy_factory import PolicyFactory, PolicySpec
+from learning.models.safe_source import SafeSource
+from planning.planner_config import ProjectionConfig
 from planning.planner_factory import PlannerFactory
 
 from .coverage import CoverageMetrics, DatasetCoverage
@@ -29,8 +32,9 @@ from .episode_starts import EpisodeStarts
 from .metrics import DaggerEvalMetrics
 from .collection import collect_dagger_rollouts
 from .evaluation import evaluate_policy_rollouts
-from .policy_action import build_policy_action
+from .policy_action import build_policy_actions
 from .round_summary import RoundTiming, append_round_summary
+from .safe_pairs import PooledPairs, SafePairs
 from .workers import RolloutWorkerSpec
 from .utils import (
     apply_config_overrides,
@@ -93,9 +97,10 @@ class DaggerTrainer:
         self.action_noise_seed = 0
         self.initial_state_seed = 0
         self.obs_feature_names: list[str] = []
-        self.state_dim = self.action_dim = self.prediction_horizon = 0
+        self.cond_dim = self.action_dim = self.prediction_horizon = 0
         self.timing = RoundTiming()  # the phases of the round under way
         self._round_started = time.perf_counter()
+        self._safe_source: SafeSource | None = None  # built when a round first trains from safe sources
 
     def setup(self) -> None:
         set_seed(self.cfg.seed)
@@ -113,7 +118,7 @@ class DaggerTrainer:
 
         self.action_noise_seed = default_action_noise_seed_for_config(self.seeded_config)
         self.initial_state_seed = resolve_initial_state_seed(self.seeded_config, self.cfg.seed)
-        # The policy predicts prediction_horizon planned actions per state, which DAgger labels with the expert's plan
+        # The policy predicts prediction_horizon planned positions per state, which DAgger labels with the expert's plan
         self.prediction_horizon = self.cfg.prediction_horizon
         expert_horizon = int(self.seeded_config["horizon"])
         if self.prediction_horizon > expert_horizon:
@@ -121,17 +126,17 @@ class DaggerTrainer:
                 f"The policy's 'prediction_horizon' ({self.prediction_horizon}) must not exceed the expert's 'horizon' "
                 f"({expert_horizon}): the expert's plan labels the policy's targets."
             )
-        features = build_dataset_features(self.simulator, self.prediction_horizon)
+        features = build_dataset_features(self.simulator, self.prediction_horizon, self.cfg.flow_config.history_length)
         if self.cfg.dataset_root.exists():
             existing_meta = LeRobotDatasetMetadata(repo_id=self.cfg.repo_id, root=self.cfg.dataset_root)
             _validate_resumable_dataset_schema(existing_meta.features, features)
         self.obs_feature_names = [n for n in features if n.startswith("observation.")]
-        # observation.environment_state (the goal) and observation.state (proprioception) are both single-frame.
+        # The policy is conditioned on observation.environment_state (the goal and the body) and observation.history
         environment_state_dim = int(features["observation.environment_state"]["shape"][0])
-        proprioception_dim = int(features["observation.state"]["shape"][0])
-        self.action_dim = self.simulator.nu  # the policy's chunk has prediction_horizon rows of action_dim jerks
+        history_dim = int(features["observation.history"]["shape"][0])
+        self.action_dim = self.simulator.n  # the policy's chunk has prediction_horizon rows of action_dim joint positions
 
-        self.state_dim = environment_state_dim + proprioception_dim
+        self.cond_dim = environment_state_dim + history_dim
 
         self.policy = self._build_policy(self.cfg.policy_type, self.device, self.simulator, self.seeded_config)
         # Single-sample inference is faster on the CPU than on an accelerator, so rollouts use a CPU copy
@@ -172,14 +177,15 @@ class DaggerTrainer:
             print("Mode: resume from existing expert dataset")
 
     def _load_init_checkpoint(self, path: Path) -> None:
-        """Start from the weights, EMA and optimizer state of a checkpoint of the same architecture."""
+        """Start from the weights, EMA and optimizer state of a checkpoint of the same architecture. The policy type may
+        differ: flow and safeflow share their weights, so a flow checkpoint initializes a safeflow run."""
         assert self.policy is not None and self.optimizer is not None and self.ema is not None
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         expected = {
-            "policy_type": self.cfg.policy_type,
-            "state_dim": self.state_dim,
+            "cond_dim": self.cond_dim,
             "action_dim": self.action_dim,
             "prediction_horizon": self.prediction_horizon,
+            "history_length": self.cfg.flow_config.history_length,
             "unet": {"dim": self.cfg.unet.dim, "dim_mults": list(self.cfg.unet.dim_mults)},
         }
         for key, value in expected.items():
@@ -188,8 +194,9 @@ class DaggerTrainer:
         for name in ("model_state_dict", "ema_model_state_dict"):
             if not all(torch.isfinite(t).all() for t in checkpoint[name].values() if t.is_floating_point()):
                 raise ValueError(f"Cannot start from {path}: its '{name}' has non-finite weights.")
-        self.policy.load_state_dict(checkpoint["model_state_dict"])
-        self.ema.load_state_dict(checkpoint["ema_model_state_dict"])
+        self.policy.load_network_state_dict(checkpoint["ema_model_state_dict"])
+        self.ema = ExponentialMovingAverage(self.policy)
+        self.policy.load_network_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"Initialized from {path} (iteration {checkpoint['iteration']})")
 
@@ -220,7 +227,7 @@ class DaggerTrainer:
             except StopIteration:
                 iterator = iter(dataloader)
                 batch = next(iterator)
-            observations, actions = batch
+            observations, actions, paths = batch
             if isinstance(observations, dict):
                 observations = {
                     key: value.to(self.device)
@@ -229,13 +236,10 @@ class DaggerTrainer:
             else:
                 observations = observations.to(self.device)
             actions = actions.to(self.device)
+            paths = paths.to(self.device) if paths is not None else None
             self.optimizer.zero_grad()
-            loss = self.policy.compute_loss(observations, actions)
+            loss = self.policy.compute_loss(observations, actions, paths)
             loss.backward()
-            # Generic safety net, not tuned tight: catches a sudden pathological
-            # spike without perturbing the normal gradient norms of the
-            # already-stable policy types.
-            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=10.0)
             self.optimizer.step()
             scheduler.step()
             self.ema.update(self.policy)
@@ -265,20 +269,27 @@ class DaggerTrainer:
             root=self.cfg.dataset_root,
         )
         generator = torch.Generator().manual_seed(self.cfg.seed + training_round)
+        pairs = self._safe_pairs(dataset)
+        training_set = dataset
+        if pairs is not None:
+            with_path = np.flatnonzero(np.isfinite(pairs.paths).reshape(len(pairs), -1).all(axis=1))
+            if len(with_path) == 0:
+                raise RuntimeError("No frame of the dataset has a safe path to train the safeflow policy on.")
+            training_set = Subset(dataset, with_path.tolist())
         loader = DataLoader(
-            dataset,
+            training_set,
             batch_size=self.cfg.batch_size,
             shuffle=True,
             generator=generator,
-            collate_fn=create_collate_fn(self.prediction_horizon),
+            collate_fn=create_collate_fn(self.prediction_horizon, pairs),
         )
         steps, approx = resolve_round_steps(
-            len(dataset),
+            len(training_set),
             self.cfg.batch_size,
             target_epochs,
             self.cfg.max_train_steps,
         )
-        print(f"Training on {len(dataset)} aggregated frames")
+        print(f"Training on {len(training_set)} of {len(dataset)} aggregated frames")
         print(
             f"  optimizer_steps={steps} "
             f"(~{approx:.2f} epochs at batch_size={self.cfg.batch_size})"
@@ -288,17 +299,50 @@ class DaggerTrainer:
         self.timing.add_training(time.perf_counter() - started)
         return mean_loss
 
+    def _safe_pairs(self, dataset: LeRobotDataset) -> SafePairs | None:
+        """The safe path from the safe source to the safe target of every frame of ``dataset``, which the safeflow policy
+        trains on (the frames without one are left out), or None for a flow policy, which trains from Gaussian noise."""
+        if self.cfg.policy_type != "safeflow":
+            return None
+        assert self.simulator is not None and self.seeded_config is not None
+        pairs = SafePairs(self.cfg.dataset_root, self.prediction_horizon, self.action_dim)
+
+        def load(start: int) -> tuple[np.ndarray, np.ndarray]:
+            rows = dataset.hf_dataset.select(range(start, len(dataset)))
+            states = np.asarray([row.numpy() for row in rows["observation.state"]], dtype=float)
+            labels = np.asarray([row.numpy() for row in rows["action"]], dtype=float)
+            return states, labels.reshape(-1, self.prediction_horizon, self.action_dim)
+
+        started, before = time.perf_counter(), len(pairs)
+        if self.cfg.num_workers > 1 and len(dataset) - before > PooledPairs.CHUNK:
+            with PooledPairs(self.seeded_config, self.prediction_horizon, self.cfg.seed, self.cfg.num_workers) as pairs_of:
+                pairs.update(len(dataset), load, pairs_of)
+        else:
+            if self._safe_source is None:
+                self._safe_source = SafeSource(
+                    self.simulator, ProjectionConfig.from_mapping(self.seeded_config), self.prediction_horizon, self.cfg.seed
+                )
+            pairs.update(len(dataset), load, self._safe_source.paths)
+        usable = float(np.isfinite(pairs.paths).reshape(len(pairs), -1).all(axis=1).mean())
+        print(
+            f"Safe sources: {len(pairs) - before} new frames, {len(pairs)} in all ({100 * usable:.0f}% with a path), "
+            f"{time.perf_counter() - started:.0f} s"
+        )
+        return pairs
+
     def _policy_spec(self, policy_type: str) -> PolicySpec:
         assert self.simulator is not None
         return PolicySpec(
             policy_type=policy_type,
             action_dim=self.action_dim,
-            state_dim=self.state_dim,
+            cond_dim=self.cond_dim,
+            history_length=self.cfg.flow_config.history_length,
+            execution_horizon=self.cfg.execution_horizon,
             prediction_horizon=self.prediction_horizon,
             unet_dim=self.cfg.unet.dim,
             unet_dim_mults=tuple(self.cfg.unet.dim_mults),
             num_inference_steps=self.cfg.flow_config.num_inference_steps,
-            action_scale=tuple(np.asarray(self.simulator.max_action, dtype=float).tolist()),
+            action_scale=tuple(self.simulator.position_scale.tolist()),
             flow_init=self.cfg.flow_config.safeflow_init,
         )
 
@@ -338,14 +382,13 @@ class DaggerTrainer:
         self.rollout_policy.load_state_dict({name: tensor.cpu() for name, tensor in self.ema.state_dict().items()})
 
     def _worker_spec(
-        self, config: dict[str, Any], *, need_expert: bool, need_policy: bool, policy_type: str | None = None
+        self, config: dict[str, Any], *, need_expert: bool, need_policy: bool
     ) -> RolloutWorkerSpec:
         assert self.simulator is not None and self.rollout_policy is not None
         policy_spec = None
         policy_state_dict = None
-        policy_type = policy_type or self.cfg.policy_type
         if need_policy:
-            policy_spec = self._policy_spec(policy_type)
+            policy_spec = self._policy_spec(self.cfg.policy_type)
             policy_state_dict = {name: tensor.cpu() for name, tensor in self.rollout_policy.state_dict().items()}
         return RolloutWorkerSpec(
             config=dict(config),
@@ -354,18 +397,14 @@ class DaggerTrainer:
             need_expert=need_expert,
         )
 
-    def evaluate_current_policy(
-        self, label: str, policy_type: str | None = None, region: str | None = None
-    ) -> DaggerEvalMetrics | None:
-        """Evaluate the weights being trained as a policy of ``policy_type`` (the trained one by default): the weights
-        of a flow policy also make a safe flow policy, which runs the same episodes with its projector. The episodes
-        start and end as the system config samples them, or in the named ``region``."""
+    def evaluate_current_policy(self, label: str, region: str | None = None) -> DaggerEvalMetrics | None:
+        """Evaluate the policy being trained. The episodes start and end as the system config samples them, or in the
+        named ``region``."""
         assert self.rollout_policy is not None
         assert self.seeded_config is not None
         if self.cfg.eval_episodes == 0:
             return None
         started = time.perf_counter()
-        policy_type = policy_type or self.cfg.policy_type
         eval_config = self._apply_runtime_config_overrides(
             copy.deepcopy(dict(self.seeded_config)),
             tolerance_overrides=self.cfg.eval_tolerance_overrides,
@@ -375,12 +414,9 @@ class DaggerTrainer:
 
         self._sync_rollout_policy()
         policy = self.rollout_policy
-        if policy_type != self.cfg.policy_type:
-            policy = self._build_policy(policy_type, ROLLOUT_DEVICE, simulator, eval_config)
-            policy.load_network_state_dict(self.rollout_policy.state_dict())
 
-        def action_fn(obs: np.ndarray) -> np.ndarray:
-            return build_policy_action(simulator, policy, obs, ROLLOUT_DEVICE)
+        def action_fn(obs: np.ndarray, history: np.ndarray) -> np.ndarray:
+            return build_policy_actions(simulator, policy, obs, history, ROLLOUT_DEVICE)
 
         metrics = evaluate_policy_rollouts(
             simulator,
@@ -388,33 +424,30 @@ class DaggerTrainer:
             self.cfg.eval_steps or self.cfg.steps_per_trajectory,
             self.cfg.eval_seed_start,
             action_fn,
+            self.cfg.flow_config.history_length,
             reset_fn=policy.reset,
             action_noise_std=self.cfg.eval_action_noise_std,
             action_noise_seed=self.action_noise_seed,
             initial_states=self.cfg.initial_states if region is None else None,
             goal_states=self.cfg.goal_states if region is None else None,
             num_workers=self.cfg.num_workers,
-            worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True, policy_type=policy_type),
+            worker_spec=self._worker_spec(eval_config, need_expert=False, need_policy=True),
         )
         if metrics is not None:
             print_rollout_metrics(label, "eval", metrics)
-        self.timing.add_evaluation(policy_type, time.perf_counter() - started, region)
+        self.timing.add_evaluation(self.cfg.policy_type, time.perf_counter() - started, region)
         return metrics
 
     def evaluate_regions(self, stage: str) -> dict[str, dict[str, DaggerEvalMetrics | None]]:
-        """The evaluation in every region, by region and policy type: the trained one and, for a flow policy, safeflow."""
-        results: dict[str, dict[str, DaggerEvalMetrics | None]] = {}
-        for name in self.cfg.regions:
-            results[name] = {
+        """The evaluation in every region, by region and policy type."""
+        return {
+            name: {
                 self.cfg.policy_type: self.evaluate_current_policy(
                     f"{stage} {self.cfg.policy_type} evaluation in region '{name}'", region=name
                 )
             }
-            if self.cfg.policy_type == "flow":
-                results[name]["safeflow"] = self.evaluate_current_policy(
-                    f"{stage} safeflow evaluation in region '{name}'", "safeflow", region=name
-                )
-        return results
+            for name in self.cfg.regions
+        }
 
     def measure_coverage(self) -> dict[str, CoverageMetrics] | None:
         """How well the dataset covers the starts of the evaluation episodes, on all the modes ('random') and in every region."""
@@ -436,12 +469,7 @@ class DaggerTrainer:
                 self.cfg.initial_states if region is None else None,
                 self.cfg.goal_states if region is None else None,
             )
-            queries = np.array(
-                [
-                    np.concatenate(list(simulator.policy_observation(simulator.observe(starts.begin(simulator, index, seed))).values()))
-                    for index, seed in enumerate(seeds)
-                ]
-            )
+            queries = np.array([self._start_features(simulator, starts.begin(simulator, index, seed)) for index, seed in enumerate(seeds)])
             results[name] = coverage.measure(queries)
             print(
                 f"Coverage of the {name} starts: median distance {results[name].median:.2f}, "
@@ -450,13 +478,19 @@ class DaggerTrainer:
         self.timing.coverage = time.perf_counter() - started
         return results
 
+    def _start_features(self, simulator: SystemSimulator, initial_state: np.ndarray) -> np.ndarray:
+        """What the policy is conditioned on at the start of an episode (the history is the start configuration repeated)."""
+        history = PositionHistory(simulator.n, self.cfg.flow_config.history_length)
+        history.reset(initial_state)
+        observed = simulator.policy_observation(simulator.observe(initial_state), history.flat)
+        return np.concatenate([observed["observation.environment_state"], observed["observation.history"]])
+
     def save_round_summary(
         self,
         round_index: int,
         train_loss: float | None,
         eval_metrics: DaggerEvalMetrics | None,
         aggregation_metrics: DaggerEvalMetrics | None = None,
-        safeflow_eval_metrics: DaggerEvalMetrics | None = None,
         latest_checkpoint: str | None = None,
         iteration_checkpoint: str | None = None,
         region_eval_metrics: Mapping[str, Mapping[str, DaggerEvalMetrics | None]] | None = None,
@@ -471,7 +505,6 @@ class DaggerTrainer:
             train_loss,
             eval_metrics,
             aggregation_metrics,
-            safeflow_eval_metrics,
             latest_checkpoint,
             iteration_checkpoint,
             region_eval_metrics,
@@ -497,9 +530,11 @@ class DaggerTrainer:
             # What inference runs with (evaluate_policy.py prefers it over model_state_dict)
             "ema_model_state_dict": self.ema.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
-            "state_dim": self.state_dim,
+            "cond_dim": self.cond_dim,
             "action_dim": self.action_dim,
             "prediction_horizon": self.prediction_horizon,
+            "history_length": self.cfg.flow_config.history_length,
+            "execution_horizon": self.cfg.execution_horizon,
             "unet": {"dim": self.cfg.unet.dim, "dim_mults": list(self.cfg.unet.dim_mults)},
             "obs_feature_names": self.obs_feature_names,
             "policy_type": self.cfg.policy_type,
@@ -509,7 +544,7 @@ class DaggerTrainer:
             "safeflow_init": self.cfg.flow_config.safeflow_init,
             # Saved explicitly so a checkpoint's normalized action space stays what trained it -- see FlowPolicy's own
             # docstring for why training and inference must agree on this exactly.
-            "action_scale": np.asarray(self.simulator.max_action, dtype=float).tolist(),
+            "action_scale": self.simulator.position_scale.tolist(),
         }
         prefix = "flow_dagger"
         latest_checkpoint = self.cfg.checkpoint_dir / f"{prefix}_checkpoint.pt"
@@ -533,9 +568,6 @@ class DaggerTrainer:
                 self.cfg.target_epochs_per_round[0],
             )
             initial = self.evaluate_current_policy(f"Round 0 {self.cfg.policy_type} evaluation")
-            initial_safeflow = (
-                self.evaluate_current_policy("Round 0 safeflow evaluation", "safeflow") if self.cfg.policy_type == "flow" else None
-            )
             initial_regions = self.evaluate_regions("Round 0")
             initial_coverage = self.measure_coverage()
 
@@ -546,7 +578,6 @@ class DaggerTrainer:
                 round_index=0,
                 train_loss=None,
                 eval_metrics=initial,
-                safeflow_eval_metrics=initial_safeflow,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
                 region_eval_metrics=initial_regions,
@@ -604,7 +635,7 @@ class DaggerTrainer:
             print(f"Aggregation execution policy: expert_beta={round_beta:.3f}")
 
             if self.cfg.start_with_aggregation and not self.cfg.dataset_root.exists():
-                features = build_dataset_features(simulator, self.prediction_horizon)
+                features = build_dataset_features(simulator, self.prediction_horizon, self.cfg.flow_config.history_length)
                 writer = LeRobotDataset.create(
                     repo_id=self.cfg.repo_id,
                     fps=int(1 / simulator.dt),
@@ -613,15 +644,18 @@ class DaggerTrainer:
                 )
             else:
                 existing_meta = LeRobotDatasetMetadata(repo_id=self.cfg.repo_id, root=self.cfg.dataset_root)
-                _validate_resumable_dataset_schema(existing_meta.features, build_dataset_features(simulator, self.prediction_horizon))
+                _validate_resumable_dataset_schema(
+                    existing_meta.features,
+                    build_dataset_features(simulator, self.prediction_horizon, self.cfg.flow_config.history_length),
+                )
                 writer = LeRobotDataset.resume(
                     repo_id=self.cfg.repo_id,
                     root=self.cfg.dataset_root,
                 )
 
             try:
-                def action_fn(obs: np.ndarray) -> np.ndarray:
-                    return build_policy_action(simulator, self.rollout_policy, obs, ROLLOUT_DEVICE)
+                def action_fn(obs: np.ndarray, history: np.ndarray) -> np.ndarray:
+                    return build_policy_actions(simulator, self.rollout_policy, obs, history, ROLLOUT_DEVICE)
 
                 self._sync_rollout_policy()
                 metrics = collect_dagger_rollouts(
@@ -637,6 +671,8 @@ class DaggerTrainer:
                     goal_states=round_goal_states,
                     expert_mixing_beta=round_beta,
                     prediction_horizon=self.prediction_horizon,
+                    history_length=self.cfg.flow_config.history_length,
+                    execution_horizon=self.cfg.execution_horizon,
                     round_index=schedule,
                     restart_initial_state_round=self.cfg.restart_round_seed,
                     policy_action_fn=action_fn,
@@ -676,13 +712,6 @@ class DaggerTrainer:
             )
             stage = "Round" if self.cfg.start_with_aggregation else "Refinement"
             eval_metrics = self.evaluate_current_policy(f"{stage} {display} {self.cfg.policy_type} evaluation")
-
-            safeflow_eval_metrics = (
-                self.evaluate_current_policy(f"{stage} {display} safeflow evaluation", "safeflow")
-                if self.cfg.policy_type == "flow"
-                else None
-            )
-
             region_eval_metrics = self.evaluate_regions(f"{stage} {display}")
             coverage = self.measure_coverage()
 
@@ -694,7 +723,6 @@ class DaggerTrainer:
                 train_loss=train_loss,
                 eval_metrics=eval_metrics,
                 aggregation_metrics=metrics,
-                safeflow_eval_metrics=safeflow_eval_metrics,
                 latest_checkpoint=str(latest_checkpoint),
                 iteration_checkpoint=str(iteration_checkpoint),
                 region_eval_metrics=region_eval_metrics,

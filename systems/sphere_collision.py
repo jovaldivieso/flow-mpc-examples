@@ -46,12 +46,26 @@ class SphereCollisionModel:
         centers, _, radii = self.spheres_along(q_traj[:, : self.n])
         return not self._penetrates(centers, radii)
 
-    def _penetrates(self, centers: np.ndarray, radii: np.ndarray) -> bool:
-        """Whether a sphere of ``centers`` (H, S, d) and ``radii`` (S,) penetrates an obstacle, at any of the H rows."""
+    def free_prefix(self, q_trajectory: np.ndarray) -> int:
+        """The number of leading rows of ``q_trajectory`` (H, n) before the first one at which a bounding sphere
+        penetrates an obstacle (all of them if none does)."""
+        q_traj = np.asarray(q_trajectory, dtype=float)
+        if not self.obstacles or len(q_traj) == 0:
+            return len(q_traj)
+        centers, _, radii = self.spheres_along(q_traj[:, : self.n])
+        hit = self._penetrating_rows(centers, radii)
+        return int(np.argmax(hit)) if hit.any() else len(q_traj)
+
+    def _penetrating_rows(self, centers: np.ndarray, radii: np.ndarray) -> np.ndarray:
+        """For each of the H rows of ``centers`` (H, S, d), whether a sphere of ``radii`` (S,) penetrates an obstacle."""
         positions = np.array([position for position, _ in self.obstacles], dtype=float)
         obstacle_radii = np.array([radius for _, radius in self.obstacles], dtype=float)
         distances = np.linalg.norm(centers[:, :, None, :] - positions, axis=-1)  # (H, S, obstacles)
-        return bool(np.any(distances < radii[None, :, None] + obstacle_radii))
+        return np.any(distances < radii[None, :, None] + obstacle_radii, axis=(1, 2))
+
+    def _penetrates(self, centers: np.ndarray, radii: np.ndarray) -> bool:
+        """Whether a sphere of ``centers`` (H, S, d) and ``radii`` (S,) penetrates an obstacle, at any of the H rows."""
+        return bool(self._penetrating_rows(centers, radii).any())
 
     @property
     def num_spheres(self) -> int:

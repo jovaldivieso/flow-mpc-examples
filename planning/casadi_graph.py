@@ -19,10 +19,9 @@ FATROP_OPTIONS: dict = {
     },
 }
 # The slack of the obstacle half-spaces costs w_1 s + w_2 s^2 (the linear term makes the penalty exact: a half-space is only
-# violated when keeping it costs more than w_1 per meter) and a solution is rejected when a slack exceeds the tolerance.
-# SafeFlowMPC's filter uses w_1 = 1000 with a tracking cost of unit scale; the MPC's goal cost (Q_diag, terminal multiplier)
-# is far larger and outweighs that, so w_1 is 10 times higher.
-SLACK_LINEAR_WEIGHT = 1e4
+# violated when keeping it costs more than w_1 per meter) and a solution is rejected when a slack exceeds the tolerance, as
+# in SafeFlowMPC's filter (w_1 = 1000 with a tracking cost of unit scale).
+SLACK_LINEAR_WEIGHT = 1e3
 SLACK_QUADRATIC_WEIGHT = 1.0
 SLACK_TOLERANCE = 1e-3  # [m]
 
@@ -39,10 +38,11 @@ class GraphSolution(NamedTuple):
 
 class CasadiKinematicGraph:
     """
-    The CasADi problem skeleton shared by ``CasadiPlanner`` and ``CasadiTrajectoryProjector``, which each hold one.
+    The CasADi problem skeleton of ``CasadiTrajectoryProjector``, which holds one.
 
-    It builds everything of their quadratic programs (QP) but the objective: its owner adds its parameters and its
-    cost to ``opti`` and ends with ``minimize``.
+    It builds everything of its quadratic program (QP) but the objective: its owner adds its parameters and its
+    cost to ``opti`` and ends with ``minimize``. Without obstacles (``with_obstacles=False``) the problem has no
+    half-spaces and no slack: the plant's limits are its only constraints.
 
     Problem (Direct Multiple Shooting, Horizon N)
     ---------------------------------------------
@@ -53,7 +53,7 @@ class CasadiKinematicGraph:
                              its half-spaces.
     Parameters               x_init, and linearized free-space half-spaces (A_coll, b_coll), P per node.
 
-    Cost                     none here: ``minimize(objective)`` adds w_1 sum(S) + w_2 ||S||_F^2 (w_1 = 10^4, w_2 = 1)
+    Cost                     none here: ``minimize(objective)`` adds w_1 sum(S) + w_2 ||S||_F^2 (w_1 = 10^3, w_2 = 1)
                              to its owner's.
 
     Constraints              x_0 = x_init
@@ -98,7 +98,7 @@ class CasadiKinematicGraph:
     failed raises ``RuntimeError``.
     """
 
-    def __init__(self, simulator: TripleIntegratorBase, horizon: int) -> None:
+    def __init__(self, simulator: TripleIntegratorBase, horizon: int, with_obstacles: bool = True) -> None:
         self.sim = simulator
         self.N = int(horizon)
         self.n_joints = simulator.n
@@ -109,7 +109,8 @@ class CasadiKinematicGraph:
         self._values: list[np.ndarray] = []
         self.x0_param = self.parameter(nx)
 
-        num_spheres, set_size = self.sim.collision.num_spheres, self.sim.collision.free_space.size
+        num_spheres = self.sim.collision.num_spheres if with_obstacles else 0
+        set_size = self.sim.collision.free_space.size if with_obstacles else 0
         self.num_halfspaces = P = num_spheres * set_size
         self._q_current: np.ndarray | None = None
         self._sets: tuple[np.ndarray, np.ndarray] | None = None  # the free-space sets of the last ``update``

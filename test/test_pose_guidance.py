@@ -7,7 +7,6 @@ from unittest import mock
 
 import numpy as np
 import pinocchio as pin
-import torch
 import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,11 +15,10 @@ sys.path.insert(0, PROJECT_ROOT)
 from planning.config import validate_system_config
 from systems.franka_system import Q_READY, FrankaSystem
 from systems.point_mass_system import PointMassSystem
-from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.pose_guidance import PoseGuidance
 from test.planner_fixtures import pose_goal
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml")
 HORIZON = 10
 Q_GOAL = np.array([0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.5])
 
@@ -35,16 +33,29 @@ def _arm_goal() -> np.ndarray:
     return pose_goal(_arm(np.concatenate([[0.4, 0.0, 0.4], np.eye(3).ravel()])), Q_GOAL)
 
 
-def _rest_at(simulator: FrankaSystem, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The policy observation (goal in the TCP frame, state) of the arm at rest in ``q``."""
-    observation = simulator.policy_observation(simulator.observe(np.concatenate([q, np.zeros(14)])))
+HISTORY = 3
+
+
+def _rest_at(simulator, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The policy observation (goal relative to the TCP, state) of the arm at rest in ``q``."""
+    state = np.concatenate([q, np.zeros(2 * simulator.n)])
+    observation = simulator.policy_observation(simulator.observe(state), np.tile(q, HISTORY))
     return observation["observation.environment_state"].astype(float), observation["observation.state"].astype(float)
 
 
-def _final_state(simulator, state: np.ndarray, chunk: np.ndarray) -> np.ndarray:
-    for jerk in chunk:
-        state = simulator.predict_next_state(state, jerk)
-    return state
+def _final_velocity_and_acceleration(chunk: np.ndarray, dt: float) -> tuple[np.ndarray, np.ndarray]:
+    """The backward differences of the last three positions of a chunk."""
+    return (chunk[-1] - chunk[-2]) / dt, (chunk[-1] - 2 * chunk[-2] + chunk[-3]) / dt**2
+
+
+def _drift(q: np.ndarray, rate: float) -> np.ndarray:
+    """The chunk of positions (HORIZON, n) that leaves ``q`` at a constant velocity ``rate`` in every joint."""
+    return q + rate * np.arange(1, HORIZON + 1)[:, None] * np.ones(7)
+
+
+def _hold(q: np.ndarray) -> np.ndarray:
+    """The chunk of positions (HORIZON, n) that stays in ``q``."""
+    return np.tile(q, (HORIZON, 1))
 
 
 class PoseGuidanceOnTheArmTests(unittest.TestCase):
@@ -78,50 +89,87 @@ class PoseGuidanceOnTheArmTests(unittest.TestCase):
                 ) / (2 * step)
             np.testing.assert_allclose(derivative, -jacobian, atol=1e-6, err_msg=f"orientation error of {angle} rad")
 
-    def test_close_to_the_goal_the_chunk_moves_the_tcp_toward_it_and_keeps_its_rest(self) -> None:
+    def test_close_to_the_goal_the_positions_move_toward_it_the_more_the_later_they_are(self) -> None:
         guidance = PoseGuidance(self.simulator, HORIZON)
         q = Q_GOAL + 0.03 * np.random.default_rng(0).standard_normal(7)
         environment_state, state = _rest_at(self.simulator, q)
         guidance._start_distance = 0.5  # the episode started far away: the goal is close
-
-        guided = guidance.guide(environment_state, state, np.zeros((HORIZON, 7)))
-
-        self.simulator.goal = self.goal
-        before, after = _final_state(self.simulator, state, np.zeros((HORIZON, 7))), _final_state(self.simulator, state, guided)
-        self.assertLess(self.simulator.goal_errors(after)[0], 0.5 * self.simulator.goal_errors(before)[0])
-        np.testing.assert_allclose(after[7:], 0.0, atol=1e-3)  # the final velocity and acceleration are kept
-        self.assertTrue(np.all(np.abs(guided) <= self.simulator.max_action + 1e-9))
-
-    def test_close_to_the_goal_the_chunk_comes_to_rest_and_far_from_it_the_motion_is_left(self) -> None:
-        guidance = PoseGuidance(self.simulator, HORIZON)
-        proposal = np.full((HORIZON, 7), 0.5)  # a chunk that ends moving
-        near = _rest_at(self.simulator, Q_GOAL + 0.03)
-        far = _rest_at(self.simulator, Q_READY)
-
-        guidance._start_distance = 5.0  # the episode started very far away: the goal is close
-        close = guidance.guide(*near, proposal)
-        guidance._start_distance = 1e-6  # the goal is as far as the start
-        away = guidance.guide(*far, proposal)
-
-        n = self.simulator.n
-        moving = _final_state(self.simulator, near[1], proposal)
-        for guided, state, rested in ((close, near[1], True), (away, far[1], False)):
-            final = _final_state(self.simulator, state, guided)
-            speed = np.linalg.norm(final[n:])
-            self.assertEqual(speed < 0.05 * np.linalg.norm(moving[n:]), rested)
-
-    def test_far_from_the_goal_the_chunk_is_left_as_proposed(self) -> None:
-        guidance = PoseGuidance(self.simulator, HORIZON)
-        environment_state, state = _rest_at(self.simulator, Q_READY)
-        proposal = 0.1 * np.random.default_rng(1).standard_normal((HORIZON, 7))
+        proposal = _hold(q)
 
         guided = guidance.guide(environment_state, state, proposal)
 
-        self.assertLess(np.abs(guided - proposal).max(), 0.05)
+        self.assertEqual(guided.shape, (HORIZON, 7))
+        self.assertLess(self.simulator.goal_errors(guided[-1])[0], 0.5 * self.simulator.goal_errors(q)[0])
+        moves = np.linalg.norm(guided - proposal, axis=1)
+        self.assertLess(moves[0], 0.5 * moves[-1])
+
+    def test_a_proposal_at_the_goal_pose_is_left_as_proposed(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        environment_state, state = _rest_at(self.simulator, Q_GOAL + 0.03)
+        guidance._start_distance = 0.5
+
+        guided = guidance.guide(environment_state, state, _hold(Q_GOAL))
+
+        self.assertLess(np.abs(guided - _hold(Q_GOAL)).max(), 1e-3)
+
+    def test_close_to_the_goal_the_chunk_comes_to_rest(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        q = Q_GOAL + 0.03
+        environment_state, state = _rest_at(self.simulator, q)
+        guidance._start_distance = 5.0  # the goal is within the onset fraction of the start distance
+        proposal = _drift(q, 0.01)
+
+        guided = guidance.guide(environment_state, state, proposal)
+
+        velocity, acceleration = _final_velocity_and_acceleration(guided, self.simulator.dt)
+        proposed_velocity, _ = _final_velocity_and_acceleration(proposal, self.simulator.dt)
+        self.assertGreater(np.abs(proposed_velocity).max(), 0.1)
+        np.testing.assert_allclose(velocity, 0.0, atol=1e-8)
+        np.testing.assert_allclose(acceleration, 0.0, atol=1e-8)
+
+    def test_far_from_the_goal_the_final_velocity_is_the_proposed_one(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        environment_state, state = _rest_at(self.simulator, Q_READY)
+        proposal = _drift(Q_READY, 0.01)
+
+        guided = guidance.guide(environment_state, state, proposal)
+
+        np.testing.assert_allclose(
+            _final_velocity_and_acceleration(guided, self.simulator.dt)[0],
+            _final_velocity_and_acceleration(proposal, self.simulator.dt)[0],
+            rtol=1e-2,
+        )
+
+    def test_the_rest_weight_is_the_closeness_of_the_last_guided_position(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        q = Q_GOAL + 0.3
+        environment_state, state = _rest_at(self.simulator, q)
+        guidance._start_distance = 1.0 * self.simulator.goal_task_error(q, self.simulator.observation_from_policy(environment_state, state)[: self.simulator.goal_dim])[2]
+        proposal = _drift(q, 0.0)
+
+        with mock.patch.object(guidance, "_rest", wraps=guidance._rest) as rest:
+            guided = guidance.guide(environment_state, state, proposal)
+
+        guided_before_rest, weight = rest.call_args.args
+        goal = self.simulator.observation_from_policy(environment_state, state)[: self.simulator.goal_dim]
+        distance = self.simulator.goal_task_error(guided_before_rest[-1], goal)[2]
+        self.assertAlmostEqual(weight, guidance._closeness(distance))
+        self.assertGreater(weight, 0.0)
+        self.assertLess(weight, 1.0)
+        np.testing.assert_allclose(guided, guidance._rest(guided_before_rest, weight))
+
+    def test_far_from_the_goal_the_positions_are_left_as_proposed(self) -> None:
+        guidance = PoseGuidance(self.simulator, HORIZON)
+        environment_state, state = _rest_at(self.simulator, Q_READY)
+        proposal = _hold(Q_READY) + 0.1 * np.random.default_rng(1).standard_normal((HORIZON, 7))
+
+        guided = guidance.guide(environment_state, state, proposal)
+
+        self.assertLess(np.abs(guided - proposal).max(), 1e-3)
 
     def test_the_start_distance_is_the_one_of_the_first_call_of_an_episode(self) -> None:
         guidance = PoseGuidance(self.simulator, HORIZON)
-        proposal = np.zeros((HORIZON, 7))
+        proposal = _hold(Q_READY)
         far = _rest_at(self.simulator, Q_READY)
         near = _rest_at(self.simulator, Q_GOAL + 0.05)
 
@@ -138,7 +186,7 @@ class PoseGuidanceOnTheArmTests(unittest.TestCase):
         # The goal comes from the observation (the goal in the TCP frame): two simulators holding other goals guide alike
         observation = _rest_at(self.simulator, Q_GOAL + 0.03)
         other = _arm(pose_goal(self.simulator, np.array([0.2, -0.7, 0.1, -1.8, -0.2, 1.3, 0.8])))
-        proposal = np.zeros((HORIZON, 7))
+        proposal = _hold(Q_GOAL + 0.03)
         chunks = []
         for simulator in (self.simulator, other):
             guidance = PoseGuidance(simulator, HORIZON)
@@ -149,66 +197,33 @@ class PoseGuidanceOnTheArmTests(unittest.TestCase):
 
 
 class PoseGuidanceOnThePointMassTests(unittest.TestCase):
-    def test_the_chunk_moves_the_point_toward_the_goal(self) -> None:
+    def test_the_positions_move_toward_the_goal(self) -> None:
         simulator = PointMassSystem({"goal": [0.03, 0.0]})
         guidance = PoseGuidance(simulator, HORIZON)
         guidance._start_distance = 0.3
-        observation = simulator.policy_observation(simulator.observe(np.zeros(6)))
+        state = np.zeros(6)
+        observation = simulator.policy_observation(simulator.observe(state), np.zeros(HISTORY * 2))
 
         guided = guidance.guide(observation["observation.environment_state"], observation["observation.state"], np.zeros((HORIZON, 2)))
 
-        final = _final_state(simulator, np.zeros(6), guided)
-        self.assertLess(np.linalg.norm(final[:2] - [0.03, 0.0]), 0.015)
-        np.testing.assert_allclose(final[2:], 0.0, atol=1e-3)
+        self.assertEqual(guided.shape, (HORIZON, 2))
+        self.assertLess(np.linalg.norm(guided[-1] - [0.03, 0.0]), 0.015)
+        self.assertTrue(np.all(guided[:, 0] >= 0.0))
+        np.testing.assert_allclose(guided[:, 1], 0.0, atol=1e-12)
 
+    def test_the_chunk_ends_at_rest_when_the_goal_is_reached(self) -> None:
+        simulator = PointMassSystem({"goal": [0.0, 0.0]})
+        guidance = PoseGuidance(simulator, HORIZON)
+        guidance._start_distance = 1.0
+        state = np.zeros(6)
+        observation = simulator.policy_observation(simulator.observe(state), np.zeros(HISTORY * 2))
+        proposal = 0.001 * np.arange(1, HORIZON + 1)[:, None] * np.ones(2)
 
-def _flow_policy(simulator: PointMassSystem, steps: int, action_scale: float = 10.0):
-    spec = PolicySpec(
-        policy_type="flow", action_dim=2, state_dim=6, prediction_horizon=HORIZON, unet_dim=8, unet_dim_mults=(1, 2),
-        num_inference_steps=steps, action_scale=(action_scale, action_scale),
-    )
-    return PolicyFactory.create(spec, simulator).eval()
+        guided = guidance.guide(observation["observation.environment_state"], observation["observation.state"], proposal)
 
-
-class GuidedFlowPolicyTests(unittest.TestCase):
-    def test_every_euler_step_of_a_flow_policy_is_guided(self) -> None:
-        simulator = PointMassSystem({"goal": [0.5, 0.0]})
-        policy = _flow_policy(simulator, 3, 10.0)
-        observation = simulator.policy_observation(simulator.observe(np.zeros(6)))
-        batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
-
-        with mock.patch.object(policy.guidance, "guide", wraps=policy.guidance.guide) as guide:
-            chunk = policy.select_action(batch)
-
-        self.assertEqual(guide.call_count, 3)
-        self.assertEqual(tuple(chunk.shape), (1, HORIZON, 2))
-
-    def test_the_iterates_of_a_flow_policy_stay_within_the_jerk_limits(self) -> None:
-        simulator = PointMassSystem({"goal": [0.5, 0.0]})
-        policy = _flow_policy(simulator, 3, 100.0)
-        observation = simulator.policy_observation(simulator.observe(np.zeros(6)))
-        batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
-
-        chunk = policy.select_action(batch)[0].numpy()
-
-        self.assertTrue(np.all(np.abs(chunk) <= simulator.max_action + 1e-6))
-
-    def test_a_reset_starts_the_guidance_of_a_new_episode(self) -> None:
-        simulator = PointMassSystem({})
-        policy = _flow_policy(simulator, 1, 10.0)
-        policy.guidance._start_distance = 1.0
-
-        policy.reset()
-
-        self.assertIsNone(policy.guidance._start_distance)
-
-    def test_a_guided_flow_policy_serves_one_system(self) -> None:
-        simulator = PointMassSystem({})
-        policy = _flow_policy(simulator, 1, 10.0)
-        batch = {"observation.environment_state": torch.zeros(2, 2), "observation.state": torch.zeros(2, 4)}
-
-        with self.assertRaises(ValueError):
-            policy.select_action(batch)
+        velocity, acceleration = _final_velocity_and_acceleration(guided, simulator.dt)
+        np.testing.assert_allclose(velocity, 0.0, atol=1e-8)
+        np.testing.assert_allclose(acceleration, 0.0, atol=1e-8)
 
 
 if __name__ == "__main__":

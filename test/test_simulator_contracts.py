@@ -20,12 +20,13 @@ import torch
 from planning.config import load_and_validate_system_config, validate_system_config
 from systems.config_fields import ConfigurationError
 from learning.data_utils import build_dataset_features, format_dataset_frame
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from systems import franka_sampling
 from systems.franka_config import HAND_AXIS, HAND_TILT, WORKSPACE_BOX
-from systems.franka_sampling import PoseRegion
+from systems.franka_sampling import IK_STARTS, EpisodeSampler, PoseRegion, SamplingMode
 from systems.franka_system import FLOOR_CLEARANCE, Q_READY, FrankaSystem
 from systems.collision_spheres import RADIUS_MARGIN, fit_collision_spheres, surface_points
 from systems.franka_kinematics import COLLISION_SPHERE_MAX_RADIUS
@@ -38,14 +39,12 @@ from learning.models.policy_factory import PolicyFactory, PolicySpec
 from planning.planner_factory import PlannerFactory
 from test.planner_fixtures import pose_goal
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
-CHUNK = 16  # actions per state the policy predicts
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml")
+CHUNK = 16  # configurations per state the policy predicts
+HISTORY_LENGTH = 3  # configurations of the history the policy observes
 
-# Behaviour tests pin the settings they depend on, so tuning scripts/config/franka_casadi_config.yaml cannot break them
+# Behaviour tests pin the settings they depend on, so tuning scripts/config/franka_config.yaml cannot break them
 PINNED_EXPERT_SETTINGS = {
-    "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
-    "R_diag": [4.4e-3] * 7,
-    "terminal_cost_multiplier": 10.0,
     "pos_tol": 0.002,
     "vel_tol": 0.02,
 }
@@ -62,6 +61,13 @@ def _build_simulator(**overrides) -> FrankaSystem:
 def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     """Ready pose at rest."""
     return np.concatenate([Q_READY, np.zeros(2 * simulator.n)])
+
+
+def _observed(simulator: SystemSimulator, state: np.ndarray) -> dict[str, np.ndarray]:
+    """The policy observation of ``state`` at the start of a rollout (the history is the configuration repeated)."""
+    history = PositionHistory(simulator.n, HISTORY_LENGTH)
+    history.reset(state)
+    return simulator.policy_observation(simulator.observe(state), history.flat)
 
 
 def _stepped_rollout(simulator: TripleIntegratorBase, state: np.ndarray, actions: np.ndarray) -> np.ndarray:
@@ -164,12 +170,15 @@ class SimulatorContractTests(unittest.TestCase):
         state = simulator.reset(simulator.random_initial_state(rng))
         observation = simulator.observe(state)
         plan = np.linspace(-1.0, 1.0, CHUNK * simulator.n).reshape(CHUNK, simulator.n)
+        history = PositionHistory(simulator.n, HISTORY_LENGTH)
+        history.reset(state)
+        history.push(state + 0.1)
 
-        features = build_dataset_features(simulator, CHUNK)
-        frame = format_dataset_frame(simulator, observation, plan)
+        features = build_dataset_features(simulator, CHUNK, HISTORY_LENGTH)
+        frame = format_dataset_frame(simulator, observation, history.flat, plan)
 
         self.assertEqual(set(frame), set(features))
-        self.assertEqual(set(features), {"observation.environment_state", "observation.state", "action"})
+        self.assertEqual(set(features), {"observation.environment_state", "observation.state", "observation.history", "action"})
         for name, feature in features.items():
             self.assertEqual(frame[name].shape, tuple(feature["shape"]), name)
             self.assertEqual(str(frame[name].dtype), feature["dtype"], name)
@@ -183,14 +192,26 @@ class SimulatorContractTests(unittest.TestCase):
             atol=1e-6,
         )
         np.testing.assert_allclose(frame["observation.state"], state, atol=1e-6)
+        # The history is the last positions, the oldest first
+        self.assertEqual(features["observation.history"]["shape"], (HISTORY_LENGTH * simulator.n,))
+        np.testing.assert_allclose(
+            frame["observation.history"],
+            np.concatenate([state[: simulator.n]] * (HISTORY_LENGTH - 1) + [state[: simulator.n] + 0.1]),
+            atol=1e-6,
+        )
         # The dataset action is the expert's plan, one joint configuration per row, flattened row by row
         self.assertEqual(features["action"]["shape"], (CHUNK * simulator.n,))
         np.testing.assert_allclose(frame["action"], plan.reshape(-1), atol=1e-6)
-        self.assertEqual(features["action"]["names"][simulator.n].endswith("[t+1]"), True)
+        self.assertTrue(features["action"]["names"][0].endswith("[t+1]"))
+        self.assertTrue(features["action"]["names"][simulator.n].endswith("[t+2]"))
+        self.assertTrue(features["observation.history"]["names"][0].endswith(f"[t-{HISTORY_LENGTH - 1}]"))
+        self.assertTrue(features["observation.history"]["names"][-1].endswith("[t-0]"))
 
-        # The policy sees exactly the two observation keys of the dataset, as float32
-        policy_observation = simulator.policy_observation(observation)
-        self.assertEqual(set(policy_observation), {"observation.environment_state", "observation.state"})
+        # The policy sees exactly the three observation keys of the dataset, as float32
+        policy_observation = simulator.policy_observation(observation, history.flat)
+        self.assertEqual(
+            set(policy_observation), {"observation.environment_state", "observation.state", "observation.history"}
+        )
         for name, value in policy_observation.items():
             self.assertEqual(value.dtype, np.float32, name)
             np.testing.assert_array_equal(value, frame[name])
@@ -213,7 +234,7 @@ class SimulatorContractTests(unittest.TestCase):
         placement = simulator.tcp_placement(state[: simulator.n])
         goal = simulator.vector_pose(simulator.goal)
 
-        seen = simulator.policy_observation(simulator.observe(state))["observation.environment_state"].astype(float)
+        seen = _observed(simulator, state)["observation.environment_state"].astype(float)
 
         np.testing.assert_allclose(seen[:3], placement.rotation.T @ (goal.translation - placement.translation), atol=1e-6)
         np.testing.assert_allclose(seen[3:12].reshape(3, 3), placement.rotation.T @ goal.rotation, atol=1e-6)
@@ -228,9 +249,9 @@ class SimulatorContractTests(unittest.TestCase):
         rng = np.random.default_rng(6)
         state = simulator.reset(simulator.random_initial_state(rng))
         simulator.randomize_goal_for_reset(rng)
-        first = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+        first = _observed(simulator, state)["observation.environment_state"]
         simulator.randomize_goal_for_reset(rng)
-        second = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+        second = _observed(simulator, state)["observation.environment_state"]
 
         expected = simulator.collision_spheres(state[: simulator.n])[0].ravel()  # base frame: forward kinematics of q only
         np.testing.assert_allclose(first[12:], expected, atol=1e-6)
@@ -242,7 +263,7 @@ class SimulatorContractTests(unittest.TestCase):
         state = _rest_state(simulator)
         simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
 
-        seen = simulator.policy_observation(simulator.observe(state))["observation.environment_state"]
+        seen = _observed(simulator, state)["observation.environment_state"]
 
         np.testing.assert_allclose(seen[:12], np.concatenate([np.zeros(3), np.eye(3).ravel()]), atol=1e-6)
 
@@ -448,14 +469,19 @@ class CollisionInterfaceTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             TripleIntegratorBase({})
 
-    def test_the_state_the_policy_sees_gives_the_plant_state(self) -> None:
+    def test_the_policy_observes_the_full_plant_state_and_the_history_of_both_systems(self) -> None:
         arm = _build_simulator()
         state = _rest_state(arm)
-        np.testing.assert_array_equal(arm.state_from_policy(arm.policy_observation(arm.observe(state))["observation.state"]), state.astype(np.float32))
+        seen = _observed(arm, state)
+        np.testing.assert_array_equal(seen["observation.state"], state.astype(np.float32))
+        np.testing.assert_array_equal(seen["observation.history"], np.tile(Q_READY, HISTORY_LENGTH).astype(np.float32))
         point = _TripleIntegratorFactory.build()
+        point.set_goal(np.array([0.5, 0.1]))
         point_state = np.array([0.4, -0.2, 0.1, 0.2, 0.0, 0.3])
-        seen = point.policy_observation(point.observe(point_state))["observation.state"]
-        np.testing.assert_allclose(point.state_from_policy(seen), np.concatenate([np.zeros(2), point_state[2:]]), atol=1e-6)
+        seen = _observed(point, point_state)
+        np.testing.assert_allclose(seen["observation.state"], point_state, atol=1e-6)
+        np.testing.assert_allclose(seen["observation.environment_state"], [0.1, 0.3], atol=1e-6)
+        np.testing.assert_allclose(seen["observation.history"], np.tile(point_state[:2], HISTORY_LENGTH), atol=1e-6)
 
 
 class RolloutTerminationTests(unittest.TestCase):
@@ -621,6 +647,74 @@ class PoseRegionTests(unittest.TestCase):
             self.assertLessEqual(np.arccos(axis @ np.array(direction)), HAND_TILT)
 
 
+class EpisodeSamplerTests(unittest.TestCase):
+    def _sampler(self, inverse_kinematics, is_valid=lambda q: True) -> EpisodeSampler:
+        region = PoseRegion.from_fields({**GOAL_REGION})
+        mode = SamplingMode(1.0, region, region, 0.0)
+        return EpisodeSampler({"a": mode}, ["a"], inverse_kinematics, np.full(7, -1.0), np.full(7, 1.0), is_valid)
+
+    def test_the_first_valid_configuration_of_a_pose_is_taken_from_a_random_start(self) -> None:
+        starts = []
+
+        def reach(position, rotation, q_init):
+            starts.append(q_init)
+            return q_init
+
+        q = self._sampler(reach).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+
+        self.assertEqual(len(starts), 1)
+        np.testing.assert_array_equal(q, starts[0])
+        self.assertTrue(np.all(np.abs(q) <= 1.0))
+
+    def test_failed_and_invalid_solutions_are_skipped_within_the_starts_of_a_pose(self) -> None:
+        calls = []
+
+        def reach(position, rotation, q_init):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("no convergence")
+            return q_init
+
+        invalid_first = iter([False, True])
+        sampler = self._sampler(reach, is_valid=lambda q: next(invalid_first))
+
+        sampler.configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+
+        self.assertEqual(len(calls), 3)  # a failure, an invalid solution, then a valid one
+
+    def test_a_pose_no_start_reaches_is_dropped_after_the_starts_and_the_region_raises_after_the_poses(self) -> None:
+        calls = []
+
+        def never(position, rotation, q_init):
+            calls.append(1)
+            raise RuntimeError("no convergence")
+
+        with mock.patch.object(franka_sampling, "POSE_ATTEMPTS", 2), self.assertRaises(RuntimeError):
+            self._sampler(never).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+
+        self.assertEqual(len(calls), 2 * IK_STARTS)
+
+    def test_the_starts_are_random_between_the_limits_and_reproducible_by_the_seed(self) -> None:
+        def draw(seed):
+            starts = []
+
+            def reach(position, rotation, q_init):
+                starts.append(q_init)
+                if len(starts) < 4:
+                    raise RuntimeError("no convergence")
+                return q_init
+
+            q = self._sampler(reach).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(seed))
+            return q, starts
+
+        q_a, starts_a = draw(5)
+        q_b, _ = draw(5)
+
+        np.testing.assert_array_equal(q_a, q_b)
+        self.assertEqual(len({tuple(start) for start in starts_a}), 4)
+        self.assertTrue(all(np.all(np.abs(start) <= 1.0) for start in starts_a))
+
+
 class SamplingModeTests(unittest.TestCase):
     BOX = {"x": [0.40, 0.60], "y": [-0.4, -0.2], "z": [0.45, 0.65]}
     OPPOSITE = {**BOX, "y": [0.2, 0.4]}
@@ -738,9 +832,9 @@ class RegionSamplingTests(unittest.TestCase):
             simulator.random_initial_state(np.random.default_rng(0))
 
 
-POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_casadi_config.yaml")
+POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_config.yaml")
 # The tests pin the dimension they assume, so scaling the shipped config up does not break them
-POINT_MASS_SETTINGS = {"dimension": 2, "Q_diag": [20.0, 20.0, 2.0, 2.0, 0.2, 0.2], "R_diag": [1.0e-2, 1.0e-2]}
+POINT_MASS_SETTINGS = {"dimension": 2}
 
 
 def _point_mass_config(**overrides) -> dict:
@@ -815,23 +909,24 @@ class PointMassSystemTests(unittest.TestCase):
         moved = simulator.predict_next_state(far, np.zeros(2))
         self.assertTrue(np.all(moved[:2] != far[:2]))  # it keeps moving at its velocity, nowhere to stop
 
-    def test_the_policy_sees_the_goal_relative_to_the_point_and_nothing_in_world_coordinates(self) -> None:
+    def test_the_policy_sees_the_goal_relative_to_the_point_and_its_position_only_in_the_state_and_history(self) -> None:
         simulator = _TripleIntegratorFactory.build()
         state = np.array([0.1, 0.2, 0.3, -0.1, 0.05, 0.0])
         shift = np.array([5.0, -3.0])
 
         simulator.set_goal(np.array([0.3, -0.4]))
-        seen = simulator.policy_observation(simulator.observe(state))
+        seen = _observed(simulator, state)
         simulator.set_goal(np.array([0.3, -0.4]) + shift)
-        moved = simulator.policy_observation(simulator.observe(np.concatenate([state[:2] + shift, state[2:]])))
+        moved = _observed(simulator, np.concatenate([state[:2] + shift, state[2:]]))
 
         np.testing.assert_allclose(seen["observation.environment_state"], [0.2, -0.6], atol=1e-6)
-        np.testing.assert_allclose(seen["observation.state"], state[2:], atol=1e-6)
-        for name in seen:  # moving the point and the goal together changes nothing
-            np.testing.assert_allclose(moved[name], seen[name], atol=1e-6)
-        # an observation for the planners can be rebuilt from it, with the point at the origin
-        rebuilt = simulator.observation_from_policy(seen["observation.environment_state"], seen["observation.state"])
-        np.testing.assert_allclose(rebuilt, [0.2, -0.6, 0.0, 0.0, *state[2:]], atol=1e-6)
+        np.testing.assert_allclose(seen["observation.state"], state, atol=1e-6)
+        np.testing.assert_allclose(seen["observation.history"], np.tile(state[:2], HISTORY_LENGTH), atol=1e-6)
+        # moving the point and the goal together changes the goal the policy sees by nothing
+        np.testing.assert_allclose(moved["observation.environment_state"], seen["observation.environment_state"], atol=1e-6)
+        # the observation of the planners can be rebuilt from it
+        rebuilt = simulator.observation_from_policy(moved["observation.environment_state"], moved["observation.state"])
+        np.testing.assert_allclose(rebuilt, simulator.observe(np.concatenate([state[:2] + shift, state[2:]])), atol=1e-5)
 
     def test_observation_dataset_frame_and_policy_input_follow_the_arm_convention(self) -> None:
         simulator = self.simulator
@@ -839,15 +934,17 @@ class PointMassSystemTests(unittest.TestCase):
         state = np.array([0.1, 0.2, 0.0, 0.0, 0.0, 0.0])
         observation = simulator.observe(state)
         plan = np.arange(CHUNK * 2, dtype=float).reshape(CHUNK, 2)
+        history = np.arange(HISTORY_LENGTH * 2, dtype=float)
 
         np.testing.assert_array_equal(observation, np.concatenate([simulator.goal, state]))
         np.testing.assert_array_equal(simulator.invert_obs(observation), state)
-        frame = format_dataset_frame(simulator, observation, plan)
-        features = build_dataset_features(simulator, CHUNK)
+        frame = format_dataset_frame(simulator, observation, history, plan)
+        features = build_dataset_features(simulator, CHUNK, HISTORY_LENGTH)
         self.assertEqual(set(frame), set(features))
         for name, feature in features.items():
             self.assertEqual(frame[name].shape, tuple(feature["shape"]), name)
         np.testing.assert_allclose(frame["action"], plan.reshape(-1))
+        np.testing.assert_allclose(frame["observation.history"], history)
 
     def test_starts_are_at_rest_and_away_from_the_goal_and_goals_are_in_the_box(self) -> None:
         simulator = _TripleIntegratorFactory.build()
@@ -867,47 +964,35 @@ class PointMassSystemTests(unittest.TestCase):
             simulator.randomize_goal_for_reset(rng)
             state = simulator.reset(simulator.random_initial_state(rng))
             planner.reset()
-            for _ in range(80):
+            for _ in range(150):
                 plan = planner.plan(simulator.observe(state))
+                self.assertEqual(plan.positions.shape, (self.config["horizon"], simulator.n))
                 state = simulator.step(state, plan.actions[0])
                 if simulator.is_done(state):
                     break
             self.assertTrue(simulator.is_done(state), simulator.goal_errors(state))
-
-    def test_the_ompl_casadi_expert_reaches_random_goals_too(self) -> None:
-        config = _point_mass_config(expert="ompl_casadi")
-        simulator = PointMassSystem(config)
-        planner = PlannerFactory.create("ompl_casadi", simulator, config)
-        rng = np.random.default_rng(0)
-        for _ in range(3):
-            simulator.randomize_goal_for_reset(rng)
-            state = simulator.reset(simulator.random_initial_state(rng))
-            planner.reset()
-            for _ in range(80):
-                state = simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
-                if simulator.is_done(state):
-                    break
-            self.assertTrue(simulator.is_done(state), simulator.goal_errors(state))
-        self.assertEqual(planner.statistics["ompl_paths"], 3)
+        self.assertEqual(planner.statistics["ompl_paths"], 5)
 
     def test_both_policies_run_on_it(self) -> None:
         simulator = _TripleIntegratorFactory.build()
         simulator.randomize_goal_for_reset(np.random.default_rng(0))
-        observation = simulator.policy_observation(simulator.observe(np.concatenate([simulator.goal, np.zeros(4)])))
+        observation = _observed(simulator, np.concatenate([simulator.goal, np.zeros(4)]))
         batch = {name: torch.as_tensor(value)[None] for name, value in observation.items()}
+        cond_dim = observation["observation.environment_state"].shape[0] + observation["observation.history"].shape[0]
         for policy_type in PolicyFactory.names():
             with self.subTest(policy_type=policy_type):
                 spec = PolicySpec(
-                    policy_type=policy_type, action_dim=2, state_dim=sum(value.shape[0] for value in observation.values()),
-                    prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2, action_scale=(1.0, 1.0),
+                    policy_type=policy_type, action_dim=2, cond_dim=cond_dim, history_length=HISTORY_LENGTH,
+                    execution_horizon=2, prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2, action_scale=(1.0, 1.0),
                 )
                 policy = PolicyFactory.create(spec, simulator, self.config).eval()
                 self.assertEqual(tuple(policy.select_action(batch).shape), (1, CHUNK, 2))
+                self.assertEqual(policy.execution_horizon, 2)
 
     def test_the_config_rejects_what_a_point_mass_has_no_use_for(self) -> None:
-        raw = {"system": "triple_integrator", "Q_diag": [1.0] * 6, "R_diag": [1.0] * 2}
+        raw = {"system": "triple_integrator"}
         self.assertEqual(validate_system_config(raw)["dimension"], 2)
-        for invalid in ({"floor_clearance": 0.1}, {"system": "pendulum"}):
+        for invalid in ({"floor_clearance": 0.1}, {"system": "pendulum"}, {"Q_diag": [1.0] * 6}):
             with self.subTest(invalid=invalid), self.assertRaises(ConfigurationError):
                 validate_system_config({**raw, **invalid})
 

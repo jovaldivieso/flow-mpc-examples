@@ -16,6 +16,7 @@ from learning.config_loaders import (
     default_dataset_root,
     default_repo_id,
     load_dagger_training_config,
+    load_execution_horizon,
     load_flow_config,
     load_policy_type,
     load_unet_config,
@@ -124,7 +125,7 @@ class LoadDaggerTrainingConfigTests(unittest.TestCase):
 
 class LoadModelSectionTests(unittest.TestCase):
     """The 'model:' section's loaders -- unet, policy_type, the flow
-    num_inference_steps and the safeflow options -- each fall back to their own
+    num_inference_steps and history_length and the safeflow options -- each fall back to their own
     default when their key (or the whole policy config) is omitted.
     policy_type is restricted to the only two policies there are: flow and
     safeflow.
@@ -182,6 +183,29 @@ class LoadModelSectionTests(unittest.TestCase):
         config = load_flow_config(path)
         self.assertEqual(config.safeflow_init, "gaussian")
 
+    def test_the_history_length_is_read_and_defaults_to_ten(self) -> None:
+        self.assertEqual(FlowConfig().history_length, 10)
+        self.assertEqual(load_flow_config(None).history_length, 10)
+        self.assertEqual(load_flow_config(self._write("flow:", "  history_length: 4")).history_length, 4)
+
+    def test_a_history_length_that_is_not_a_positive_integer_is_rejected(self) -> None:
+        for value in ("0", "-2", "2.5", "true"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_flow_config(self._write("flow:", f"  history_length: {value}"))
+
+    def test_the_execution_horizon_defaults_to_one(self) -> None:
+        self.assertEqual(load_execution_horizon(None, 10), 1)
+        self.assertEqual(load_execution_horizon(self._write("policy_type: flow"), 10), 1)
+
+    def test_the_execution_horizon_is_read_up_to_the_prediction_horizon(self) -> None:
+        self.assertEqual(load_execution_horizon(self._write("execution_horizon: 5"), 10), 5)
+        self.assertEqual(load_execution_horizon(self._write("execution_horizon: 10"), 10), 10)
+
+    def test_an_execution_horizon_outside_one_to_the_prediction_horizon_is_rejected(self) -> None:
+        for value in ("0", "-1", "11", "2.5", "true"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                load_execution_horizon(self._write(f"execution_horizon: {value}"), 10)
+
     def test_invalid_safeflow_options_are_rejected(self) -> None:
         for lines in (("safeflow:", "  init: zeros"), ("safeflow: 3",)):
             with self.subTest(lines=lines):
@@ -204,11 +228,11 @@ class ShippedPolicyConfigTests(unittest.TestCase):
     """
 
     def test_shipped_policy_configs_load_through_every_loader(self) -> None:
-        for file_name, policy_type, expected_unet, expected_horizon in (
-            ("franka_casadi_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
-            ("franka_casadi_safeflow_config.yaml", "safeflow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
-            ("triple_integrator_casadi_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10),
-            ("triple_integrator_casadi_safeflow_config.yaml", "safeflow", UnetConfig(), 16),
+        for file_name, policy_type, expected_unet, expected_horizon, expected_execution in (
+            ("franka_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 5),
+            ("franka_safeflow_config.yaml", "safeflow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 5),
+            ("triple_integrator_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 1),
+            ("triple_integrator_safeflow_config.yaml", "safeflow", UnetConfig(), 16, 1),
         ):
             path = Path(PROJECT_ROOT) / "learning" / "config" / file_name
             with self.subTest(config=file_name):
@@ -216,7 +240,9 @@ class ShippedPolicyConfigTests(unittest.TestCase):
                 self.assertEqual(load_policy_type(path), policy_type)
                 self.assertEqual(load_unet_config(path), expected_unet)
                 self.assertEqual(load_prediction_horizon(path), expected_horizon)
+                self.assertEqual(load_execution_horizon(path, expected_horizon), expected_execution)
                 self.assertGreater(load_flow_config(path).num_inference_steps, 0)
+                self.assertGreater(load_flow_config(path).history_length, 0)
 
 
 if __name__ == "__main__":

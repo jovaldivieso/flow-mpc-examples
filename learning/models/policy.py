@@ -21,6 +21,16 @@ class ActionPolicy(nn.Module, ABC):
 
     @property
     @abstractmethod
+    def execution_horizon(self) -> int:
+        """How many control periods the first jerks of the selected chunk are executed before the policy is asked again."""
+
+    @property
+    @abstractmethod
+    def history_length(self) -> int:
+        """How many configurations of the arm's last positions (the current one last) the policy is conditioned on."""
+
+    @property
+    @abstractmethod
     def network(self) -> nn.Module:
         """The module that holds the learned weights, the flow policy every policy type is made of."""
 
@@ -43,6 +53,7 @@ class ActionPolicy(nn.Module, ABC):
 
     @abstractmethod
     def select_action(self, observation_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """The jerks (1, H, nu) that execute the policy's plan, the first row of which is executed."""
         raise NotImplementedError
 
     @abstractmethod
@@ -51,24 +62,22 @@ class ActionPolicy(nn.Module, ABC):
 
     @abstractmethod
     def compute_loss(
-        self,
-        observation_dict: Mapping[str, torch.Tensor],
-        actions: torch.Tensor,
+        self, observation_dict: Mapping[str, torch.Tensor], positions: torch.Tensor, paths: torch.Tensor | None = None
     ) -> torch.Tensor:
+        """The training loss of the target chunks of positions ``positions`` (B, H, n); with ``paths`` (B, S + 1, H, n), the safe
+        path of every row, the flow is learned along them (see ``FlowVelocityNet.compute_loss``), else from Gaussian noise
+        towards the chunks."""
         raise NotImplementedError
 
 
 def observation_features(observation_dict: Mapping[str, torch.Tensor]) -> torch.Tensor:
-    """Flat conditioning vector ``[observation.environment_state, observation.state]``.
-
-    This is what the flow policies are conditioned on directly (and what
-    ``CasadiTrajectoryProjector``/``invert_obs`` take as their flat ego
-    observation): the policy observation dict has exactly those two keys.
-    """
+    """Flat conditioning vector ``[observation.environment_state, observation.history]``: the policy is conditioned on what
+    it sees of the world and the positions of the arm in its last configurations, not on its velocity and acceleration
+    (``observation.state``, which the guidance and the projection start from)."""
     return torch.cat(
         [
             observation_dict["observation.environment_state"],
-            observation_dict["observation.state"],
+            observation_dict["observation.history"],
         ],
         dim=-1,
     )

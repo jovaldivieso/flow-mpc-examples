@@ -51,6 +51,8 @@ class FlowConfig:
     num_inference_steps: int = 10
     # Only used by the safeflow policy: where the flow integration starts ("previous_safe" or "gaussian")
     safeflow_init: str = "previous_safe"
+    # How many configurations (the current one last) of the arm's last positions the policy is conditioned on (SafeFlowMPC: 10)
+    history_length: int = 10
 
 
 @lru_cache(maxsize=None)
@@ -105,7 +107,7 @@ def load_unet_config(policy_config_path: Path) -> UnetConfig:
 
 
 def load_prediction_horizon(policy_config_path: Path | None) -> int:
-    """The ``model.prediction_horizon``: how many actions the policy predicts per state (the length of the chunk DAgger
+    """The ``model.prediction_horizon``: how many actions the policy predicts per state (the length of the chunk of positions DAgger
     labels with the expert's plan); ``DEFAULT_PREDICTION_HORIZON`` if the config omits it."""
     if policy_config_path is None:
         return DEFAULT_PREDICTION_HORIZON
@@ -113,6 +115,18 @@ def load_prediction_horizon(policy_config_path: Path | None) -> int:
     horizon = model_section.get("prediction_horizon", DEFAULT_PREDICTION_HORIZON)
     if isinstance(horizon, bool) or not isinstance(horizon, int) or horizon < 1:
         raise ValueError("'model.prediction_horizon' must be a positive integer.")
+    return horizon
+
+
+def load_execution_horizon(policy_config_path: Path | None, prediction_horizon: int) -> int:
+    """The ``model.execution_horizon``: how many control periods the first jerks of the policy's chunk are executed for
+    before it is asked again (1 if the config omits it); at most the ``prediction_horizon``."""
+    if policy_config_path is None:
+        return 1
+    _, model_section = _model_section(policy_config_path)
+    horizon = model_section.get("execution_horizon", 1)
+    if isinstance(horizon, bool) or not isinstance(horizon, int) or not 1 <= horizon <= prediction_horizon:
+        raise ValueError(f"'model.execution_horizon' must be an integer from 1 to the prediction horizon ({prediction_horizon}).")
     return horizon
 
 
@@ -137,9 +151,14 @@ def load_flow_config(policy_config_path: Path | None) -> FlowConfig:
     if safeflow_init not in {"previous_safe", "gaussian"}:
         raise ValueError("'model.safeflow.init' must be one of {'previous_safe', 'gaussian'}.")
 
+    history_length = flow_section.get("history_length", FlowConfig.history_length)
+    if isinstance(history_length, bool) or not isinstance(history_length, int) or history_length < 1:
+        raise ValueError("'model.flow.history_length' must be a positive integer.")
+
     return FlowConfig(
         num_inference_steps=int(flow_section.get("num_inference_steps", 10)),
         safeflow_init=safeflow_init,
+        history_length=history_length,
     )
 
 

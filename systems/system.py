@@ -147,12 +147,15 @@ class SystemSimulator(ABC):
         """The state of the observation (the part before it is dropped)."""
         return np.asarray(obs, dtype=float)[self.obs_dim - self.nx :]
 
-    def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """What the policy sees of an observation: the part before the state and the state, the two dataset features."""
+    def policy_observation(self, obs: np.ndarray, history: np.ndarray) -> dict[str, np.ndarray]:
+        """What the policy sees of an observation and of the rollout so far (``PositionHistory.flat``): the part before the
+        state, the state and the history of positions, the three dataset features. The policy is conditioned on the first
+        and the last; the state is what its guidance and projection start from."""
         obs_array = np.asarray(obs, dtype=np.float32)
         return {
             "observation.environment_state": obs_array[: self.environment_dim],
             "observation.state": obs_array[self.environment_dim :],
+            "observation.history": np.asarray(history, dtype=np.float32),
         }
 
     @property
@@ -170,14 +173,17 @@ class SystemSimulator(ABC):
     def action_names(self) -> list[str]:
         """Names of the ``nu`` action components (dataset metadata)."""
 
-    def state_from_policy(self, state: np.ndarray) -> np.ndarray:
-        """The plant state of the ``observation.state`` the policy sees (``nx`` entries): the state itself unless the
-        policy cannot see all of it."""
-        return np.asarray(state, dtype=float)
+    @abstractmethod
+    def history_names(self, length: int) -> list[str]:
+        """Names of the components of ``policy_observation``'s ``observation.history`` of ``length`` configurations."""
+
+    @abstractmethod
+    def plan_names(self, rows: int) -> list[str]:
+        """Names of the components of a plan of ``rows`` configurations, the dataset's ``action`` (dataset metadata)."""
 
     def observation_from_policy(self, environment_state: np.ndarray, state: np.ndarray) -> np.ndarray:
-        """An observation ``[goal, state]`` that gives the policy observation (the inverse of ``policy_observation``,
-        up to what the policy cannot see); here the policy sees the observation itself."""
+        """An observation ``[goal, state]`` that gives the policy observation (the inverse of ``policy_observation``, up to
+        the history); here the policy sees the observation itself."""
         return np.concatenate([np.asarray(environment_state, dtype=float), np.asarray(state, dtype=float)])
 
     def rollout_states(self, state: np.ndarray, actions: np.ndarray) -> np.ndarray:

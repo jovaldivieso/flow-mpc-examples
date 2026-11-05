@@ -7,7 +7,7 @@ Starts and goals are sampled from the seeds like the DAgger evaluation does (--s
 predicted action chunk is drawn as the TCP path of the motion it leads to (cyan) and, with --show-expert, the plan the
 expert would make from the very same state (green): the two are the network's output and the label it is trained on.
 The TCP path actually executed so far is drawn in yellow.
-The executed action is the first row of the policy's chunk. --show-collision-geometry draws the bounding spheres of the
+The policy is asked every execution_horizon steps and executes the first rows of its chunk (the jerks that track its plan). --show-collision-geometry draws the bounding spheres of the
 robot, which the planners and the safety filter keep clear of the obstacles. --no-viewer prints the outcome of every
 rollout only (reached, collision, timeout, solve failure).
 """
@@ -25,6 +25,7 @@ import numpy as np
 import torch
 from pinocchio.visualize import MeshcatVisualizer
 
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system_factory import SystemFactory
 from systems.franka_system import FrankaSystem
@@ -45,8 +46,8 @@ EXECUTED_RADIUS = 0.003  # m, a bit thicker than the plans so it stays visible u
 
 class PolicyRollout(NamedTuple):
     states: np.ndarray  # (T + 1, 2n) visited states
-    chunks: np.ndarray  # (T, H, nu) the policy's predicted action chunk at states[:T]
-    expert_plans: np.ndarray | None  # (T, H, nu) the expert's planned actions from the same states, None without an expert
+    chunks: np.ndarray  # (T, H, nu) the jerks the policy selects at states[:T] (its plan, projected when it is a safe flow policy); NaN where it is not asked
+    expert_plans: np.ndarray | None  # (T, H, nu) the jerks of the expert's plan from the same states, None without an expert
     outcome: str
     detail: str
 
@@ -63,28 +64,36 @@ def rollout_policy(
     state = dyn.reset(initial_state)
     termination = RolloutTerminationTracker(dyn)
     policy.reset()
+    history = PositionHistory(dyn.n, policy.history_length)
+    history.reset(state)
     if planner is not None:
         planner.reset()
     states, chunks, expert_plans = [state.copy()], [], []
     outcome, detail = "timeout", ""
     if termination.update(state):
         outcome = "reached"
+    block_chunk, block_step = None, 0
     for _ in range(0 if outcome == "reached" else num_steps):
         observation = dyn.observe(state)
-        policy_input = {name: torch.as_tensor(value)[None].to(device) for name, value in dyn.policy_observation(observation).items()}
-        try:
-            with torch.inference_mode():
-                chunk = policy.select_action(policy_input)[0].detach().cpu().numpy().astype(float)
-        except PlannerSolveError as error:
-            outcome, detail = "solve failure", str(error)[:80]
-            break
+        if block_step == 0:  # the policy is asked once per block of execution_horizon steps
+            policy_input = {name: torch.as_tensor(value)[None].to(device) for name, value in dyn.policy_observation(observation, history.flat).items()}
+            try:
+                with torch.inference_mode():
+                    block_chunk = policy.select_action(policy_input)[0].detach().cpu().numpy().astype(float)
+            except PlannerSolveError as error:
+                outcome, detail = "solve failure", str(error)[:80]
+                break
+            chunks.append(block_chunk)
+        else:
+            chunks.append(np.full_like(block_chunk, np.nan))  # no new chunk: the one of the block is still being executed
         if planner is not None:
             try:
-                expert_plans.append(planner.plan(observation).first_actions(len(chunk)))
+                expert_plans.append(planner.plan(observation).actions[: len(block_chunk)])
             except PlannerSolveError:
-                expert_plans.append(np.full((len(chunk), dyn.nu), np.nan))
-        chunks.append(chunk)
-        state = dyn.step(state, chunk[0])
+                expert_plans.append(np.full((len(block_chunk), dyn.nu), np.nan))
+        state = dyn.step(state, block_chunk[block_step])
+        block_step = (block_step + 1) % policy.execution_horizon
+        history.push(state)
         states.append(state.copy())
         if dyn.collides(state):
             outcome = "collision"
@@ -106,7 +115,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", required=True, help="DAgger checkpoint, e.g. outputs/train_dagger/<name>/flow_dagger_checkpoint.pt")
     parser.add_argument("--policy-type", choices=["flow", "safeflow"], default=None, help="default: the checkpoint's own policy type")
-    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_casadi_config.yaml"), help="expert yaml config (default: %(default)s)")
+    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default="[10000]", help="seeds of the starts and goals, e.g. '[10000, 10001]' (default: %(default)s)")
     parser.add_argument("--num-steps", type=int, default=125, help="maximum steps per rollout (default: %(default)s)")
     parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
@@ -140,7 +149,7 @@ def main() -> None:
             f"seed {seed}: {rollout.outcome}{' (' + rollout.detail + ')' if rollout.detail else ''} after {len(rollout.chunks)} steps | "
             f"final position error {position_error:.4f} m, rotation error {rotation_error:.3f} rad, "
             f"max joint speed {np.abs(rollout.states[-1][dyn.n : 2 * dyn.n]).max():.4f} rad/s | "
-            f"largest planned excursion of the policy {max([np.abs(np.diff(dyn.rollout_positions(s, c), axis=0)).sum(axis=0).max() for s, c in zip(rollout.states, rollout.chunks)], default=0.0):.2f}"
+            f"largest planned excursion of the policy {max([np.abs(np.diff(dyn.rollout_positions(s, c), axis=0)).sum(axis=0).max() for s, c in zip(rollout.states, rollout.chunks) if not np.isnan(c).any()], default=0.0):.2f}"
         )
         rollouts.append((seed, goal, rollout))
     if args.no_viewer:
@@ -178,7 +187,8 @@ def main() -> None:
                     show(state)
                     draw_plan(viz, "executed_path", executed_tcp[: index + 1], EXECUTED_COLOR, EXECUTED_RADIUS)
                     if index < len(rollout.chunks):
-                        draw_plan(viz, "policy_plan", action_tcp_points(dyn, state, rollout.chunks[index]), POLICY_COLOR)
+                        if not np.isnan(rollout.chunks[index]).any():
+                            draw_plan(viz, "policy_plan", action_tcp_points(dyn, state, rollout.chunks[index]), POLICY_COLOR)
                         if rollout.expert_plans is not None and not np.isnan(rollout.expert_plans[index]).any():
                             draw_plan(viz, "expert_plan", action_tcp_points(dyn, state, rollout.expert_plans[index]), EXPERT_COLOR)
                     time.sleep(dyn.dt / args.speed)

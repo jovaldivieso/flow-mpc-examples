@@ -48,7 +48,7 @@ def rollout_expert(dyn: FrankaSystem, planner: Planner, initial_state: np.ndarra
             outcome = f"planner failure ({str(exc)[:60]})"
             break
         solve_times.append(time.time() - t0)
-        executed = apply_execution_noise(dyn, action, noise_std, noise_rng)
+        executed = apply_execution_noise(action, noise_std, noise_rng)
         state = dyn.step(state, executed)
         states.append(state.copy())
         actions.append(executed)
@@ -88,7 +88,7 @@ def summarize(dyn: FrankaSystem, rollout: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_casadi_config.yaml"), help="expert yaml config (default: %(default)s)")
+    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
     parser.add_argument("--num-traj", type=int, default=10, help="number of random rollouts, seeds 0..N-1 (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default=None, help="explicit seeds instead of 0..N-1, e.g. '[0, 3, 7]'")
     parser.add_argument("--num-steps", type=int, default=250, help="maximum steps per rollout (default: %(default)s)")

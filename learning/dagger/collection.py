@@ -11,6 +11,7 @@ import torch
 
 from learning.data_utils import format_dataset_frame
 from planning.planner import Planner, PlannerSolveError
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.seed_utils import (
     action_noise_seed_for_rollout,
@@ -51,6 +52,8 @@ class CollectionSettings:
     initial_state_round_index: int | None
     expert_mixing_beta: float
     prediction_horizon: int
+    history_length: int
+    execution_horizon: int
     round_index: int
     starts: EpisodeStarts
     should_query_policy: bool
@@ -80,6 +83,9 @@ class _CollectionEpisode:
     rollout_steps: int
     frames: list[dict[str, object]]
     actor_is_expert: list[bool]
+    history: PositionHistory
+    block_is_expert: bool = True  # who acts in the block of ``execution_horizon`` steps under way
+    block_actions: np.ndarray | None = None  # the policy's jerks of the block, when it acts
     planner_failures: int = 0
     policy_solve_fallbacks: int = 0
     failure_cause: str | None = None
@@ -87,8 +93,12 @@ class _CollectionEpisode:
 
 
 class RolloutCollector:
-    """Collects the episodes of a DAgger round: every visited state is labeled with the expert's plan from it, whoever
-    executes the step (the expert or the policy, mixed by ``expert_mixing_beta``).
+    """Collects the episodes of a DAgger round: every visited state is labeled with the expert's planned positions from it,
+    whoever executes the step (the expert, with the jerks that track them, or the policy, mixed by ``expert_mixing_beta``).
+
+    The policy is asked once per block of ``execution_horizon`` steps, and a block is the expert's or the policy's as a whole,
+    drawn by ``expert_mixing_beta`` at its first step: the policy executes the first jerks of its chunk one after the other,
+    the expert plans again at every step.
 
     An episode whose expert planner fails to solve ends there and keeps the states it labeled before (``failure_cause``);
     when that is its first state, nothing is left and the episode is discarded (``discard_reason``). A failed policy
@@ -101,9 +111,9 @@ class RolloutCollector:
         expert_planner: Planner,
         settings: CollectionSettings,
         *,
-        policy_action_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+        policy_action_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None,
         policy_reset_fn: Callable[[], None] | None = None,
-        frame_builder: Callable[[np.ndarray, np.ndarray], Mapping[str, object]] | None = None,
+        frame_builder: Callable[[np.ndarray, np.ndarray, np.ndarray], Mapping[str, object]] | None = None,
     ) -> None:
         self.simulator = simulator
         self.expert_planner = expert_planner
@@ -133,8 +143,8 @@ class RolloutCollector:
                 break
         return self._result(episode, stats_before)
 
-    def _format_frame(self, observation: np.ndarray, expert_plan: np.ndarray) -> Mapping[str, object]:
-        return format_dataset_frame(self.simulator, observation, expert_plan)
+    def _format_frame(self, observation: np.ndarray, history: np.ndarray, positions: np.ndarray) -> Mapping[str, object]:
+        return format_dataset_frame(self.simulator, observation, history, positions)
 
     def _begin_episode(self, attempt_index: int) -> _CollectionEpisode:
         settings = self.settings
@@ -155,6 +165,8 @@ class RolloutCollector:
         if self.policy_reset_fn is not None:
             self.policy_reset_fn()
         self.expert_planner.reset()
+        history = PositionHistory(self.simulator.n, settings.history_length)
+        history.reset(state)
         return _CollectionEpisode(
             attempt_index=attempt_index,
             state=state,
@@ -166,6 +178,7 @@ class RolloutCollector:
             rollout_steps=settings.steps_per_trajectory,
             frames=[],
             actor_is_expert=[],
+            history=history,
         )
 
     def _run_step(self, episode: _CollectionEpisode, step: int) -> bool:
@@ -187,22 +200,26 @@ class RolloutCollector:
             episode.rollout_steps = step - 1
             return False
 
-        use_expert_action = bool(episode.mixing_rng.random() < settings.expert_mixing_beta)
-        policy_action = None
-        if settings.should_query_policy and self.policy_action_fn is not None:
-            policy_action = self._query_policy(episode, step, observation)
-            if policy_action is None:
-                use_expert_action = True
-        built_frame = self.frame_builder(observation, expert_plan.first_actions(settings.prediction_horizon))
+        block_step = (step - 1) % settings.execution_horizon
+        if block_step == 0:
+            episode.block_is_expert = bool(episode.mixing_rng.random() < settings.expert_mixing_beta)
+            episode.block_actions = None
+            if settings.should_query_policy and self.policy_action_fn is not None:
+                episode.block_actions = self._query_policy(episode, step, observation)
+                if episode.block_actions is None:
+                    episode.block_is_expert = True
+        use_expert_action = episode.block_is_expert
+        built_frame = self.frame_builder(observation, episode.history.flat, expert_plan.positions[: settings.prediction_horizon])
         if not isinstance(built_frame, Mapping):
             raise TypeError("'frame_builder' must return a mapping, got " f"{type(built_frame).__name__}.")
         episode.frames.append({"task": simulator.task_description, **built_frame})
         episode.actor_is_expert.append(use_expert_action)
-        base_action = expert_plan.actions[0] if use_expert_action or policy_action is None else policy_action
+        base_action = expert_plan.actions[0] if use_expert_action else episode.block_actions[block_step]
         episode.state = simulator.step(
             episode.state,
-            apply_execution_noise(simulator, base_action, settings.action_noise_std, episode.noise_rng),
+            apply_execution_noise(base_action, settings.action_noise_std, episode.noise_rng),
         )
+        episode.history.push(episode.state)
         if episode.termination.update(episode.state):
             episode.reached_goal = True
             episode.rollout_steps = step
@@ -210,15 +227,15 @@ class RolloutCollector:
         return True
 
     def _query_policy(self, episode: _CollectionEpisode, step: int, observation: np.ndarray) -> np.ndarray | None:
-        """The policy's action, or none if its solve failed. Unlike an expert-planner failure the episode survives
-        this: the expert's action of the step is already computed, so the step falls back to it and the episode goes
-        on instead of being discarded. It counts as an expert step, since that is what gets executed."""
+        """The policy's actions of the block (execution_horizon, nu), or none if its solve failed. Unlike an expert-planner
+        failure the episode survives this: the block falls back to the expert and the episode goes on instead of being
+        discarded. Those steps count as expert steps, since that is what gets executed."""
         try:
-            return self.policy_action_fn(observation)
+            return self.policy_action_fn(observation, episode.history.flat)
         except PlannerSolveError as exc:
             print(
-                "Policy action unavailable this step, falling back to the "
-                f"expert action (attempt={episode.attempt_index}, step={step}): {exc}"
+                "Policy actions unavailable, falling back to the "
+                f"expert for the block (attempt={episode.attempt_index}, step={step}): {exc}"
             )
             episode.policy_solve_fallbacks += 1
             return None
@@ -320,9 +337,11 @@ def collect_dagger_rollouts(
     initial_state_seed: int,
     expert_mixing_beta: float,
     prediction_horizon: int,
-    policy_action_fn: Callable[[np.ndarray], np.ndarray] | None,
+    history_length: int,
+    execution_horizon: int,
+    policy_action_fn: Callable[[np.ndarray, np.ndarray], np.ndarray] | None,
     policy_reset_fn: Callable[[], None] | None = None,
-    frame_builder: Callable[[np.ndarray, np.ndarray], Mapping[str, object]] | None = None,
+    frame_builder: Callable[[np.ndarray, np.ndarray, np.ndarray], Mapping[str, object]] | None = None,
     initial_states: list[np.ndarray] | None = None,
     goal_states: list[np.ndarray] | None = None,
     round_index: int = 0,
@@ -333,7 +352,7 @@ def collect_dagger_rollouts(
     """Collect DAgger trajectories with expert relabeling and mixed execution.
 
     Every visited state is labeled with the expert's plan from that state (its next ``prediction_horizon`` planned
-    actions, the length of the policy's chunk), whoever executes the step. An episode whose expert planner fails to
+    positions, the length of the policy's chunk, up to the last collision-free one), whoever executes the step. An episode whose expert planner fails to
     solve ends there and keeps the states labeled before the failure; one that fails at its first state has none, and is
     dropped and retried from a fresh initial state and goal.
     """
@@ -350,6 +369,8 @@ def collect_dagger_rollouts(
         initial_state_round_index=initial_state_round_index,
         expert_mixing_beta=expert_mixing_beta,
         prediction_horizon=prediction_horizon,
+        history_length=history_length,
+        execution_horizon=execution_horizon,
         round_index=round_index,
         starts=EpisodeStarts.from_specs(simulator, initial_states, goal_states),
         should_query_policy=policy_action_fn is not None and expert_mixing_beta < 1.0,

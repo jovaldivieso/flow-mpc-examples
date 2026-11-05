@@ -7,21 +7,19 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import meshcat.geometry as g
 import numpy as np
 import pandas as pd
 import torch
-import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from systems.franka_system import Q_READY, FrankaSystem
 from learning.models.policy_factory import PolicyFactory, PolicySpec
-from planning.casadi_planner import CasadiPlanner
-from planning.config import validate_system_config
-from planning.planner_config import PlannerConfig
+from planning.planner_factory import PlannerFactory
 from scripts.evaluate_policy import load_policy
 from scripts.meshcat_dataset import episode_summary, load_episodes, plan_positions, read_frames
 from scripts.meshcat_utils import (
@@ -33,19 +31,14 @@ from scripts.meshcat_utils import (
     tube_geometry,
 )
 from scripts.meshcat_policy import rollout_policy
-from test.planner_fixtures import pose_goal
+from systems.position_history import PositionHistory
+from test.planner_fixtures import pinned_config, pose_goal
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 PLAN_HORIZON = 4  # of the synthetic dataset
 CHUNK = 8  # of the policies built here
+EXECUTION = 3  # control periods the first jerks of a chunk are executed for, of the policies built here
+HISTORY = 3  # of the policies and the synthetic dataset
 N = 7
-
-
-def _config(**overrides) -> dict:
-    with open(CONFIG_PATH) as f:
-        raw_config = yaml.safe_load(f)
-    raw_config.update(overrides)
-    return validate_system_config(raw_config=raw_config)
 
 
 def _rest_state(simulator: FrankaSystem) -> np.ndarray:
@@ -53,18 +46,21 @@ def _rest_state(simulator: FrankaSystem) -> np.ndarray:
     return np.concatenate([q, np.zeros(2 * simulator.n)])
 
 
-def _episode_rows(index: int, frames: int, environment: np.ndarray, q: np.ndarray, moving_plan: bool) -> pd.DataFrame:
-    """Frames of a synthetic episode: the arm stays at ``q``; the labelled plan holds still or applies a jerk of
-    15 rad/s^3 for ``PLAN_HORIZON`` steps."""
+def _episode_rows(
+    index: int, frames: int, environment: np.ndarray, history: np.ndarray, q: np.ndarray, moving_plan: bool
+) -> pd.DataFrame:
+    """Frames of a synthetic episode: the arm stays at ``q``; the labelled plan holds still or moves 0.1 rad per row
+    of every joint away from it."""
     rows = []
     for frame in range(frames):
-        plan = np.full((PLAN_HORIZON, N), 15.0 if moving_plan else 0.0)
+        plan = q + (0.1 * np.arange(1, PLAN_HORIZON + 1)[:, None] if moving_plan else 0.0)
         rows.append(
             {
                 "episode_index": index,
                 "frame_index": frame,
                 "observation.state": np.concatenate([q, np.zeros(2 * N)]).astype(np.float32),
                 "observation.environment_state": environment.astype(np.float32),
+                "observation.history": history.astype(np.float32),
                 "action": plan.reshape(-1).astype(np.float32),
             }
         )
@@ -74,22 +70,25 @@ def _episode_rows(index: int, frames: int, environment: np.ndarray, q: np.ndarra
 class DatasetViewerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.simulator = FrankaSystem(_config())
+        cls.simulator = FrankaSystem(pinned_config())
         cls.q = _rest_state(cls.simulator)[:N]
         cls.goal = pose_goal(cls.simulator, cls.q + 0.1)
         cls.simulator.set_goal(cls.goal)
         state = np.concatenate([cls.q, np.zeros(2 * N)])
-        cls.environment = cls.simulator.policy_observation(cls.simulator.observe(state))["observation.environment_state"]
+        history = PositionHistory(N, HISTORY)
+        history.reset(state)
+        observed = cls.simulator.policy_observation(cls.simulator.observe(state), history.flat)
+        cls.environment, cls.history = observed["observation.environment_state"], observed["observation.history"]
 
     def setUp(self) -> None:
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         chunk = self.root / "data" / "chunk-000"
         chunk.mkdir(parents=True)
-        _episode_rows(0, 5, self.environment, self.q, moving_plan=True).to_parquet(chunk / "file-000.parquet")
+        _episode_rows(0, 5, self.environment, self.history, self.q, moving_plan=True).to_parquet(chunk / "file-000.parquet")
         pd.concat(
             [
-                _episode_rows(1, 4, self.environment, self.q, moving_plan=False),
-                _episode_rows(2, 6, self.environment, self.q, moving_plan=True),
+                _episode_rows(1, 4, self.environment, self.history, self.q, moving_plan=False),
+                _episode_rows(2, 6, self.environment, self.history, self.q, moving_plan=True),
             ]
         ).to_parquet(chunk / "file-001.parquet")
         # the file a running DAgger job is still writing: no parquet footer yet
@@ -119,14 +118,14 @@ class DatasetViewerTests(unittest.TestCase):
         self.assertEqual([episode.index for episode in episodes], [0, 1])
         episode = episodes[0]
         self.assertEqual(episode.positions.shape, (5, N))
-        self.assertEqual(episode.actions.shape, (5, PLAN_HORIZON, N))
+        self.assertEqual(episode.plans.shape, (5, PLAN_HORIZON, N))
         self.assertEqual(episode.velocities.shape, (5, N))
         np.testing.assert_allclose(episode.goal, self.goal, atol=1e-5)  # recovered from the goal in the TCP frame
-        plans = plan_positions(self.simulator, episode)
+        plans = plan_positions(episode)
         self.assertEqual(plans.shape, (5, PLAN_HORIZON + 1, N))
         np.testing.assert_allclose(plans[0, 0], episode.positions[0], atol=1e-6)  # row 0 is the frame's own q
-        np.testing.assert_allclose(plans[0, -1], self.simulator.rollout_positions(episode.states[0], episode.actions[0])[-1])
-        self.assertGreater(np.abs(plans[0, -1] - plans[0, 0]).max(), 0.0)
+        np.testing.assert_allclose(plans[0, 1:], episode.plans[0])
+        np.testing.assert_allclose(plans[0, -1], self.q + 0.1 * PLAN_HORIZON, atol=1e-5)
 
     def test_explicit_indices_are_loaded_and_unknown_ones_rejected(self) -> None:
         self.assertEqual([episode.index for episode in self._load(10, seed=0, indices=[2, 0])], [2, 0])
@@ -146,9 +145,7 @@ class DatasetViewerTests(unittest.TestCase):
 
         self.assertEqual(moving_summary["frames"], 5)
         self.assertEqual(moving_summary["stay_label_fraction"], 0.0)
-        moving_plan = self.simulator.rollout_positions(moving.states[0], moving.actions[0])
-        self.assertAlmostEqual(moving_summary["plan_excursion"], np.abs(moving_plan[1:] - moving_plan[:1]).max(), places=6)
-        self.assertGreater(moving_summary["plan_excursion"], 0.05)
+        self.assertAlmostEqual(moving_summary["plan_excursion"], 0.1 * PLAN_HORIZON, places=5)
         self.assertEqual(stalled_summary["stay_label_fraction"], 1.0)
         self.assertEqual(stalled_summary["at_rest_fraction"], 1.0)
         self.assertGreater(stalled_summary["final_position_error"], 0.0)  # it never got to the goal
@@ -184,7 +181,7 @@ class CollisionGeometryDrawingTests(unittest.TestCase):
     def test_the_spheres_are_created_with_their_radii_and_move_to_the_centers(self) -> None:
         objects, transforms = {}, {}
         viz = type("Viewer", (), {"viewer": _RecordingNode(objects, transforms)})()
-        simulator = FrankaSystem(_config())
+        simulator = FrankaSystem(pinned_config())
         centers, _, radii = simulator.collision_spheres(Q_READY)
 
         draw_collision_spheres(viz, radii)
@@ -229,22 +226,24 @@ class ThickPathDrawingTests(unittest.TestCase):
         self.assertEqual(objects, {})
 
 
+def _spec(simulator: FrankaSystem, **overrides) -> PolicySpec:
+    fields = dict(
+        policy_type="flow", action_dim=N, cond_dim=simulator.environment_dim + HISTORY * N, history_length=HISTORY,
+        execution_horizon=EXECUTION, prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+        action_scale=tuple(simulator.position_scale.tolist()),
+    )
+    return PolicySpec(**{**fields, **overrides})
+
+
 class PolicyRolloutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.config = _config()
+        cls.config = pinned_config()
         cls.simulator = FrankaSystem(cls.config)
         cls.state = _rest_state(cls.simulator)
         cls.simulator.set_goal(pose_goal(cls.simulator, cls.state[:N] + 0.3))
         torch.manual_seed(0)
-        cls.policy = PolicyFactory.create(
-            PolicySpec(
-                policy_type="flow", action_dim=N, state_dim=cls.simulator.environment_dim + cls.simulator.nx,
-                prediction_horizon=CHUNK, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
-                action_scale=tuple(cls.simulator.max_action.tolist()),
-            ),
-            cls.simulator,
-        ).eval()
+        cls.policy = PolicyFactory.create(_spec(cls.simulator), cls.simulator, cls.config).eval()
 
     def test_a_rollout_records_the_visited_states_and_the_chunk_planned_at_each(self) -> None:
         rollout = rollout_policy(self.simulator, self.policy, self.state, 3, torch.device("cpu"))
@@ -256,22 +255,51 @@ class PolicyRolloutTests(unittest.TestCase):
         self.assertIn(rollout.outcome, {"timeout", "collision", "reached", "solve failure"})
         np.testing.assert_allclose(rollout.states[0], self.state)
 
-    def test_the_executed_step_applies_the_first_row_of_the_chunk(self) -> None:
-        rollout = rollout_policy(self.simulator, self.policy, self.state, 1, torch.device("cpu"))
+    def test_the_policy_is_asked_once_per_block_and_the_other_steps_of_it_have_no_chunk(self) -> None:
+        rollout = rollout_policy(self.simulator, self.policy, self.state, 7, torch.device("cpu"))
 
-        np.testing.assert_allclose(rollout.states[1], self.simulator.predict_next_state(self.state, rollout.chunks[0][0]))
+        self.assertEqual(rollout.outcome, "timeout")
+        asked = ~np.isnan(rollout.chunks).any(axis=(1, 2))
+        self.assertEqual(asked.tolist(), [step % EXECUTION == 0 for step in range(7)])
+        self.assertEqual(np.isnan(rollout.chunks[~asked]).all(axis=(1, 2)).tolist(), [True] * 4)
+
+    def test_the_steps_of_a_block_apply_the_rows_of_its_chunk_in_order(self) -> None:
+        rollout = rollout_policy(self.simulator, self.policy, self.state, 5, torch.device("cpu"))
+
+        for step in range(5):
+            chunk = rollout.chunks[step - step % EXECUTION]  # the chunk selected at the first step of the block
+            np.testing.assert_allclose(
+                rollout.states[step + 1], self.simulator.predict_next_state(rollout.states[step], chunk[step % EXECUTION])
+            )
+
+    def test_the_policy_is_given_the_history_of_the_rollout(self) -> None:
+        seen = []
+        select_action = self.policy.select_action
+
+        def record(observation):
+            seen.append(observation["observation.history"][0].numpy())
+            return select_action(observation)
+
+        with mock.patch.object(self.policy, "select_action", side_effect=record):
+            rollout = rollout_policy(self.simulator, self.policy, self.state, EXECUTION + 1, torch.device("cpu"))
+
+        self.assertEqual(len(seen), 2)  # the first step of each of the two blocks
+        np.testing.assert_allclose(seen[0], np.tile(self.state[:N], HISTORY), atol=1e-6)  # the start repeated
+        expected = np.concatenate([state[:N] for state in rollout.states[EXECUTION - HISTORY + 1 : EXECUTION + 1]])
+        np.testing.assert_allclose(seen[1], expected, atol=1e-6)  # slid at every step of the block
 
     def test_the_expert_plans_from_every_visited_state_when_asked_to(self) -> None:
-        planner = CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config))
+        planner = PlannerFactory.create(self.config["expert"], self.simulator, self.config)
 
-        rollout = rollout_policy(self.simulator, self.policy, self.state, 2, torch.device("cpu"), planner)
+        rollout = rollout_policy(self.simulator, self.policy, self.state, 4, torch.device("cpu"), planner)
 
         self.assertEqual(rollout.expert_plans.shape, rollout.chunks.shape)
-        first_action = CasadiPlanner(self.simulator, PlannerConfig.from_mapping(self.config)).plan(self.simulator.observe(self.state)).actions[0]
-        np.testing.assert_allclose(rollout.expert_plans[0][0], first_action, atol=1e-6)  # the plan starts at the state
+        self.assertTrue(np.isfinite(rollout.expert_plans).all())  # recorded at every step, also where the policy is not asked
+        first = PlannerFactory.create(self.config["expert"], self.simulator, self.config).plan(self.simulator.observe(self.state))
+        np.testing.assert_allclose(rollout.expert_plans[0][0], first.actions[0], atol=1e-6)  # the plan starts at the state
 
     def test_a_rollout_that_starts_at_the_goal_is_reached_without_steps(self) -> None:
-        simulator = FrankaSystem(_config(done_hold_steps=1))  # one check at the goal and at rest is enough
+        simulator = FrankaSystem(pinned_config(done_hold_steps=1))  # one check at the goal and at rest is enough
         simulator.set_goal(pose_goal(simulator, self.state[:N]))
 
         rollout = rollout_policy(simulator, self.policy, self.state, 5, torch.device("cpu"))
@@ -280,36 +308,50 @@ class PolicyRolloutTests(unittest.TestCase):
 
 
 class LoadPolicyTests(unittest.TestCase):
-    def test_the_policy_of_a_checkpoint_runs_with_its_ema_weights_in_eval_mode(self) -> None:
-        simulator = FrankaSystem(_config())
-        state_dim = simulator.environment_dim + simulator.nx
-        template = PolicyFactory.create(
-            PolicySpec(
-                policy_type="flow", action_dim=N, state_dim=state_dim, prediction_horizon=CHUNK, unet_dim=8,
-                unet_dim_mults=(1, 2), num_inference_steps=2, action_scale=(1.0,) * N,
-            ),
-            simulator,
-        )
-        averaged = {name: torch.full_like(tensor, 0.25) for name, tensor in template.state_dict().items()}
-        checkpoint = {
+    def _checkpoint(self, simulator: FrankaSystem, template, averaged: dict, **overrides) -> dict:
+        return {
             "model_state_dict": template.state_dict(),
             "ema_model_state_dict": averaged,
-            "state_dim": state_dim,
+            "cond_dim": simulator.environment_dim + HISTORY * N,
             "action_dim": N,
             "prediction_horizon": CHUNK,
+            "history_length": HISTORY,
+            "execution_horizon": EXECUTION,
             "unet": {"dim": 8, "dim_mults": [1, 2]},
             "policy_type": "flow",
             "flow_config": {"num_inference_steps": 2, "safeflow_init": "previous_safe", "action_scale": [1.0] * N},
+            **overrides,
         }
+
+    def test_the_policy_of_a_checkpoint_runs_with_its_ema_weights_in_eval_mode(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        template = PolicyFactory.create(_spec(simulator, action_scale=(1.0,) * N), simulator, config)
+        averaged = {name: torch.full_like(tensor, 0.25) for name, tensor in template.state_dict().items()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "checkpoint.pt")
+            torch.save(self._checkpoint(simulator, template, averaged), path)
+
+            policy = load_policy("flow", path, simulator, config, torch.device("cpu"))
+
+        self.assertFalse(policy.training)
+        self.assertEqual((policy.history_length, policy.execution_horizon), (HISTORY, EXECUTION))
+        for name, tensor in policy.state_dict().items():
+            torch.testing.assert_close(tensor, averaged[name])
+
+    def test_a_checkpoint_without_an_execution_horizon_executes_one_step_per_call(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        template = PolicyFactory.create(_spec(simulator, action_scale=(1.0,) * N), simulator, config)
+        checkpoint = self._checkpoint(simulator, template, template.state_dict())
+        del checkpoint["execution_horizon"]
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "checkpoint.pt")
             torch.save(checkpoint, path)
 
-            policy = load_policy("flow", path, simulator, {}, torch.device("cpu"))
+            policy = load_policy("flow", path, simulator, config, torch.device("cpu"))
 
-        self.assertFalse(policy.training)
-        for name, tensor in policy.state_dict().items():
-            torch.testing.assert_close(tensor, averaged[name])
+        self.assertEqual(policy.execution_horizon, 1)
 
 
 if __name__ == "__main__":

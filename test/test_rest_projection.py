@@ -15,66 +15,94 @@ HORIZON = 10
 DT = 0.05
 
 
-def _terminal_state(chunk: np.ndarray, velocity: np.ndarray, acceleration: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """The velocity and acceleration (n,) after the jerks (H, n) are applied one step each from the given ones."""
-    for jerk in chunk:
-        velocity, acceleration = velocity + DT * acceleration + DT**2 / 2 * jerk, acceleration + DT * jerk
-    return velocity, acceleration
-
-
-def _terminal_map() -> np.ndarray:
-    """The (2, H) map from the jerks of one joint, from rest, to its final velocity and acceleration."""
-    columns = []
-    for k in range(HORIZON):
-        jerk = np.zeros((HORIZON, 1))
-        jerk[k] = 1.0
-        velocity, acceleration = _terminal_state(jerk, np.zeros(1), np.zeros(1))
-        columns.append([velocity[0], acceleration[0]])
-    return np.array(columns).T
+def _final_velocity_and_acceleration(chunk: np.ndarray, dt: float = DT) -> tuple[np.ndarray, np.ndarray]:
+    """The backward differences of the last three positions of each joint of a chunk (H, n)."""
+    return (chunk[-1] - chunk[-2]) / dt, (chunk[-1] - 2 * chunk[-2] + chunk[-3]) / dt**2
 
 
 class RestProjectionTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.rest = RestProjection(_terminal_map())
-        rng = np.random.default_rng(0)
-        self.chunk = rng.standard_normal((HORIZON, 3))
-        self.velocity, self.acceleration = rng.standard_normal(3), rng.standard_normal(3)
+        self.rest = RestProjection(HORIZON, DT)
+        self.chunk = np.random.default_rng(0).standard_normal((HORIZON, 4))
 
-    def _project(self, weight: float) -> np.ndarray:
-        final = _terminal_state(self.chunk, self.velocity, self.acceleration)
-        return self.rest(self.chunk, final[0], final[1], weight)
+    def test_the_full_weight_brings_the_final_velocity_and_acceleration_to_rest(self) -> None:
+        velocity, acceleration = _final_velocity_and_acceleration(self.rest(self.chunk, 1.0))
 
-    def test_the_full_weight_brings_the_final_velocity_and_acceleration_to_zero(self) -> None:
-        velocity, acceleration = _terminal_state(self._project(1.0), self.velocity, self.acceleration)
+        np.testing.assert_allclose(velocity, 0.0, atol=1e-9)
+        np.testing.assert_allclose(acceleration, 0.0, atol=1e-9)
 
-        np.testing.assert_allclose(velocity, 0.0, atol=1e-12)
-        np.testing.assert_allclose(acceleration, 0.0, atol=1e-12)
+    def test_a_partial_weight_scales_the_final_velocity_and_acceleration_of_every_joint(self) -> None:
+        before = _final_velocity_and_acceleration(self.chunk)
 
-    def test_a_partial_weight_scales_the_final_velocity_and_acceleration(self) -> None:
-        before = _terminal_state(self.chunk, self.velocity, self.acceleration)
-        after = _terminal_state(self._project(0.4), self.velocity, self.acceleration)
+        for weight in (0.25, 0.5, 0.9):
+            with self.subTest(weight=weight):
+                after = _final_velocity_and_acceleration(self.rest(self.chunk, weight))
 
-        np.testing.assert_allclose(after[0], 0.6 * before[0], atol=1e-12)
-        np.testing.assert_allclose(after[1], 0.6 * before[1], atol=1e-12)
+                np.testing.assert_allclose(after[0], (1 - weight) * before[0], atol=1e-9)
+                np.testing.assert_allclose(after[1], (1 - weight) * before[1], atol=1e-9)
 
     def test_no_weight_leaves_the_chunk_as_it_is(self) -> None:
-        np.testing.assert_array_equal(self._project(0.0), self.chunk)
+        np.testing.assert_array_equal(self.rest(self.chunk, 0.0), self.chunk)
 
-    def test_the_change_of_the_jerks_is_the_smallest_one_that_does_it(self) -> None:
-        change = self._project(1.0) - self.chunk
-        terminal_map = _terminal_map()
-        _, _, right_singular = np.linalg.svd(terminal_map)
-        null_space = right_singular[2:].T  # the jerks that change neither the final velocity nor the final acceleration
+    def test_the_change_is_spread_along_the_chunk_and_largest_at_its_end(self) -> None:
+        change = np.linalg.norm(self.rest(self.chunk, 1.0) - self.chunk, axis=1)
 
-        np.testing.assert_allclose(null_space.T @ change, 0.0, atol=1e-12)
+        self.assertEqual(int(np.argmax(change)), HORIZON - 1)
+        self.assertGreater(change[HORIZON // 2], 1e-3 * change[-1])  # not confined to the last rows
+        self.assertLess(change[0], 0.1 * change[-1])
+
+    def test_the_change_is_smooth(self) -> None:
+        # In velocity and acceleration the change is far smaller than the same change landing on the last row alone
+        change = self.rest(self.chunk, 1.0) - self.chunk
+        spike = np.zeros_like(change)
+        spike[-1] = np.abs(change[-1])
+
+        self.assertLess(np.abs(np.diff(change, 2, axis=0)).max(), 0.5 * np.abs(np.diff(spike, 2, axis=0)).max())
+
+    def test_the_change_is_linear_in_the_chunk_and_the_weight(self) -> None:
+        other = np.random.default_rng(1).standard_normal(self.chunk.shape)
+        change = lambda chunk, weight: self.rest(chunk, weight) - chunk
+
+        np.testing.assert_allclose(change(self.chunk + 2 * other, 0.5), change(self.chunk, 0.5) + 2 * change(other, 0.5), atol=1e-10)
+        np.testing.assert_allclose(change(self.chunk, 0.5), 0.5 * change(self.chunk, 1.0), atol=1e-10)
 
     def test_the_joints_are_projected_independently(self) -> None:
-        together = self._project(1.0)
-        final = _terminal_state(self.chunk, self.velocity, self.acceleration)
+        together = self.rest(self.chunk, 0.7)
 
-        alone = self.rest(self.chunk[:, :1], final[0][:1], final[1][:1], 1.0)
+        for joint in range(self.chunk.shape[1]):
+            np.testing.assert_allclose(together[:, joint], self.rest(self.chunk[:, joint : joint + 1], 0.7)[:, 0], atol=1e-12)
 
-        np.testing.assert_allclose(together[:, :1], alone, atol=1e-12)
+    def test_a_chunk_that_already_rests_is_left_as_it_is(self) -> None:
+        resting = np.tile(self.chunk[:1], (HORIZON, 1))
+
+        np.testing.assert_allclose(self.rest(resting, 1.0), resting, atol=1e-10)
+
+    def test_the_result_does_not_depend_on_the_scale_of_the_time_step(self) -> None:
+        # The change that scales the final velocity and acceleration is the same for any dt: both are rescaled alike
+        for dt in (0.01, 1.0):
+            with self.subTest(dt=dt):
+                np.testing.assert_allclose(RestProjection(HORIZON, dt)(self.chunk, 0.6), self.rest(self.chunk, 0.6), atol=1e-8)
+
+    def test_the_final_velocity_and_acceleration_are_scaled_with_any_time_step(self) -> None:
+        dt = 0.2
+        before = _final_velocity_and_acceleration(self.chunk, dt)
+        after = _final_velocity_and_acceleration(RestProjection(HORIZON, dt)(self.chunk, 1.0), dt)
+
+        self.assertGreater(np.abs(before[0]).max(), 1e-3)
+        np.testing.assert_allclose(after[0], 0.0, atol=1e-9)
+        np.testing.assert_allclose(after[1], 0.0, atol=1e-9)
+
+    def test_the_shortest_chunk_has_three_positions(self) -> None:
+        for horizon in (0, 1, 2):
+            with self.subTest(horizon=horizon):
+                with self.assertRaises(ValueError):
+                    RestProjection(horizon, DT)
+
+        chunk = np.random.default_rng(2).standard_normal((3, 2))
+        velocity, acceleration = _final_velocity_and_acceleration(RestProjection(3, DT)(chunk, 1.0))
+
+        np.testing.assert_allclose(velocity, 0.0, atol=1e-9)
+        np.testing.assert_allclose(acceleration, 0.0, atol=1e-9)
 
 
 if __name__ == "__main__":

@@ -62,7 +62,6 @@ def append_round_summary(
     train_loss: float | None,
     eval_metrics: DaggerEvalMetrics | None,
     aggregation_metrics: DaggerEvalMetrics | None = None,
-    safeflow_eval_metrics: DaggerEvalMetrics | None = None,
     latest_checkpoint: str | None = None,
     iteration_checkpoint: str | None = None,
     region_eval_metrics: Mapping[str, Mapping[str, DaggerEvalMetrics | None]] | None = None,
@@ -87,8 +86,6 @@ def append_round_summary(
         "aggregation_success_rate": aggregation_metrics.success_rate if aggregation_metrics is not None else None,
         **(eval_metrics.to_dict() if eval_metrics is not None else DaggerEvalMetrics.not_evaluated()),
     }
-    if safeflow_eval_metrics is not None:
-        entry["safeflow_eval"] = safeflow_eval_metrics.to_dict()
     if region_eval_metrics:
         entry["regions"] = {
             region: {policy_type: metrics.to_dict() for policy_type, metrics in evaluations.items() if metrics is not None}

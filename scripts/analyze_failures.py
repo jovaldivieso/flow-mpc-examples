@@ -6,7 +6,7 @@ progress made, the speed). With ``--expert`` it also runs the expert from the ep
 episodes nobody can solve from those the policy gets wrong.
 
     python scripts/analyze_failures.py --checkpoint outputs/train_dagger/<run>/flow_dagger_iter_003.pt \
-        --expert-config scripts/config/franka_ompl_casadi_config.yaml --policy-config learning/config/<policy>.yaml
+        --expert-config scripts/config/franka_obstacles_config.yaml --policy-config learning/config/<policy>.yaml
 """
 
 from __future__ import annotations
@@ -26,13 +26,14 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from learning.config_loaders import load_dagger_training_config
-from learning.dagger import apply_config_overrides, build_policy_action, evaluation_seed_specs
+from learning.dagger import apply_config_overrides, build_policy_actions, evaluation_seed_specs
 from learning.dagger.episode_starts import EpisodeStarts
 from planning.config import load_and_validate_system_config, validate_system_config
 from planning.ompl_planner import initialize_ompl
 from planning.planner import PlannerSolveError
 from planning.planner_factory import PlannerFactory
 from scripts.evaluate_policy import load_policy
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.seed_utils import default_action_noise_seed_for_config, torch_inference_seed_for_rollout
 from systems.system_factory import SystemFactory
@@ -91,23 +92,31 @@ def run_policy(simulator, policy, initial_state: np.ndarray, num_steps: int, see
     state = simulator.reset(initial_state)
     termination = RolloutTerminationTracker(simulator)
     policy.reset()
+    history = PositionHistory(simulator.n, policy.history_length)
+    history.reset(state)
     initial_error = simulator.goal_errors(state)[0]
     record: dict[str, Any] = {"outcome": "timeout", "steps": num_steps, "min_clearance": clearance(simulator, state)}
     if termination.update(state):
         return {**record, "outcome": "success", "steps": 0}
-    for step in range(1, num_steps + 1):
-        action = build_policy_action(simulator, policy, simulator.observe(state), torch.device("cpu"))
-        state = simulator.step(state, action)
-        record["min_clearance"] = min(record["min_clearance"], clearance(simulator, state))
-        if simulator.collides(state):
-            link, obstacle = contact(simulator)
-            return {
-                **record, "outcome": "collision", "steps": step, "link": link, "obstacle": obstacle,
-                "progress": 1.0 - simulator.goal_errors(state)[0] / initial_error,
-                "goal_distance": simulator.goal_errors(state)[0], "speed": float(np.linalg.norm(state[simulator.n: 2 * simulator.n])),
-            }
-        if termination.update(state):
-            return {**record, "outcome": "success", "steps": step}
+    step = 0
+    while step < num_steps:
+        actions = build_policy_actions(simulator, policy, simulator.observe(state), history.flat, torch.device("cpu"))
+        for action in actions:  # the policy's jerks are executed one after the other until it is asked again
+            if step >= num_steps:
+                break
+            step += 1
+            state = simulator.step(state, action)
+            history.push(state)
+            record["min_clearance"] = min(record["min_clearance"], clearance(simulator, state))
+            if simulator.collides(state):
+                link, obstacle = contact(simulator)
+                return {
+                    **record, "outcome": "collision", "steps": step, "link": link, "obstacle": obstacle,
+                    "progress": 1.0 - simulator.goal_errors(state)[0] / initial_error,
+                    "goal_distance": simulator.goal_errors(state)[0], "speed": float(np.linalg.norm(state[simulator.n: 2 * simulator.n])),
+                }
+            if termination.update(state):
+                return {**record, "outcome": "success", "steps": step}
     return {**record, "goal_distance": simulator.goal_errors(state)[0], "speed": float(np.linalg.norm(state[simulator.n: 2 * simulator.n]))}
 
 

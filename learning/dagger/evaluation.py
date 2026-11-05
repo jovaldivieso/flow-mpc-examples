@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from planning.planner import Planner, PlannerSolveError
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.seed_utils import action_noise_rng_for_rollout, torch_inference_seed_for_rollout
 from systems.system import SystemSimulator
@@ -36,6 +37,7 @@ class EvaluationSettings:
     num_steps: int
     action_noise_std: float
     action_noise_seed: int
+    history_length: int
     starts: EpisodeStarts
 
     def build_runner(self, simulator: SystemSimulator, expert_planner: Planner | None, policy) -> RolloutEvaluator:
@@ -49,7 +51,7 @@ class RolloutEvaluator:
         self,
         simulator: SystemSimulator,
         settings: EvaluationSettings,
-        action_fn: Callable[[np.ndarray], np.ndarray],
+        action_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
         reset_fn: Callable[[], None] | None = None,
     ) -> None:
         self.simulator = simulator
@@ -71,6 +73,7 @@ class RolloutEvaluator:
             initial_state=initial_state,
             num_steps=settings.num_steps,
             action_fn=self.action_fn,
+            history_length=settings.history_length,
             reset_fn=self.reset_fn,
             action_noise_std=settings.action_noise_std,
             action_noise_rng=action_noise_rng_for_rollout(settings.action_noise_seed, seed_spec=seed_spec),
@@ -85,14 +88,16 @@ def rollout_policy_with_action_fn(
     simulator: SystemSimulator,
     initial_state: np.ndarray,
     num_steps: int,
-    action_fn: Callable[[np.ndarray], np.ndarray],
+    action_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    history_length: int,
     reset_fn: Callable[[], None] | None = None,
     action_noise_std: float = 0.0,
     action_noise_rng: np.random.Generator | None = None,
     call_times: list[float] | None = None,
 ) -> tuple[bool, int, str | None]:
     """Returns (reached_goal, steps_taken, failure_reason). The wall-clock duration of every ``action_fn`` call that
-    returned an action is appended to ``call_times``.
+    returned actions is appended to ``call_times``. ``action_fn`` takes the observation and the history of the last
+    ``history_length`` positions of the rollout and returns the jerks (steps, nu) to execute before it is called again.
 
     failure_reason is None on success, else one of "timeout" (ran out of steps
     without reaching tolerance), "solve_failure" (action_fn itself raised) or
@@ -102,32 +107,35 @@ def rollout_policy_with_action_fn(
     """
     state = simulator.reset(initial_state)
     termination = RolloutTerminationTracker(simulator)
+    history = PositionHistory(simulator.n, history_length)
+    history.reset(state)
     if reset_fn is not None:
         reset_fn()
     if termination.update(state):
         return True, 0, None
-    for step in range(1, num_steps + 1):
+    step = 0
+    while step < num_steps:
         call_start = time.perf_counter()
         try:
-            action = action_fn(simulator.observe(state))
+            actions = action_fn(simulator.observe(state), history.flat)
         except PlannerSolveError as exc:
-            # No expert running alongside evaluation to fall back to (unlike
-            # collect_dagger_rollouts) -- treat like any other episode
-            # failure (a timeout) rather than crashing the
-            # whole evaluation/training run over one solver hiccup.
-            # simulator.step() never ran this iteration, so `step` (a
-            # 1-indexed loop counter) overcounts the actually-executed steps
-            # by one -- step - 1 matches every other return in this function,
-            # each of which only reaches `step` after simulator.step() ran.
-            print(f"Safeflow policy solve failed during evaluation at step={step}: {exc}")
-            return False, step - 1, "solve_failure"
+            # No expert running alongside evaluation to fall back to (unlike collect_dagger_rollouts) -- treat like any
+            # other episode failure rather than crashing the whole evaluation/training run over one solver hiccup. No
+            # step of this call was executed, so the steps taken are the ones before it.
+            print(f"Safeflow policy solve failed during evaluation at step={step + 1}: {exc}")
+            return False, step, "solve_failure"
         if call_times is not None:
             call_times.append(time.perf_counter() - call_start)
-        state = simulator.step(state, apply_execution_noise(simulator, action, action_noise_std, action_noise_rng))
-        if simulator.collides(state):
-            return False, step, "collision"
-        if termination.update(state):
-            return True, step, None
+        for action in actions:  # the policy's jerks are executed one after the other until it is asked again
+            if step >= num_steps:
+                break
+            step += 1
+            state = simulator.step(state, apply_execution_noise(action, action_noise_std, action_noise_rng))
+            history.push(state)
+            if simulator.collides(state):
+                return False, step, "collision"
+            if termination.update(state):
+                return True, step, None
     return False, num_steps, "timeout"
 
 
@@ -205,7 +213,8 @@ def evaluate_policy_rollouts(
     num_episodes: int,
     num_steps: int,
     seed_start: int,
-    action_fn: Callable[[np.ndarray], np.ndarray],
+    action_fn: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    history_length: int,
     reset_fn: Callable[[], None] | None = None,
     action_noise_std: float = 0.0,
     action_noise_seed: int = 0,
@@ -223,6 +232,7 @@ def evaluate_policy_rollouts(
         num_steps=num_steps,
         action_noise_std=action_noise_std,
         action_noise_seed=action_noise_seed,
+        history_length=history_length,
         starts=EpisodeStarts.from_specs(simulator, initial_states, goal_states),
     )
     if num_workers > 1 and worker_spec is not None and num_episodes > 1:

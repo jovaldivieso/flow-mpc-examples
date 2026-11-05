@@ -24,12 +24,13 @@ from systems.seed_utils import (
     action_noise_seed_for_rollout,
     default_action_noise_seed_for_config,
 )
+from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from learning.config_loaders import UnetConfig
 from learning.data_utils import build_dataset_features
-from learning.dagger import apply_config_overrides, build_policy_action
+from learning.dagger import apply_config_overrides, build_policy_actions
 from learning.dagger.policy_action import apply_execution_noise
 from learning.dagger.utils import rng_for_seed_spec as _rng_for_seed_spec, sample_initial_state
 from learning.models.policy import ActionPolicy
@@ -43,9 +44,11 @@ def resolve_checkpoint_observation_dimensions(
     checkpoint: Mapping[str, Any],
     simulator: SystemSimulator,
     requested_policy_type: str,
-) -> tuple[int, int]:
-    """Resolve and validate checkpoint dimensions against the evaluation simulator."""
-    features = build_dataset_features(simulator, int(checkpoint.get("prediction_horizon", 1)))
+) -> tuple[int, int, int]:
+    """Resolve and validate checkpoint dimensions against the evaluation simulator: (conditioning dimension, action
+    dimension, history length)."""
+    history_length = int(checkpoint["history_length"])
+    features = build_dataset_features(simulator, int(checkpoint.get("prediction_horizon", 1)), history_length)
 
     # 'flow' and 'safeflow' share the exact same underlying network (safeflow
     # only wraps it with a CasADi projection at inference time), so a checkpoint
@@ -62,18 +65,18 @@ def resolve_checkpoint_observation_dimensions(
             )
 
     environment_state_dim = int(features["observation.environment_state"]["shape"][0])
-    proprioception_dim = int(features["observation.state"]["shape"][0])
-    expected_state_dim = environment_state_dim + proprioception_dim
-    state_dim = int(checkpoint.get("state_dim", expected_state_dim))
-    if state_dim != expected_state_dim:
+    history_dim = int(features["observation.history"]["shape"][0])
+    expected_cond_dim = environment_state_dim + history_dim
+    cond_dim = int(checkpoint.get("cond_dim", expected_cond_dim))
+    if cond_dim != expected_cond_dim:
         raise ValueError(
-            "Checkpoint ego observation schema is incompatible with the evaluation simulator: "
-            f"checkpoint=(state_dim={state_dim}), "
-            f"expected_state_dim={expected_state_dim}. "
-            "Use a checkpoint trained with the same ego observation schema."
+            "Checkpoint observation schema is incompatible with the evaluation simulator: "
+            f"checkpoint=(cond_dim={cond_dim}), "
+            f"expected_cond_dim={expected_cond_dim}. "
+            "Use a checkpoint trained with the same observation schema."
         )
-    # The dataset's action is the flattened chunk (prediction_horizon rows), the policy's action_dim one row: one action
-    expected_action_dim = int(simulator.nu)
+    # The dataset's action is the flattened chunk (prediction_horizon rows), the policy's action_dim one row of positions
+    expected_action_dim = int(simulator.n)
     action_dim = int(checkpoint.get("action_dim", expected_action_dim))
     if action_dim != expected_action_dim:
         raise ValueError(
@@ -82,7 +85,7 @@ def resolve_checkpoint_observation_dimensions(
             f"expected_action_dim={expected_action_dim}. "
             "Use a checkpoint trained with the same action schema."
         )
-    return state_dim, action_dim
+    return cond_dim, action_dim, history_length
 
 
 def parse_seed_argument(raw_seeds: str | None) -> list[int]:
@@ -193,7 +196,6 @@ def rollout_planner(
         solve_times.append(time.perf_counter() - solve_start)
 
         executed_action = apply_execution_noise(
-            simulator=simulator,
             action=action,
             action_noise_std=action_noise_std,
             rng=action_noise_rng,
@@ -234,40 +236,47 @@ def rollout_policy(
     termination = RolloutTerminationTracker(simulator)
     trajectory = [state.copy()]
     policy.reset()
+    history = PositionHistory(simulator.n, policy.history_length)
+    history.reset(state)
     solve_times: list[float] = []
     if termination.update(state):
         return np.asarray(trajectory), True, 0, False, solve_times
 
-    for step in range(1, num_steps + 1):
+    step = 0
+    while step < num_steps:
         observation = simulator.observe(state)
 
         _synchronize_device(device)
         solve_start = time.perf_counter()
         try:
-            action = build_policy_action(
+            actions = build_policy_actions(
                 simulator=simulator,
                 policy=policy,
                 observation=observation,
+                history=history.flat,
                 device=device,
             )
         except PlannerSolveError as exc:
-            print(f"Policy rollout solve failed (step={step}): {exc}")
+            print(f"Policy rollout solve failed (step={step + 1}): {exc}")
             return np.asarray(trajectory), False, len(trajectory) - 1, True, solve_times
         _synchronize_device(device)
         solve_times.append(time.perf_counter() - solve_start)
 
-        executed_action = apply_execution_noise(
-            simulator=simulator,
-            action=action,
-            action_noise_std=action_noise_std,
-            rng=action_noise_rng,
-        )
+        for action in actions:  # the policy's jerks are executed one after the other until it is asked again
+            if step >= num_steps:
+                break
+            step += 1
+            executed_action = apply_execution_noise(
+                action=action,
+                action_noise_std=action_noise_std,
+                rng=action_noise_rng,
+            )
+            state = simulator.step(state, executed_action)
+            history.push(state)
+            trajectory.append(state.copy())
 
-        state = simulator.step(state, executed_action)
-        trajectory.append(state.copy())
-
-        if termination.update(state):
-            return np.asarray(trajectory), True, step, False, solve_times
+            if termination.update(state):
+                return np.asarray(trajectory), True, step, False, solve_times
 
     return np.asarray(trajectory), False, len(trajectory) - 1, False, solve_times
 
@@ -282,12 +291,13 @@ def _load_checkpoint_policy_components(
     Mapping[str, torch.Tensor],
     int,
     int,
+    int,
     UnetConfig,
     int,
 ]:
-    """Load a metadata checkpoint and resolve its state/action/network-size schema.
+    """Load a metadata checkpoint and resolve its observation/action/network-size schema.
 
-    Returns (checkpoint, state_dict, state_dim, action_dim, unet,
+    Returns (checkpoint, state_dict, cond_dim, action_dim, history_length, unet,
     prediction_horizon).
     """
     checkpoint = torch.load(model_dir, map_location=device, weights_only=True)
@@ -303,7 +313,7 @@ def _load_checkpoint_policy_components(
 
     prediction_horizon = int(checkpoint.get("prediction_horizon", 1))
 
-    state_dim, action_dim = resolve_checkpoint_observation_dimensions(
+    cond_dim, action_dim, history_length = resolve_checkpoint_observation_dimensions(
         checkpoint, simulator, policy_type
     )
     unet_raw = checkpoint.get("unet")
@@ -316,8 +326,9 @@ def _load_checkpoint_policy_components(
     return (
         checkpoint,
         state_dict,
-        state_dim,
+        cond_dim,
         action_dim,
+        history_length,
         unet,
         prediction_horizon,
     )
@@ -334,14 +345,16 @@ def load_policy(
 
     ``planner_config`` is the validated expert config a ``safeflow`` policy builds its projector from.
     """
-    checkpoint, state_dict, state_dim, action_dim, unet, prediction_horizon = (
+    checkpoint, state_dict, cond_dim, action_dim, history_length, unet, prediction_horizon = (
         _load_checkpoint_policy_components(model_dir, simulator, policy_type, device)
     )
     flow_config = checkpoint["flow_config"]
     spec = PolicySpec(
         policy_type=policy_type,
         action_dim=action_dim,
-        state_dim=state_dim,
+        cond_dim=cond_dim,
+        history_length=history_length,
+        execution_horizon=int(checkpoint.get("execution_horizon", 1)),  # absent: a run that executed one step per call
         prediction_horizon=prediction_horizon,
         unet_dim=unet.dim,
         unet_dim_mults=unet.dim_mults,
@@ -713,7 +726,7 @@ def main():
     parser.add_argument(
         "--config",
         type=str,
-        default=os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml"),
+        default=os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml"),
         help="expert yaml config (default: %(default)s)",
     )
     parser.add_argument(

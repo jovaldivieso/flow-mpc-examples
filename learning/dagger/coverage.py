@@ -1,6 +1,6 @@
 """How well the data covers the episodes a policy is asked to solve.
 
-The policy sees the observation ``[goal in the TCP frame, bounding sphere centers, state]``, so a start whose observation
+The policy sees the observation ``[goal in the TCP frame, bounding sphere centers, history of positions]``, so a start whose observation
 has no near neighbour among the observations of the dataset is one the policy has no example of. ``DatasetCoverage``
 measures the distance of the observations of the starts of an evaluation to their nearest neighbour in the dataset, in
 units of the standard deviation of every observation component, against the same distance of the first observations of
@@ -52,10 +52,10 @@ class DatasetCoverage:
     @classmethod
     def from_dataset(cls, root: Path) -> DatasetCoverage:
         """The coverage of the LeRobot dataset at ``root`` (the episodes of every parquet file)."""
-        columns = ["episode_index", "observation.environment_state", "observation.state"]
+        columns = ["episode_index", "observation.environment_state", "observation.history"]
         frames = pd.concat([pd.read_parquet(path, columns=columns) for path in sorted(root.glob("data/**/*.parquet"))])
         observations = np.concatenate(
-            [np.stack(frames["observation.environment_state"].to_numpy()), np.stack(frames["observation.state"].to_numpy())],
+            [np.stack(frames["observation.environment_state"].to_numpy()), np.stack(frames["observation.history"].to_numpy())],
             axis=1,
         )
         return cls(observations, frames["episode_index"].to_numpy())

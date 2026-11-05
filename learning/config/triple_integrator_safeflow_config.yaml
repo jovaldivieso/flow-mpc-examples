@@ -4,6 +4,7 @@ model:
 
   flow:
     num_inference_steps: 3      # Euler integration steps for ODE sampling
+    history_length: 10          # last positions of the arm (the current one last) the policy is conditioned on, as in SafeFlowMPC
 
   # Only used by the safeflow policy
   safeflow:

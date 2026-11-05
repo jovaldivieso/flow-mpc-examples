@@ -2,9 +2,9 @@
 calibrate the pipeline.
 
 Goal   g = target position
-Observation o = [g, x], what the planners read. The point mass has no position limits, so it is translation-invariant and
-the policy sees nothing in world coordinates (``policy_observation``): the goal relative to the point, ``g - p``, as
-``observation.environment_state`` and the velocity and acceleration as ``observation.state``.
+Observation o = [g, x], what the planners read. The policy sees the goal relative to the point, ``g - p``, as
+``observation.environment_state``, the state as ``observation.state`` and the history of positions
+(``policy_observation``).
 """
 
 from typing import Any, Mapping
@@ -126,21 +126,20 @@ class PointMassSystem(TripleIntegratorBase):
         """The point mass is its own bounding sphere: it collides when that sphere penetrates an obstacle."""
         return not self.collision.is_collision_free(np.asarray(state, dtype=float)[: self.n])
 
-    def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """What the policy sees: the goal relative to the point, ``g - p``, and the velocity and acceleration. Nothing
-        is in world coordinates, which the unbounded dynamics make irrelevant."""
+    def policy_observation(self, obs: np.ndarray, history: np.ndarray) -> dict[str, np.ndarray]:
+        """What the policy sees: the goal relative to the point, ``g - p``, the state and the history of positions."""
         obs_array = np.asarray(obs, dtype=np.float32)
         goal, state = obs_array[: self.n], obs_array[self.n :]
-        return {"observation.environment_state": goal - state[: self.n], "observation.state": state[self.n :]}
-
-    def state_from_policy(self, state: np.ndarray) -> np.ndarray:
-        """The plant state of the velocity and acceleration the policy sees, with the point at the origin: where it is
-        does not matter to the dynamics."""
-        return np.concatenate([np.zeros(self.n), np.asarray(state, dtype=float)])
+        return {
+            "observation.environment_state": goal - state[: self.n],
+            "observation.state": state,
+            "observation.history": np.asarray(history, dtype=np.float32),
+        }
 
     def observation_from_policy(self, environment_state: np.ndarray, state: np.ndarray) -> np.ndarray:
-        """An observation ``[goal, x]`` that gives this policy observation, with the point at the origin."""
-        return np.concatenate([np.asarray(environment_state, dtype=float), self.state_from_policy(state)])
+        """The observation ``[g, x]`` of a policy observation: the goal is the relative goal from the point."""
+        state_array = np.asarray(state, dtype=float)
+        return np.concatenate([np.asarray(environment_state, dtype=float) + state_array[: self.n], state_array])
 
     @property
     def coordinate_names(self) -> list[str]:
@@ -152,7 +151,7 @@ class PointMassSystem(TripleIntegratorBase):
 
     @property
     def state_names(self) -> list[str]:
-        return [f"{name}.{kind}" for kind in ("vel", "acc") for name in self.coordinate_names]
+        return [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self.coordinate_names]
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
         """Sample a random collision-free position inside the workspace."""

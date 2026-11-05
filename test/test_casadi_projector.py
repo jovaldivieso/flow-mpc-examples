@@ -6,126 +6,102 @@ import unittest
 import warnings
 
 import numpy as np
-import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.config import validate_system_config
-from systems.franka_system import Q_READY, FrankaSystem
-from planning.casadi_planner import CasadiPlanner
 from planning.casadi_graph import GraphSolution
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.casadi_projector import CasadiTrajectoryProjector, Projection
 from planning.planner import PlannerSolveError
-from planning.planner_config import PlannerConfig
-from test.planner_fixtures import pose_goal
+from planning.planner_config import ProjectionConfig
+from systems.franka_system import FrankaSystem
+from test.planner_fixtures import pinned_config, rest_state
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
-
-# Behaviour tests pin the settings they depend on, so tuning scripts/config/franka_casadi_config.yaml cannot break them
-PINNED_EXPERT_SETTINGS = {
-    "Q_diag": [20.0] * 7 + [2.0] * 7 + [0.2] * 7,
-    "R_diag": [4.4e-3] * 7,
-    "terminal_cost_multiplier": 10.0,
-    "pos_tol": 0.002,
-    "vel_tol": 0.02,
-}
 HORIZON = 10
 
 
-def _validated_config(**overrides) -> dict:
-    with open(CONFIG_PATH) as f:
-        raw_config = yaml.safe_load(f)
-    raw_config.update(PINNED_EXPERT_SETTINGS)
-    raw_config.update(overrides)
-    return validate_system_config(raw_config=raw_config)
+def _hold_reference(state: np.ndarray, horizon: int = HORIZON) -> np.ndarray:
+    """The reference (horizon, n) that stays at the configuration of ``state``."""
+    return np.tile(state[:7], (horizon, 1))
 
 
-def _rest_state(simulator: FrankaSystem) -> np.ndarray:
-    """Ready pose with the wrist turned by 0.3 rad, at rest."""
-    q = Q_READY.copy()
-    q[6] += 0.3
-    return np.concatenate([q, np.zeros(2 * simulator.n)])
+def _moving_reference(simulator: FrankaSystem, state: np.ndarray, horizon: int = HORIZON) -> np.ndarray:
+    """A reference that starts a motion of joint 1 and does not come to rest within the horizon."""
+    jerks = np.zeros((horizon, simulator.nu))
+    jerks[:3, 0] = 8.0
+    return simulator.rollout_positions(state, jerks)[1:]
 
 
-def _zero_chunk(horizon: int = HORIZON) -> np.ndarray:
-    """A chunk of zero jerks (horizon, nu): from rest, it stays at rest."""
-    return np.zeros((horizon, 7))
+def _rest_to_rest_reference(state: np.ndarray, amplitude: float = 0.2, horizon: int = HORIZON) -> np.ndarray:
+    """A quintic move of joint 1 by ``amplitude`` rad over the horizon, from rest to rest: within the plant's limits."""
+    tau = np.arange(1, horizon + 1) / horizon
+    reference = _hold_reference(state, horizon)
+    reference[:, 0] += amplitude * (10 * tau**3 - 15 * tau**4 + 6 * tau**5)
+    return reference
 
 
-def _moving_chunk(horizon: int = HORIZON) -> np.ndarray:
-    """A proposal that starts a motion of joint 1 and does not come to rest within the horizon."""
-    chunk = _zero_chunk(horizon)
-    chunk[:3, 0] = 8.0
-    return chunk
+def _forced_failure():
+    raise RuntimeError("forced failure")
 
 
 class ProjectorFailClosedFallbackTests(unittest.TestCase):
-    """Returning the unprojected proposal on any solve failure bypasses every
-    constraint the projector exists to enforce. The projector falls back to
-    the last known-safe trajectory (SafeFlowMPC Theorem 2) whenever one
-    exists, and at the start of an episode (Assumption 2) to holding still,
-    which is safe when the arm is at rest and clear of the obstacles. Where
-    there is no safe trajectory it raises PlannerSolveError instead of
-    fabricating a fallback with no safety basis.
+    """A failed solve never returns the unprojected reference. The projector falls back to the last known-safe plan
+    (SafeFlowMPC Theorem 2) whenever one exists, and at the start of an episode (Assumption 2) to holding still, which is
+    safe when the arm is at rest and clear of the obstacles. Where there is no safe plan it raises PlannerSolveError.
     """
 
     def setUp(self) -> None:
-        config = _validated_config(terminal_velocity_weight=500.0)
-        # An amplified terminal_velocity_weight makes the projector settle at
-        # rest: the terminal-rest condition is a soft cost, not a hard
-        # constraint, and these tests need a genuinely resting cached
-        # trajectory to fall back on.
+        # A large terminal_velocity_weight makes the projector settle at rest: the terminal rest is a soft cost, and
+        # these tests need a genuinely resting cached plan to fall back on
+        config = pinned_config(terminal_velocity_weight=500.0)
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(config), horizon=HORIZON)
-        self.state0 = _rest_state(self.simulator)
-        self.q_ref = _zero_chunk()
+        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
+        self.state0 = rest_state(self.simulator)
+        self.q_ref = _hold_reference(self.state0)
 
     def _perturbed_state(self, offset: float) -> np.ndarray:
-        # Perturb joint positions only: leaves the certified-zero terminal velocity untouched
+        # Joint positions only: the terminal velocity of the cached plan stays at rest
         state = self.state0.copy()
         state[: self.simulator.n] += offset
         return state
 
-    def test_falls_back_to_last_safe_trajectory_when_one_exists(self) -> None:
+    def test_falls_back_to_last_safe_plan_when_one_exists(self) -> None:
         self.projector.project(self.state0, self.q_ref)
         self.assertIsNotNone(self.projector._prev_U_sol)
-        # Matches project()'s own fallback padding: the shifted plan's
-        # extra final slot is zero action (holds the certified-at-rest
-        # terminal state), not a duplicate of the last applied action.
+        # the shifted plan ends with a zero jerk, which holds the rest state it ends in
         shifted_actions = np.hstack([self.projector._prev_U_sol[:, 1:], np.zeros((self.simulator.nu, 1))])
         perturbed_state = self._perturbed_state(0.005)
-        expected_plan = self.projector._revalidate_fallback(perturbed_state, shifted_actions)
-        self.assertIsNotNone(expected_plan)
+        expected = self.projector._revalidate_fallback(perturbed_state, shifted_actions)
+        self.assertIsNotNone(expected)
 
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            fallback_chunk = self.projector.project(perturbed_state, self.q_ref)
+            fallback = self.projector.project(perturbed_state, self.q_ref)
 
-        np.testing.assert_allclose(fallback_chunk, shifted_actions.T)
+        np.testing.assert_allclose(fallback.actions, shifted_actions.T)
+        np.testing.assert_allclose(fallback.positions, expected[: self.simulator.n, 1:].T)
         self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
 
     def test_a_cold_start_failure_holds_still_when_at_rest_and_clear_of_the_obstacles(self) -> None:
-        # No previously-solved safe trajectory exists (first call ever, or right after reset()): the safe trajectory of
-        # Assumption 2 is holding still, never the unprojected proposal.
+        # No solved plan exists (first call, or right after reset): the safe plan of Assumption 2 is holding still
         self.projector.reset()
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            chunk = self.projector.project(self.state0, self._moving_proposal())
+            plan = self.projector.project(self.state0, _moving_reference(self.simulator, self.state0))
 
-        np.testing.assert_array_equal(chunk, _zero_chunk())
+        np.testing.assert_array_equal(plan.actions, np.zeros((HORIZON, self.simulator.nu)))
+        np.testing.assert_allclose(plan.positions, _hold_reference(self.state0), atol=1e-12)
         self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
         self.assertIsNotNone(self.projector._prev_U_sol)  # the next tick shifts the plan that was held
 
     def test_a_cold_start_failure_raises_when_holding_still_is_not_safe(self) -> None:
-        # In motion, holding still (zero jerk) does not come to rest within the horizon: no safe trajectory, so the
-        # failure is loud instead of returning the unverified, unprojected proposal.
+        # In motion, holding still (zero jerk) does not come to rest within the horizon: no safe plan
         moving = self.state0.copy()
         moving[self.simulator.n] = 0.5
         self.projector.reset()
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with self.assertRaises(PlannerSolveError):
             self.projector.project(moving, self.q_ref)
 
@@ -144,43 +120,25 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
 
         self.assertEqual(len(solves), 1)
 
-    def _moving_proposal(self) -> np.ndarray:
-        return _moving_chunk()
-
     def test_consecutive_fallbacks_stay_at_rest_instead_of_drifting_away(self) -> None:
-        # Regression test for padding the fallback's extra control slot with
-        # a duplicate of the *last applied* action instead of zero (the
-        # action that actually sustains the certified at-rest terminal
-        # state). A run of consecutive failures across genuinely different
-        # ticks (a new x0 each time, so each hits the shift-and-pad branch,
-        # not the same-tick reuse-as-is branch) must keep the fallback's own
-        # terminal velocity bounded, not drifting further away with each
-        # additional fallback.
+        # Across ticks with a new x0 each time, every fallback pads its plan with zero jerk, so the terminal velocity
+        # stays at rest however many fallbacks follow one another
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
                 self.projector.project(self._perturbed_state(0.001 * i), self.q_ref)
         terminal_velocity = self.projector._prev_X_sol[self.projector.rest_idx, self.projector.N]
-        # Not 0.0 to machine precision: the terminal-rest condition is a
-        # soft cost, so the cached solve only ever settles *close to*
-        # rest, never exactly -- fallback_terminal_velocity_tol is precisely
-        # the bound _revalidate_fallback itself already enforces on this
-        # quantity every time it accepts a fallback.
-        np.testing.assert_allclose(terminal_velocity, 0.0, atol=self.projector.fallback_terminal_velocity_tol)
+        # the terminal rest is a soft cost: a plan settles close to rest, within the bound the revalidation enforces
+        np.testing.assert_allclose(terminal_velocity, 0.0, atol=self.projector.config.fallback_terminal_velocity_tol)
 
     def test_exceeding_max_consecutive_fallbacks_raises_instead_of_coasting_indefinitely(self) -> None:
-        # A fallback accepted within fallback_terminal_velocity_tol is
-        # coasting at a small residual velocity, not genuinely at rest; each
-        # individual reuse is only checked through its own horizon. An
-        # unbroken run of them would otherwise let that drift keep
-        # accumulating for as long as real solves keep failing.
-        # max_consecutive_fallbacks bounds it: one more consecutive fallback
-        # than the default (5) must raise rather than be accepted.
-        self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
+        # A fallback accepted within fallback_terminal_velocity_tol coasts at a small residual velocity; an unbroken run of
+        # them would let that accumulate, so one more than max_consecutive_fallbacks raises
+        self.assertEqual(self.projector.config.max_consecutive_fallbacks, 5)
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for i in range(1, 6):
@@ -189,31 +147,85 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
                 self.projector.project(self._perturbed_state(0.006), self.q_ref)
 
     def test_repeated_same_tick_calls_do_not_each_consume_the_fallback_budget(self) -> None:
-        # select_action() calls project() once per flow/Euler denoising step
-        # -- several times per real control tick, all at the *same* x0 (only
-        # the proposal changes as the flow network refines it). None of
-        # those represent additional elapsed time or drift, so repeating
-        # far more of them than max_consecutive_fallbacks allows must not
-        # raise, as long as it's genuinely the same tick throughout.
-        self.assertEqual(self.projector.max_consecutive_fallbacks, 5)
+        # The flow calls project once per Euler step, several times per control tick at the same x0 (only the reference
+        # is refined): none of them is more elapsed time or drift
         self.projector.project(self.state0, self.q_ref)
-        self.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
+        self.projector._graph._solve_once = _forced_failure
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             for _ in range(20):  # far more than max_consecutive_fallbacks (5)
                 self.projector.project(self.state0, self.q_ref)
         self.assertEqual(self.projector._consecutive_fallback_count, 0)
 
+    def test_a_held_arm_that_keeps_failing_falls_back_for_the_budget_and_then_raises(self) -> None:
+        # An arm held at rest has the same state tick after tick, so only begin_tick tells the ticks apart: each of them
+        # consumes the budget, and one more than max_consecutive_fallbacks raises instead of holding still forever
+        self.projector.project(self.state0, self.q_ref)
+        self.projector._graph._solve_once = _forced_failure
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for _ in range(self.projector.config.max_consecutive_fallbacks):
+                self.projector.begin_tick()
+                plan = self.projector.project(self.state0, self.q_ref)
+                self.assertEqual((plan.positions.shape, plan.actions.shape), ((HORIZON, 7), (HORIZON, self.simulator.nu)))
+            self.projector.begin_tick()
+            with self.assertRaises(PlannerSolveError):
+                self.projector.project(self.state0, self.q_ref)
+
+    def test_the_flow_steps_of_a_tick_after_begin_tick_do_not_each_consume_the_budget(self) -> None:
+        self.projector.project(self.state0, self.q_ref)
+        self.projector._graph._solve_once = _forced_failure
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.projector.begin_tick()
+            for _ in range(20):  # the flow steps of one tick, the state the same
+                self.projector.project(self.state0, self.q_ref)
+        self.assertEqual(self.projector._consecutive_fallback_count, 1)
+
+    def test_a_tick_that_starts_from_the_hold_still_plan_is_not_solved_a_second_time_from_it(self) -> None:
+        self.projector.reset()
+        solves = []
+
+        def failing_solve():
+            solves.append(1)
+            raise RuntimeError("forced failure")
+
+        self.projector._graph._solve_once = failing_solve
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.projector.project(self.state0, self.q_ref)  # the cold start holds still, and falls back to it
+            solves.clear()
+            self.projector.begin_tick()
+            self.projector.project(self.state0, self.q_ref)  # the warm guess now is the hold-still plan
+
+        self.assertEqual(len(solves), 1)
+
+    def test_a_warm_start_that_is_not_the_hold_still_plan_gets_a_cold_restart(self) -> None:
+        self.projector.project(self.state0, _moving_reference(self.simulator, self.state0))  # a plan that moves
+        solves = []
+        real_solve = self.projector._graph._solve_once
+
+        def failing_then_real():
+            solves.append(1)
+            if len(solves) == 1:
+                raise RuntimeError("the warm start fails")
+            return real_solve()
+
+        self.projector._graph._solve_once = failing_then_real
+        self.projector.begin_tick()
+        self.projector.project(self._perturbed_state(0.001), self.q_ref)
+
+        self.assertEqual(len(solves), 2)
+
 
 class FallbackRevalidationTests(unittest.TestCase):
-    """_revalidate_fallback re-checks a reused plan against everything the
-    live solve enforces, not only the state bounds and the terminal rest."""
+    """_revalidate_fallback re-checks a reused plan against what the live solve enforces."""
 
     def setUp(self) -> None:
-        config = _validated_config(terminal_velocity_weight=500.0)
+        config = pinned_config(terminal_velocity_weight=500.0)
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(config), horizon=HORIZON)
-        self.state0 = _rest_state(self.simulator)
+        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
+        self.state0 = rest_state(self.simulator)
         self.u_rest = np.zeros((self.simulator.nu, HORIZON))
 
     def test_accepts_a_resting_plan(self) -> None:
@@ -226,173 +238,283 @@ class FallbackRevalidationTests(unittest.TestCase):
         moving[0, :] = 5.0
         self.assertIsNone(self.projector._revalidate_fallback(self.state0, moving))
 
+    def test_rejects_a_plan_that_penetrates_an_obstacle(self) -> None:
+        simulator = FrankaSystem(
+            pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
+        )
+        projector = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
 
-class ProjectionFeasibilityTests(unittest.TestCase):
+        self.assertFalse(simulator.collision.is_collision_free(self.state0[:7]))
+        self.assertIsNone(projector._revalidate_fallback(self.state0, self.u_rest))
+
+    def test_without_the_safety_filter_a_plan_need_not_end_at_rest(self) -> None:
+        no_rest = CasadiTrajectoryProjector(self.simulator, ProjectionConfig(), horizon=HORIZON, safe=False)
+        moving = self.u_rest.copy()
+        moving[0, :3] = 5.0  # ends in motion
+
+        self.assertIsNotNone(no_rest._revalidate_fallback(self.state0, moving))
+        self.assertIsNone(self.projector._revalidate_fallback(self.state0, moving))
+
+    def test_without_the_safety_filter_a_plan_through_an_obstacle_is_accepted(self) -> None:
+        simulator = FrankaSystem(
+            pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
+        )
+        no_obstacles = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON, safe=False)
+
+        self.assertIsNotNone(no_obstacles._revalidate_fallback(self.state0, self.u_rest))
+
+
+class ProjectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.config = _validated_config()
+        cls.config = pinned_config()
+        cls.projection_config = ProjectionConfig.from_mapping(cls.config)
         cls.simulator = FrankaSystem(cls.config)
-        cls.projector = CasadiTrajectoryProjector(cls.simulator, PlannerConfig.from_mapping(cls.config), horizon=HORIZON)
+        cls.projector = CasadiTrajectoryProjector(cls.simulator, cls.projection_config, horizon=HORIZON)
 
-    def test_projection_of_a_resting_reference_at_rest_stays_put(self) -> None:
+    def setUp(self) -> None:
         self.projector.reset()
-        state = _rest_state(self.simulator)
-        projected = self.projector.project(state, _zero_chunk())
-        np.testing.assert_allclose(projected, _zero_chunk(), atol=1e-3)
 
-    def test_projected_chunks_are_feasible_for_the_plant_even_for_infeasible_proposals(self) -> None:
+    def test_a_projection_holds_the_positions_and_actions_of_the_plan(self) -> None:
+        state = rest_state(self.simulator)
+
+        projection = self.projector.project(state, _rest_to_rest_reference(state))
+
+        self.assertIsInstance(projection, Projection)
+        self.assertEqual((projection.positions.shape, projection.actions.shape), ((HORIZON, 7), (HORIZON, self.simulator.nu)))
+        np.testing.assert_allclose(projection.positions, self.simulator.rollout_positions(state, projection.actions)[1:], atol=1e-5)
+
+    def test_the_projection_of_a_holding_reference_at_rest_stays_put(self) -> None:
+        state = rest_state(self.simulator)
+
+        projection = self.projector.project(state, _hold_reference(state))
+
+        np.testing.assert_allclose(projection.positions, _hold_reference(state), atol=1e-4)
+        np.testing.assert_allclose(projection.actions, 0.0, atol=1e-2)
+
+    def test_a_feasible_rest_to_rest_reference_is_tracked_closely(self) -> None:
+        state = rest_state(self.simulator)
+        reference = _rest_to_rest_reference(state)
+
+        projection = self.projector.project(state, reference)
+
+        np.testing.assert_allclose(projection.positions, reference, atol=0.05)  # the soft rest at the end gives a little way
+
+    def test_a_reference_far_from_reachable_gives_the_closest_reachable_plan_within_the_limits(self) -> None:
+        simulator, tolerance = self.simulator, 1e-5
+        state = rest_state(simulator)
+        reference = _hold_reference(state)
+        reference[:, 0] += 2.0  # a jump no jerk-limited arm makes
+
+        projection = self.projector.project(state, reference)
+
+        self.assertTrue(np.all(np.abs(projection.actions) <= simulator.max_action + tolerance))
+        self.assertGreater(projection.positions[-1, 0], state[0])  # it goes towards the reference
+        self.assertLess(projection.positions[-1, 0], reference[-1, 0] - 0.5)  # but cannot reach it
+        for q in self.simulator.rollout_states(state, projection.actions)[1:]:
+            self.assertTrue(np.all(q >= simulator.state_lower_bounds - tolerance) and np.all(q <= simulator.state_upper_bounds + tolerance))
+
+    def test_projected_plans_are_feasible_for_the_plant_even_for_unreachable_references(self) -> None:
         simulator = self.simulator
         tolerance = 1e-5  # the constraints hold up to the solver's tolerance
         for seed, scale in enumerate((0.05, 0.5, 3.0)):
             rng = np.random.default_rng(seed)
-            simulator.randomize_goal_for_reset(rng)
             x0 = simulator.random_initial_state(rng)
             self.projector.reset()
-            u_ref = rng.normal(0.0, scale, (HORIZON, simulator.nu)) * simulator.max_action
+            reference = x0[: simulator.n] + rng.normal(0.0, scale, (HORIZON, simulator.n))
 
-            projected = self.projector.project(x0, u_ref)
+            projection = self.projector.project(x0, reference)
 
-            self.assertEqual(projected.shape, u_ref.shape)
-            self.assertTrue(np.all(np.abs(projected) <= simulator.max_action + tolerance), scale)
+            self.assertEqual(projection.actions.shape, (HORIZON, simulator.nu))
+            self.assertTrue(np.all(np.abs(projection.actions) <= simulator.max_action + tolerance), scale)
             state = x0.copy()
-            for action in projected:  # the plant follows the projected actions
+            for action in projection.actions:  # the plant follows the projected actions
                 state = simulator.predict_next_state(state, action)
                 self.assertTrue(np.all(state >= simulator.state_lower_bounds - tolerance), scale)
                 self.assertTrue(np.all(state <= simulator.state_upper_bounds + tolerance), scale)
-            np.testing.assert_allclose(state[: simulator.n], self.projector._prev_X_sol[: simulator.n, -1], atol=1e-4)
+            np.testing.assert_allclose(state[: simulator.n], projection.positions[-1], atol=1e-4)
 
-    def test_unit_gaussian_noise_is_projected_without_failing(self) -> None:
-        # The flow starts from noise like this (scaled by the action limits): the cold start must not begin inside
-        # the constraints, where the solver ends in a locally infeasible point
+    def test_noise_around_the_arm_is_projected_without_failing(self) -> None:
+        # The flow starts from noise like this: the cold start must not begin inside the constraints, where the solver
+        # ends in a locally infeasible point
         simulator = self.simulator
-        state = _rest_state(simulator)
+        state = rest_state(simulator)
         for seed in range(6):
             self.projector.reset()
-            noise = np.random.default_rng(seed).normal(size=(HORIZON, simulator.nu)) * simulator.max_action
+            noise = np.random.default_rng(seed).normal(size=(HORIZON, simulator.n))
 
-            projected = self.projector.project(state, noise)
+            projection = self.projector.project(state, state[: simulator.n] + noise)
 
-            self.assertEqual(projected.shape, noise.shape)
+            self.assertEqual(projection.positions.shape, noise.shape)
 
-    def test_the_projection_stays_inside_the_joint_limits_the_proposal_ignores(self) -> None:
-        # A proposal that drives joint 5 into its upper limit at full jerk
+    def test_the_projection_stays_inside_the_joint_limits_the_reference_ignores(self) -> None:
         joint = 4
-        simulator = FrankaSystem(self.config)
-        projector = CasadiTrajectoryProjector(simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
-        state = _rest_state(simulator)
+        simulator = self.simulator
+        state = rest_state(simulator)
         upper = simulator.state_upper_bounds[joint]
         state[joint] = upper - 0.3
-        proposal = _zero_chunk()
-        proposal[:, joint] = simulator.max_action[joint]
+        reference = _hold_reference(state)
+        reference[:, joint] = upper + 0.5  # beyond the limit
 
-        projector.project(state, proposal)
+        projection = self.projector.project(state, reference)
 
-        self.assertLessEqual(projector._prev_X_sol[joint].max(), upper + 1e-6)
+        self.assertLessEqual(projection.positions[:, joint].max(), upper + 1e-6)
 
-    def test_a_feasible_plan_of_the_expert_is_tracked_closely(self) -> None:
-        # The projector only corrects what is unsafe: the first actions of a chunk the expert planned stay almost untouched,
-        # the later ones give way to the rest at the end of the horizon
-        simulator = self.simulator
-        simulator.set_goal(pose_goal(simulator, Q_READY))
-        state = _rest_state(simulator)
-        reference = CasadiPlanner(simulator, PlannerConfig.from_mapping(self.config)).plan(simulator.observe(state)).actions[:HORIZON]
-        self.projector.reset()
+    def test_the_safety_filter_makes_the_plan_slow_down_and_the_unsafe_one_not(self) -> None:
+        state = rest_state(self.simulator)
+        reference = _hold_reference(state)
+        reference[:, 0] += 0.15 * np.arange(1, HORIZON + 1)  # keeps moving: 1.5 rad/s
+        no_rest = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, safe=False)
 
-        projected = self.projector.project(state, reference)
+        rest_plan = self.projector.project(state, reference)
+        free_plan = no_rest.project(state, reference)
 
-        head = self.projector.full_weight_steps
-        np.testing.assert_allclose(projected[:head], reference[:head], atol=0.15 * simulator.max_action.max())
+        n = self.simulator.n
+        rest_velocity = abs(self.projector._prev_X_sol[n, -1])
+        free_velocity = abs(no_rest._prev_X_sol[n, -1])
+        self.assertLess(rest_velocity, 0.5 * free_velocity)
+        self.assertGreater(free_plan.positions[-1, 0], rest_plan.positions[-1, 0])
 
-    def test_the_executed_first_action_is_tracked_closer_with_decaying_weights_than_with_uniform_ones(self) -> None:
-        state = _rest_state(self.simulator)
-        proposal = _zero_chunk()
-        proposal[:, 0] = 5.0  # keeps accelerating, so the rest at the end costs deviation somewhere
-        uniform = CasadiTrajectoryProjector(
-            self.simulator, PlannerConfig.from_mapping({**self.config, "projection_full_weight_steps": HORIZON}), horizon=HORIZON
-        )
+    def test_without_the_safety_filter_the_limits_are_the_only_constraints(self) -> None:
+        simulator, tolerance = self.simulator, 1e-5
+        limits_only = CasadiTrajectoryProjector(simulator, self.projection_config, horizon=HORIZON, safe=False)
+        state = rest_state(simulator)
 
-        decaying = self.projector.project(state, proposal)[:, 0]
-        self.projector.reset()
-        flat = uniform.project(state, proposal)[:, 0]
+        plan = limits_only.project(state, _moving_reference(simulator, state))
 
-        self.assertLess(abs(decaying[0] - 5.0), abs(flat[0] - 5.0))
+        self.assertFalse(limits_only.safe)
+        self.assertTrue(np.all(np.abs(plan.actions) <= simulator.max_action + tolerance))
+        np.testing.assert_allclose(plan.positions, simulator.rollout_positions(state, plan.actions)[1:], atol=1e-5)
 
-    def test_the_next_chunk_guess_is_the_actions_shifted_by_one_step(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
+    def test_the_next_chunk_guess_is_the_positions_one_control_period_later(self) -> None:
+        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON)
         self.assertIsNone(projector.next_chunk_guess())
-        state = _rest_state(self.simulator)
-        projected = projector.project(state, _moving_chunk())
+        state = rest_state(self.simulator)
 
+        projection = projector.project(state, _rest_to_rest_reference(state))
         guess = projector.next_chunk_guess()
 
-        self.assertEqual(guess.shape, (HORIZON, self.simulator.nu))
-        np.testing.assert_allclose(guess[:-1], projected[1:])
-        np.testing.assert_array_equal(guess[-1], 0.0)  # zero jerk keeps the rest state the plan ends in
+        self.assertEqual(guess.shape, (HORIZON, self.simulator.n))
+        np.testing.assert_allclose(guess[:-1], projection.positions[1:])
+        np.testing.assert_allclose(guess[-1], projection.positions[-1])  # the last row is held
         projector.reset()
         self.assertIsNone(projector.next_chunk_guess())
 
-    def test_a_chunk_of_the_wrong_shape_is_rejected(self) -> None:
-        state = _rest_state(self.simulator)
+    def test_the_next_chunk_guess_is_shifted_by_the_tick_steps(self) -> None:
+        tick_steps = 3
+        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        state = rest_state(self.simulator)
+
+        projection = projector.project(state, _rest_to_rest_reference(state))
+        guess = projector.next_chunk_guess()
+
+        self.assertEqual(guess.shape, (HORIZON, self.simulator.n))
+        np.testing.assert_allclose(guess[: HORIZON - tick_steps], projection.positions[tick_steps:])
+        np.testing.assert_allclose(guess[HORIZON - tick_steps :], np.tile(projection.positions[-1], (tick_steps, 1)))
+
+    def test_the_tick_steps_are_between_one_and_the_horizon(self) -> None:
+        for tick_steps in (0, -1, HORIZON + 1):
+            with self.subTest(tick_steps=tick_steps), self.assertRaises(ValueError):
+                CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        self.assertEqual(CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=HORIZON).tick_steps, HORIZON)
+
+    def test_the_warm_start_of_a_new_tick_is_shifted_by_the_tick_steps(self) -> None:
+        tick_steps = 3
+        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        state = rest_state(self.simulator)
+        reference = _rest_to_rest_reference(state)
+        projector.project(state, reference)
+        previous_states, previous_actions = projector._prev_X_sol, projector._prev_U_sol
+        guesses = []
+        real_set_initial = projector._graph.set_initial
+        projector._graph.set_initial = lambda states, actions: guesses.append((states, actions)) or real_set_initial(states, actions)
+
+        projector.begin_tick()
+        projector.project(state, reference)
+
+        states, actions = guesses[0]
+        np.testing.assert_allclose(states[:, : HORIZON + 1 - tick_steps], previous_states[:, tick_steps:])
+        np.testing.assert_allclose(states[:, HORIZON + 1 - tick_steps :], np.tile(previous_states[:, -1:], (1, tick_steps)))
+        np.testing.assert_allclose(actions[:, : HORIZON - tick_steps], previous_actions[:, tick_steps:])
+        np.testing.assert_array_equal(actions[:, HORIZON - tick_steps :], np.zeros((self.simulator.nu, tick_steps)))
+
+    def test_a_reference_of_the_wrong_shape_is_rejected(self) -> None:
+        state = rest_state(self.simulator)
         with self.assertRaises(ValueError):
-            self.projector.project(state, _zero_chunk().T)
+            self.projector.project(state, _hold_reference(state).T)
+        with self.assertRaises(ValueError):
+            self.projector.project(state[:7], _hold_reference(state))
 
     def test_short_horizon_constructs_and_solves(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=2)
-        state = _rest_state(self.simulator)
-        projected = projector.project(state, _zero_chunk(2))
-        self.assertEqual(projected.shape, (2, self.simulator.nu))
+        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=2)
+        state = rest_state(self.simulator)
+
+        projection = projector.project(state, _hold_reference(state, 2))
+
+        self.assertEqual((projection.positions.shape, projection.actions.shape), ((2, 7), (2, self.simulator.nu)))
 
     def test_the_projector_ignores_the_goal_of_the_simulator_it_was_built_on(self) -> None:
-        # The projector takes no goal, and no projector cost or constraint reads it, so whatever goal the simulator
-        # holds (here none that is a pose at all) must not change the projection.
-        simulator = FrankaSystem(self.config)
+        # No projector cost or constraint reads the goal, so whatever goal the simulator holds must not change the plan
         other = FrankaSystem(self.config)
         other.set_goal(np.zeros_like(other.goal))
-        projector = CasadiTrajectoryProjector(other, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
-        reference = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
-        state = _rest_state(simulator)
-        u_ref = np.random.default_rng(5).normal(0.0, 0.3, (HORIZON, simulator.nu)) * simulator.max_action
+        projector = CasadiTrajectoryProjector(other, self.projection_config, horizon=HORIZON)
+        state = rest_state(self.simulator)
+        reference = state[:7] + np.random.default_rng(5).normal(0.0, 0.1, (HORIZON, 7))
+
         np.testing.assert_allclose(
-            projector.project(state, u_ref),
-            reference.project(state, u_ref),
-            atol=1e-6,
+            projector.project(state, reference).positions, self.projector.project(state, reference).positions, atol=1e-6
         )
 
     def test_a_projector_needs_a_horizon(self) -> None:
-        # Its scalar settings are validated when the config is loaded (test_planner_config)
+        # Its scalar settings are validated when the config is built (test_planner_config)
         with self.assertRaises(ValueError):
-            CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=0)
+            CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=0)
 
-    def test_projector_pushes_an_obstacle_colliding_proposal_outside_the_sphere(self) -> None:
-        state = _rest_state(self.simulator)
-        proposal = _moving_chunk()
-        rollout_q = self.simulator.rollout_positions(state, proposal)
-        target_tcp = self.simulator.tcp_position(rollout_q[-1]).tolist()
+    def test_the_weights_of_the_config_shape_the_plan(self) -> None:
+        state = rest_state(self.simulator)
+        reference = _rest_to_rest_reference(state, amplitude=1.0)
+        heavy = CasadiTrajectoryProjector(
+            self.simulator, ProjectionConfig(jerk_weight=1.0, velocity_weight=1.0, acceleration_weight=1.0), horizon=HORIZON
+        )
 
-        obs_config = _validated_config(obstacles=[{"position": target_tcp, "radius": 0.05}])
-        obs_sim = FrankaSystem(obs_config)
-        self.assertTrue(obs_sim.collision.is_collision_free(state))
-        self.assertFalse(obs_sim.collision.is_collision_free(rollout_q[-1]))
+        light_plan = self.projector.project(state, reference)
+        heavy_plan = heavy.project(state, reference)
 
-        projector = CasadiTrajectoryProjector(obs_sim, PlannerConfig.from_mapping(obs_config), horizon=HORIZON)
-        projected = projector.project(state, proposal)
-        projected_q = obs_sim.rollout_positions(state, projected)
-        for q in projected_q[1:]:
-            self.assertTrue(obs_sim.collision.is_collision_free(q), "projected trajectory collided with obstacle")
+        self.assertGreater(np.abs(light_plan.positions[-1, 0] - state[0]), np.abs(heavy_plan.positions[-1, 0] - state[0]))
 
 
-class PerStepProjectionTests(unittest.TestCase):
-    """Every Euler step is a converged solve, linearized along its own proposal, whose solution has to clear the obstacles."""
+class ObstacleProjectionTests(unittest.TestCase):
+    """With obstacles, the plan of every solve is a collision-free one, linearized along its own reference."""
 
     def setUp(self) -> None:
-        self.state = _rest_state(FrankaSystem(_validated_config()))
-        rollout_q = FrankaSystem(_validated_config()).rollout_positions(self.state, _moving_chunk())
-        self.config = _validated_config(
-            terminal_velocity_weight=500.0,
-            obstacles=[{"position": FrankaSystem(_validated_config()).tcp_position(rollout_q[-1]).tolist(), "radius": 0.05}],
+        free = FrankaSystem(pinned_config())
+        self.state = rest_state(free)
+        reference = _moving_reference(free, self.state)
+        self.reference = reference
+        self.config = pinned_config(
+            terminal_velocity_weight=500.0, obstacles=[{"position": free.tcp_position(reference[-1]).tolist(), "radius": 0.05}]
         )
         self.simulator = FrankaSystem(self.config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, PlannerConfig.from_mapping(self.config), horizon=HORIZON)
+        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(self.config), horizon=HORIZON)
+
+    def test_the_reference_runs_into_the_obstacle_and_the_plan_does_not(self) -> None:
+        self.assertTrue(self.simulator.collision.is_collision_free(self.state[:7]))
+        self.assertFalse(self.simulator.collision.is_collision_free(self.reference[-1]))
+
+        plan = self.projector.project(self.state, self.reference)
+
+        self.assertTrue(self.simulator.collision.trajectory_is_collision_free(plan.positions))
+        for q in self.simulator.rollout_positions(self.state, plan.actions)[1:]:
+            self.assertTrue(self.simulator.collision.is_collision_free(q))
+
+    def test_without_the_safety_filter_the_obstacles_are_ignored(self) -> None:
+        no_obstacles = CasadiTrajectoryProjector(
+            self.simulator, ProjectionConfig.from_mapping(self.config), horizon=HORIZON, safe=False
+        )
+
+        plan = no_obstacles.project(self.state, self.reference)
+
+        self.assertFalse(self.simulator.collision.trajectory_is_collision_free(plan.positions))
 
     def test_the_obstacles_are_linearized_at_every_step(self) -> None:
         real_sets_along = self.simulator.collision.sets_along
@@ -400,15 +522,14 @@ class PerStepProjectionTests(unittest.TestCase):
         self.simulator.collision.sets_along = lambda q_current, q: calls.append(len(q)) or real_sets_along(q_current, q)
 
         for _ in range(3):  # the Euler steps of one tick
-            self.projector.project(self.state, _moving_chunk())
+            self.projector.project(self.state, self.reference)
 
         self.assertGreaterEqual(len(calls), 3)
 
-    def test_every_projection_clears_the_obstacles(self) -> None:
+    def test_every_projection_of_a_tick_clears_the_obstacles(self) -> None:
         for _ in range(3):
-            projected = self.projector.project(self.state, _moving_chunk())
-            for q in self.simulator.rollout_positions(self.state, projected)[1:]:
-                self.assertTrue(self.simulator.collision.is_collision_free(q))
+            plan = self.projector.project(self.state, self.reference)
+            self.assertTrue(self.simulator.collision.trajectory_is_collision_free(plan.positions))
 
     def test_a_solution_that_still_penetrates_an_obstacle_is_a_failed_projection(self) -> None:
         simulator = self.simulator
@@ -417,7 +538,7 @@ class PerStepProjectionTests(unittest.TestCase):
         self.projector._graph.solve = lambda: GraphSolution(at_start, np.zeros((simulator.nu, HORIZON)), penetrates=True)
 
         with self.assertRaises(PlannerSolveError):
-            self.projector.project(self.state, _moving_chunk())
+            self.projector.project(self.state, self.reference)
 
 
 if __name__ == "__main__":

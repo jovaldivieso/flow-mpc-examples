@@ -11,13 +11,12 @@ import yaml
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.casadi_graph import SLACK_TOLERANCE
 from planning.config import load_and_validate_system_config, validate_system_config
-from planning.planner_config import OmplConfig, PlannerConfig
+from planning.planner_config import ExpertConfig, ProjectionConfig
 from planning.planner_factory import PlannerFactory
 from systems.config_fields import ConfigurationError
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml")
 
 
 def _load_raw_config() -> dict:
@@ -25,155 +24,178 @@ def _load_raw_config() -> dict:
         return yaml.safe_load(f)
 
 
-class ProjectorTuningKeysReachValidatedConfigTests(unittest.TestCase):
-    """Regression coverage for a real gap: CasadiTrajectoryProjector reads
-    terminal_velocity_weight/fallback_terminal_velocity_tol/
-    max_consecutive_fallbacks off its planner_config (see
-    planning/casadi_projector.py), but validate_system_config's key
-    allowlist never listed them, so any expert YAML setting one was
-    silently either rejected outright or (if it slipped past that) just
-    never made it into the dict PolicyFactory hands the projector -- the
-    projector always fell back to its own hardcoded defaults regardless of
-    what the config said.
-    """
+class ExpertAndProjectionKeysReachValidatedConfigTests(unittest.TestCase):
+    """The expert and projection settings of a config are validated and reach the config the planners are built from."""
 
     def test_overridden_values_are_accepted_and_pass_through(self) -> None:
         raw_config = _load_raw_config()
-        raw_config["terminal_velocity_weight"] = 42.0
-        raw_config["projection_full_weight_steps"] = 5
-        raw_config["fallback_terminal_velocity_tol"] = 0.007
-        raw_config["max_consecutive_fallbacks"] = 3
+        raw_config.update(
+            {
+                "terminal_velocity_weight": 42.0,
+                "projection_velocity_weight": 0.5,
+                "projection_acceleration_weight": 0.25,
+                "projection_jerk_weight": 0.125,
+                "fallback_terminal_velocity_tol": 0.007,
+                "max_consecutive_fallbacks": 3,
+            }
+        )
 
         validated = validate_system_config(raw_config=raw_config)
 
         self.assertEqual(validated["terminal_velocity_weight"], 42.0)
-        self.assertEqual(validated["projection_full_weight_steps"], 5)
+        self.assertEqual(
+            (validated["projection_velocity_weight"], validated["projection_acceleration_weight"], validated["projection_jerk_weight"]),
+            (0.5, 0.25, 0.125),
+        )
         self.assertEqual(validated["fallback_terminal_velocity_tol"], 0.007)
         self.assertEqual(validated["max_consecutive_fallbacks"], 3)
 
-    def test_omitted_values_default_to_the_projectors_own_hardcoded_fallbacks(self) -> None:
-        # These three literals must stay in sync with
-        # CasadiTrajectoryProjector.__init__'s own config.get(..., <default>)
-        # calls -- a config that omits these keys must behave identically to
-        # before they were configurable.
+    def test_omitted_values_default_to_the_dataclass_defaults(self) -> None:
         raw_config = _load_raw_config()
-
-        validated = validate_system_config(raw_config=raw_config)
-
-        self.assertEqual(validated["terminal_velocity_weight"], 1.0)
-        self.assertEqual(validated["projection_full_weight_steps"], 3)
-        self.assertEqual(validated["fallback_terminal_velocity_tol"], 1e-2)
-        self.assertEqual(validated["max_consecutive_fallbacks"], 5)
-
-    def test_keys_outside_the_schema_are_rejected(self) -> None:
-        raw_config = _load_raw_config()
-        for key in ("joint_limit_margin", "collision_slack_penalty_weight", "task_weights", "mode", "path_length_weight"):
-            with self.subTest(key=key):
-                with self.assertRaises(ConfigurationError):
-                    validate_system_config(raw_config={**raw_config, key: 1.0})
-
-    def test_ompl_settings_default_when_omitted_and_reach_the_validated_config(self) -> None:
-        raw_config = _load_raw_config()
-        for key in OmplConfig.keys():
+        for key in ExpertConfig.keys() | ProjectionConfig.keys():
             raw_config.pop(key, None)
 
         validated = validate_system_config(raw_config=raw_config)
 
-        for key, default in asdict(OmplConfig()).items():
-            self.assertEqual(validated[key], default, key)
+        for name, default in asdict(ExpertConfig()).items():
+            self.assertEqual(validated[name], default, name)
+        for name, default in asdict(ProjectionConfig()).items():
+            self.assertEqual(validated[ProjectionConfig.key(name)], default, name)
 
-    def test_ompl_settings_of_the_config_are_passed_on(self) -> None:
-        raw_config = {**_load_raw_config(), "ompl_speed": 3.0, "ompl_seed": 7}
+    def test_the_expert_settings_of_the_config_are_passed_on(self) -> None:
+        raw_config = {**_load_raw_config(), "ompl_seed": 7, "horizon": 12, "totg_max_deviation": 0.1, "replan_distance": 0.3}
 
         validated = validate_system_config(raw_config=raw_config)
 
-        self.assertEqual((validated["ompl_speed"], validated["ompl_seed"]), (3.0, 7))
+        self.assertEqual((validated["ompl_seed"], validated["horizon"]), (7, 12))
+        self.assertEqual((validated["totg_max_deviation"], validated["replan_distance"]), (0.1, 0.3))
 
-    def test_the_expert_defaults_to_casadi_and_must_be_one_the_factory_has(self) -> None:
+    def test_keys_outside_the_schema_are_rejected(self) -> None:
+        raw_config = _load_raw_config()
+        for key in ("joint_limit_margin", "task_weights", "mode", "Q_diag", "R_diag", "R_weight", "ompl_speed", "plan_horizon"):
+            with self.subTest(key=key):
+                with self.assertRaises(ConfigurationError):
+                    validate_system_config(raw_config={**raw_config, key: 1.0})
+
+    def test_the_expert_defaults_to_ompl_casadi_and_must_be_one_the_factory_has(self) -> None:
         raw_config = _load_raw_config()
         raw_config.pop("expert", None)
-        self.assertEqual(validate_system_config(raw_config=raw_config)["expert"], "casadi")
+        self.assertEqual(validate_system_config(raw_config=raw_config)["expert"], "ompl_casadi")
         for name in PlannerFactory.names():
             self.assertEqual(validate_system_config(raw_config={**raw_config, "expert": name})["expert"], name)
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config={**raw_config, "expert": "rrt"})
 
-    def test_invalid_ompl_settings_are_rejected(self) -> None:
+    def test_invalid_expert_settings_are_rejected(self) -> None:
         raw_config = _load_raw_config()
         for key, value in (
-            ("ompl_speed", -1.0),
-            ("ompl_replan_distance", 0.0),
-            ("ompl_lookahead", 0.0),
+            ("horizon", 0),
             ("ompl_timeout", 0.0),
+            ("replan_distance", 0.0),
+            ("progress_window", -1.0),
+            ("totg_max_deviation", 0.0),
+            ("totg_velocity_scale", 0.0),
+            ("totg_velocity_scale", 1.5),
+            ("totg_acceleration_scale", 0.0),
+            ("totg_acceleration_scale", 1.5),
         ):
-            with self.subTest(key=key):
+            with self.subTest(key=key, value=value):
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config={**raw_config, key: value})
 
-    def test_the_chunk_length_is_not_an_expert_setting(self) -> None:
+    def test_invalid_projection_settings_are_rejected(self) -> None:
         raw_config = _load_raw_config()
-        raw_config["plan_horizon"] = 16
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
-
-    def test_non_positive_terminal_velocity_weight_is_rejected(self) -> None:
-        raw_config = _load_raw_config()
-        raw_config["terminal_velocity_weight"] = 0.0
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
-
-    def test_negative_fallback_terminal_velocity_tol_is_rejected(self) -> None:
-        raw_config = _load_raw_config()
-        raw_config["fallback_terminal_velocity_tol"] = -0.01
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
-
-    def test_non_positive_max_consecutive_fallbacks_is_rejected(self) -> None:
-        raw_config = _load_raw_config()
-        raw_config["max_consecutive_fallbacks"] = 0
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
+        for key, value in (
+            ("projection_velocity_weight", 0.0),
+            ("projection_acceleration_weight", -1.0),
+            ("projection_jerk_weight", 0.0),
+            ("terminal_velocity_weight", 0.0),
+            ("fallback_terminal_velocity_tol", -0.01),
+            ("max_consecutive_fallbacks", 0),
+        ):
+            with self.subTest(key=key, value=value):
+                with self.assertRaises(ConfigurationError):
+                    validate_system_config(raw_config={**raw_config, key: value})
 
 
-class PlannerConfigTests(unittest.TestCase):
-    """PlannerConfig parses and validates like OmplConfig: ``from_mapping`` reads, ``__post_init__`` checks."""
+class ExpertConfigTests(unittest.TestCase):
+    """ExpertConfig parses and validates: ``from_mapping`` reads, ``__post_init__`` checks."""
 
-    def test_defaults_and_the_r_diag_that_follows_the_r_weight(self) -> None:
-        planner = PlannerConfig.from_mapping({})
+    def test_defaults(self) -> None:
+        expert = ExpertConfig.from_mapping({})
 
-        self.assertEqual((planner.expert, planner.horizon, planner.r_weight), ("casadi", 20, 0.1))
-        self.assertEqual(planner.expert_slack_tolerance, SLACK_TOLERANCE)
-        self.assertEqual((planner.q_diag, planner.r_diag), ((), ()))  # the planner completes them for its system
-        self.assertEqual(PlannerConfig.from_mapping({"R_weight": 0.3}).r_weight, 0.3)
-        self.assertEqual(PlannerConfig.from_mapping({"R_diag": [1.0, 2.0]}).r_diag, (1.0, 2.0))
+        self.assertEqual((expert.expert, expert.horizon, expert.ompl_timeout, expert.ompl_seed), ("ompl_casadi", 20, 5.0, 0))
+        self.assertEqual((expert.replan_distance, expert.progress_window), (0.5, 1.5))
+        self.assertEqual((expert.totg_velocity_scale, expert.totg_acceleration_scale, expert.totg_max_deviation), (0.8, 0.5, 0.05))
 
     def test_what_the_mapping_sets_is_read(self) -> None:
-        planner = PlannerConfig.from_mapping(
-            {"expert": "ompl_casadi", "horizon": 7, "Q_diag": [1.0] * 6, "terminal_cost_multiplier": 3.0,
-             "terminal_velocity_weight": 2.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9,
-             "expert_slack_tolerance": 0.03},
-        )
+        expert = ExpertConfig.from_mapping({"expert": "ompl_casadi", "horizon": 7, "ompl_seed": 3, "totg_velocity_scale": 1.0})
 
-        self.assertEqual((planner.expert, planner.horizon, planner.q_diag), ("ompl_casadi", 7, (1.0,) * 6))
-        self.assertEqual(
-            (planner.terminal_cost_multiplier, planner.terminal_velocity_weight, planner.fallback_terminal_velocity_tol,
-             planner.max_consecutive_fallbacks),
-            (3.0, 2.0, 0.5, 9),
-        )
-        self.assertEqual(planner.expert_slack_tolerance, 0.03)
+        self.assertEqual((expert.horizon, expert.ompl_seed, expert.totg_velocity_scale), (7, 3, 1.0))
+
+    def test_the_keys_are_the_field_names(self) -> None:
+        self.assertEqual(ExpertConfig.keys(), set(asdict(ExpertConfig())))
 
     def test_wrong_types_and_values_are_rejected(self) -> None:
-        for bad in ({"Q_diag": [1.0, 0.0]}, {"Q_diag": []}, {"Q_diag": 1.0}, {"R_diag": [1.0, 0.0]}, {"horizon": 2.5}, {"R_weight": "x"},
-                    {"R_weight": 0.0}, {"horizon": 0}, {"terminal_cost_multiplier": 0.0},
-                    {"terminal_velocity_weight": -1.0}, {"projection_full_weight_steps": 0}, {"fallback_terminal_velocity_tol": -0.1},
-                    {"max_consecutive_fallbacks": 0}, {"expert_slack_tolerance": SLACK_TOLERANCE / 2}):
+        for bad in ({"horizon": 2.5}, {"horizon": 0}, {"ompl_timeout": "x"}, {"ompl_timeout": 0.0}, {"totg_acceleration_scale": 2.0}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
-                PlannerConfig.from_mapping(bad)
+                ExpertConfig.from_mapping(bad)
 
-    def test_a_planner_config_built_directly_is_validated_too(self) -> None:
-        for bad in ({"horizon": 0}, {"r_weight": 0.0}, {"max_consecutive_fallbacks": 0}):
+    def test_a_config_built_directly_is_validated_too(self) -> None:
+        for bad in ({"horizon": 0}, {"replan_distance": 0.0}, {"totg_velocity_scale": 0.0}):
             with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
-                PlannerConfig(**bad)
+                ExpertConfig(**bad)
+
+
+class ProjectionConfigTests(unittest.TestCase):
+    def test_defaults(self) -> None:
+        projection = ProjectionConfig.from_mapping({})
+
+        self.assertEqual((projection.velocity_weight, projection.acceleration_weight, projection.jerk_weight), (1e-3, 1e-3, 1e-4))
+        self.assertEqual(
+            (projection.terminal_velocity_weight, projection.fallback_terminal_velocity_tol, projection.max_consecutive_fallbacks),
+            (10.0, 1e-2, 5),
+        )
+
+    def test_the_yaml_keys_carry_the_projection_prefix_except_the_terminal_and_fallback_ones(self) -> None:
+        self.assertEqual(
+            ProjectionConfig.keys(),
+            {
+                "projection_velocity_weight",
+                "projection_acceleration_weight",
+                "projection_jerk_weight",
+                "terminal_velocity_weight",
+                "fallback_terminal_velocity_tol",
+                "max_consecutive_fallbacks",
+            },
+        )
+        self.assertEqual(ProjectionConfig.key("jerk_weight"), "projection_jerk_weight")
+        self.assertEqual(ProjectionConfig.key("max_consecutive_fallbacks"), "max_consecutive_fallbacks")
+
+    def test_what_the_mapping_sets_is_read(self) -> None:
+        projection = ProjectionConfig.from_mapping(
+            {"projection_velocity_weight": 2.0, "terminal_velocity_weight": 3.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9}
+        )
+
+        self.assertEqual((projection.velocity_weight, projection.terminal_velocity_weight), (2.0, 3.0))
+        self.assertEqual((projection.fallback_terminal_velocity_tol, projection.max_consecutive_fallbacks), (0.5, 9))
+
+    def test_wrong_types_and_values_are_rejected(self) -> None:
+        for bad in (
+            {"terminal_velocity_weight": -1.0},
+            {"projection_jerk_weight": 0.0},
+            {"projection_velocity_weight": "x"},
+            {"fallback_terminal_velocity_tol": -0.1},
+            {"max_consecutive_fallbacks": 0},
+            {"max_consecutive_fallbacks": 1.5},
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
+                ProjectionConfig.from_mapping(bad)
+
+    def test_a_config_built_directly_is_validated_too(self) -> None:
+        for bad in ({"velocity_weight": 0.0}, {"max_consecutive_fallbacks": 0}):
+            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
+                ProjectionConfig(**bad)
 
 
 class ExpertConfigValidationTests(unittest.TestCase):
@@ -184,34 +206,11 @@ class ExpertConfigValidationTests(unittest.TestCase):
         validated = load_and_validate_system_config(CONFIG_PATH)
         self.assertEqual(validate_system_config(raw_config=validated), validated)
 
-    def test_a_yaml_string_like_1e_minus_3_is_reported_with_a_hint(self) -> None:
-        raw_config = _load_raw_config()
-        raw_config["R_diag"] = ["10e-3"] * 7  # PyYAML parses a number without a dot in the mantissa as a string
-        with self.assertRaisesRegex(ConfigurationError, "write 1.0e-3"):
-            validate_system_config(raw_config=raw_config)
-
     def test_unknown_keys_are_rejected(self) -> None:
         raw_config = _load_raw_config()
         raw_config["max_linear_accel"] = 2.0  # not a key of the arm's config
         with self.assertRaises(ConfigurationError):
             validate_system_config(raw_config=raw_config)
-
-    def test_q_and_r_diagonals_are_positive_lists_whatever_their_length(self) -> None:
-        # Their lengths depend on the system, which is the planner's to check (test_casadi_planner)
-        raw_config = _load_raw_config()
-        raw_config["Q_diag"] = [1.0] * 13
-        self.assertEqual(validate_system_config(raw_config=raw_config)["Q_diag"], [1.0] * 13)
-        raw_config = _load_raw_config()
-        raw_config["R_diag"] = [1.0] * 6 + [0.0]
-        with self.assertRaises(ConfigurationError):
-            validate_system_config(raw_config=raw_config)
-
-    def test_omitted_diagonals_stay_out_of_the_validated_config(self) -> None:
-        raw_config = _load_raw_config()
-        del raw_config["Q_diag"], raw_config["R_diag"]
-        raw_config["R_weight"] = 0.3
-        validated = validate_system_config(raw_config=raw_config)
-        self.assertEqual((validated["R_weight"], "Q_diag" in validated, "R_diag" in validated), (0.3, False, False))
 
     def test_joint_limits_are_broadcast_from_a_scalar_and_their_list_length_is_checked(self) -> None:
         for key in ("max_acceleration", "max_jerk"):

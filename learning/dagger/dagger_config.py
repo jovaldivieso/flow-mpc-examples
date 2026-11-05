@@ -51,6 +51,7 @@ class DaggerConfig:
     learning_rate: float
     unet: UnetConfig
     prediction_horizon: int
+    execution_horizon: int
     policy_type: str
     flow_config: FlowConfig
     checkpoint_dir: Path

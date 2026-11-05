@@ -19,7 +19,7 @@ class FlowVelocityNet(nn.Module):
     (``compute_loss``) and sampled via Euler integration (``integrate``).
 
     The network is SafeFlowMPC's temporal U-Net (``TemporalUnet``), conditioned on the flat ``obs_cond`` vector (here the
-    goal and the state) and on the flow time passed as it is, in [0, 1]. The horizon of the chunk has to be divisible by
+    world and the last positions) and on the flow time passed as it is, in [0, 1]. The horizon of the chunk has to be divisible by
     ``2 ** (len(unet_dim_mults) - 1)``.
     """
 
@@ -53,24 +53,11 @@ class FlowVelocityNet(nn.Module):
         self.prediction_horizon = int(prediction_horizon)
         self.num_inference_steps = int(num_inference_steps)
 
-        # Rectified flow interpolates x_t = t*x_1 + (1-t)*x_0 against x_0 ~
-        # N(0, 1) (see compute_loss/integrate below) -- an isotropic,
-        # unit-scale noise prior. Per-dimension action bounds are not
-        # generally isotropic (e.g. joints configured with different
-        # acceleration limits, since nothing physically ties them
-        # together), so training x_1 = raw,
-        # unnormalized actions against that fixed unit-scale prior makes the
-        # loss -- and the gradient -- dominated by whichever action
-        # dimension happens to have the largest physical range, independent
-        # of how much that dimension actually matters for the task. Dividing
-        # by a fixed, config-derived per-dimension scale before ever touching
-        # x_0 puts every action dimension on comparable footing relative to
-        # that same prior, and integrate() multiplies back by the same scale
-        # to return actions in physical units. Defaults to all-ones (no-op)
-        # only so this remains constructible without one (e.g. in isolated
-        # unit tests) -- real training/eval callers must pass the actual
-        # max_action so the network is trained and queried in the
-        # same normalized space.
+        # Rectified flow interpolates x_t = t*x_1 + (1-t)*x_0 against x_0 ~ N(0, 1), a unit-scale noise prior. The chunk is
+        # divided by a fixed per-dimension scale (half the range of each joint) before it meets that prior, and integrate()
+        # multiplies back by the same scale to return physical units, so every dimension is on the same footing in the loss.
+        # It defaults to all-ones only so the net stays constructible in isolation; real callers pass the system's scale, so
+        # training and inference use the same normalized space.
         if action_scale is None:
             action_scale_tensor = torch.ones(self.action_dim, dtype=torch.float32)
         else:
@@ -82,7 +69,7 @@ class FlowVelocityNet(nn.Module):
                 )
             if bool((~torch.isfinite(action_scale_tensor)).any() or (action_scale_tensor <= 0).any()):
                 raise ValueError("'action_scale' entries must all be finite and positive.")
-        # Non-persistent: it is derived from the config (the system's max_action), not learned, and rebuilt from the
+        # Non-persistent: it is derived from the config (the system's position scale), not learned, and rebuilt from the
         # checkpoint metadata at both train and eval time rather than loaded with the state dict.
         self.register_buffer("action_scale", action_scale_tensor, persistent=False)
 
@@ -110,20 +97,42 @@ class FlowVelocityNet(nn.Module):
         chunk = action_state_flat.view(-1, self.prediction_horizon, self.action_dim)
         return self.unet(chunk, timesteps.float(), obs_cond).flatten(1)
 
-    def compute_loss(self, obs_cond: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+    def compute_loss(
+        self, obs_cond: torch.Tensor, actions: torch.Tensor, paths: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """The flow-matching loss. Without ``paths`` the chunks ``actions`` (B, H, action_dim) are learned from Gaussian
+        noise towards the chunk. With ``paths`` (B, S + 1, H, action_dim), the safe path of every row (see ``SafeSource``),
+        the flow is learned along it: at the flow time t the point is the path at t, the piecewise linear interpolation of
+        its S + 1 equally spaced values, and the velocity is its derivative, the target flow of SafeFlowMPC's Eq. 7."""
         batch_size = actions.shape[0]
-        x_1 = actions / self.action_scale
-        x_0 = torch.randn_like(actions)
         # t = 1 - Beta(1.5, 1): the density rises toward t = 0, so the early, noisy part of the flow gets more of the
         # training steps than the end of it, where the target is almost determined (SafeFlowMPC's training scripts)
         # Sampled on the CPU: the Dirichlet sampler behind Beta is not implemented on the MPS backend. The copy must
         # block: a non_blocking copy of this temporary reads freed host memory there and yields flow times of ~1e22.
         t = 1.0 - self._flow_time_distribution.sample((batch_size,)).to(device=actions.device, dtype=actions.dtype)
-        t_expanded = t.view(batch_size, 1, 1)
-        x_t = t_expanded * x_1 + (1.0 - t_expanded) * x_0
-        target_velocity = x_1 - x_0
+        if paths is None:
+            x_1 = actions / self.action_scale
+            x_0 = torch.randn_like(actions)
+            t_expanded = t.view(batch_size, 1, 1)
+            x_t = t_expanded * x_1 + (1.0 - t_expanded) * x_0
+            target_velocity = x_1 - x_0
+        else:
+            path_points = paths / self.action_scale
+            segments = path_points.shape[1] - 1
+            position = t * segments
+            segment = position.floor().clamp(max=segments - 1).long()
+            along = (position - segment).view(batch_size, 1, 1)
+            rows = torch.arange(batch_size, device=actions.device)
+            start, end = path_points[rows, segment], path_points[rows, segment + 1]
+            x_t = (1.0 - along) * start + along * end
+            target_velocity = (end - start) * segments
         pred_velocity = self.predict_velocity(x_t.flatten(1), obs_cond, t)
         return F.mse_loss(pred_velocity, target_velocity.flatten(1))
+
+    @staticmethod
+    def require_one_system(obs_cond: torch.Tensor) -> None:
+        if obs_cond.shape[0] != 1:
+            raise ValueError(f"The integration serves one system, so the batch must hold one row, got {obs_cond.shape[0]}.")
 
     @torch.no_grad()
     def integrate(
@@ -139,8 +148,7 @@ class FlowVelocityNet(nn.Module):
         iterate. The integration runs in the normalized space ``compute_loss`` trains in: only what ``correct`` sees and
         returns is rescaled by ``action_scale``.
         """
-        if obs_cond.shape[0] != 1:
-            raise ValueError(f"The integration serves one system, so the batch must hold one row, got {obs_cond.shape[0]}.")
+        self.require_one_system(obs_cond)
         scale = self.action_scale.detach().cpu().numpy()
         if initial is None:
             x = torch.randn(1, self.prediction_horizon, self.action_dim, device=obs_cond.device, dtype=obs_cond.dtype)

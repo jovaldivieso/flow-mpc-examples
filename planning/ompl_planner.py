@@ -6,8 +6,8 @@ from ompl import geometric as og
 from ompl import util as ou
 
 from systems.triple_integrator import TripleIntegratorBase
-from planning.planner import Plan, Planner, PlannerSolveError, goal_configuration
-from planning.planner_config import OmplConfig
+from planning.planner import PlannerSolveError, goal_configuration
+from planning.planner_config import ExpertConfig
 
 def initialize_ompl(seed: int, log_level: ou.LogLevel = ou.LogLevel.LOG_ERROR) -> None:
     """Set OMPL's process-wide random seed and log level.
@@ -20,36 +20,34 @@ def initialize_ompl(seed: int, log_level: ou.LogLevel = ou.LogLevel.LOG_ERROR) -
     ou.RNG.setSeed(int(seed))
 
 
-# Fraction of the largest joint range between two validity checks along a motion
-VALIDITY_RESOLUTION = 0.01
-# Points the simplified path is first resampled to (evenly spaced in joint space), before it is timed
-SIMPLIFIED_PATH_POINTS = 200
+# Fraction of the largest joint range between two validity checks along a motion, fine enough that no motion penetrates an
+# obstacle between two checks
+VALIDITY_RESOLUTION = 0.003
+# Largest joint-space step [rad] between the configurations the end effector's path length is summed over
+LENGTH_STEP = 0.05
 
 
-class OmplPlanner(Planner):
-    """Global joint-space planner: a path from a configuration to the goal configuration (OMPL RRT-Connect).
+class OmplPlanner:
+    """Global joint-space path planner: a path from a configuration to the goal configuration (OMPL RRT-Connect).
 
-    A configuration is valid if it is within the joint limits. The path is shortcut and smoothed with OMPL's path
-    simplifier and traversed at the constant joint-space speed ``ompl_speed`` (rad/s), one configuration per control
-    period.
+    A configuration is valid if it is within the joint limits and clear of the obstacles. The path is shortcut and smoothed
+    with OMPL's path simplifier and returned as its waypoints; the straight motions between them are validity checked.
 
     The planner is stateless regarding OMPL's global environment: its random seed (``ompl_seed``) and log level are set
     by ``initialize_ompl``, which the entry point of the application calls once.
     """
 
-    def __init__(self, simulator: TripleIntegratorBase, config: OmplConfig) -> None:
+    def __init__(self, simulator: TripleIntegratorBase, config: ExpertConfig) -> None:
         self.sim = simulator
         self.n_joints = simulator.n
         self.timeout = config.ompl_timeout
-        self.speed = config.ompl_speed
+        self.candidates = config.ompl_candidates
 
-    def reset(self) -> None:
-        """Planning from scratch every time: there is nothing to forget."""
-
-    def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
-        """A path, timed at ``ompl_speed``, from the configuration in ``observation`` (the first row) to its goal
-        configuration. ``initial_plan`` is ignored. Raises ``PlannerSolveError`` when the start or goal is out of
-        bounds or when no exact path is found within ``ompl_timeout`` seconds."""
+    def path(self, observation: np.ndarray) -> np.ndarray:
+        """The waypoints (M, n) of a path from the configuration in ``observation`` (the first row) to its goal
+        configuration (the last): of ``ompl_candidates`` RRT-Connect paths (the ones that found none are left out), the one
+        along which the end effector (``tcp_position``) travels the shortest. Raises ``PlannerSolveError`` when the start or goal is out of bounds or in collision, or when none
+        of the candidates finds an exact path within ``ompl_timeout`` seconds."""
         q_start = np.asarray(self.sim.invert_obs(observation), dtype=float)[: self.n_joints]
         lower, upper = self.sim.path_lower, self.sim.path_upper
         if np.any(q_start < lower) or np.any(q_start > upper):
@@ -61,17 +59,27 @@ class OmplPlanner(Planner):
             raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
         if self.sim.collision.obstacles and not self.sim.collision.is_collision_free(q_goal):
             raise PlannerSolveError("OMPL: the goal configuration is in collision.")
-        path = self._connect(q_start, [q_goal], lower, upper)
+        paths, failure = [], None
+        for _ in range(self.candidates):
+            try:
+                paths.append(self._connect(q_start, [q_goal], lower, upper))
+            except PlannerSolveError as exc:
+                failure = exc
+        if not paths:
+            raise failure
+        path = min(paths, key=self._end_effector_length)
         path[0] = q_start
-        return Plan(positions=self._timed(path))
+        return path
 
-    def _timed(self, path: np.ndarray) -> np.ndarray:
-        """The path at the constant joint-space speed: one configuration per control period (the last step may be shorter)."""
-        arc_length = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))])
-        arcs = np.append(np.arange(0.0, arc_length[-1], self.speed * self.sim.dt), arc_length[-1])
-        if len(arcs) == 1:  # the start already is the goal configuration: a plan has a first and a next row
-            arcs = np.repeat(arcs, 2)
-        return np.stack([np.interp(arcs, arc_length, joint) for joint in path.T], axis=1)
+    def _end_effector_length(self, path: np.ndarray) -> float:
+        """The length of the path the end effector travels along the straight joint-space motions between the waypoints, summed
+        over configurations at most ``LENGTH_STEP`` apart."""
+        configurations = [path[:1]]
+        for start, end in zip(path[:-1], path[1:]):
+            steps = max(int(np.ceil(np.linalg.norm(end - start) / LENGTH_STEP)), 1)
+            configurations.append(start + np.linspace(0.0, 1.0, steps + 1)[1:, None] * (end - start))
+        positions = np.array([self.sim.tcp_position(q) for q in np.concatenate(configurations)])
+        return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
 
     def _state(self, space_information: ob.SpaceInformation, q: np.ndarray) -> ob.State:
         state = space_information.allocState()
@@ -80,7 +88,7 @@ class OmplPlanner(Planner):
         return state
 
     def _connect(self, q_start: np.ndarray, goals: list[np.ndarray], lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
-        """RRT-Connect from the start to any of the goal configurations: the simplified path (SIMPLIFIED_PATH_POINTS)."""
+        """RRT-Connect from the start to any of the goal configurations: the waypoints of the simplified path."""
         space = ob.RealVectorStateSpace(self.n_joints)
         bounds = ob.RealVectorBounds(self.n_joints)
         for joint in range(self.n_joints):
@@ -116,7 +124,6 @@ class OmplPlanner(Planner):
             raise PlannerSolveError(f"OMPL: RRT-Connect found no path to the goal pose within {self.timeout} s.")
         path = problem.getSolutionPath()
         og.PathSimplifier(space_information).simplifyMax(path)
-        path.interpolate(SIMPLIFIED_PATH_POINTS)
         return np.array(
             [[path.getState(index)[joint] for joint in range(self.n_joints)] for index in range(path.getStateCount())]
         )

@@ -61,7 +61,7 @@ class DatasetCoverageTests(unittest.TestCase):
                     {
                         "episode_index": episodes[rows],
                         "observation.environment_state": list(observations[rows, :3].astype(np.float32)),
-                        "observation.state": list(observations[rows, 3:].astype(np.float32)),
+                        "observation.history": list(observations[rows, 3:].astype(np.float32)),
                     }
                 ).to_parquet(root / "data" / "chunk-000" / f"file-{index:03d}.parquet")
 

@@ -9,32 +9,30 @@ from unittest import mock
 
 import numpy as np
 import torch
-import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.config import validate_system_config
-from systems.franka_system import Q_READY, FrankaSystem
+from systems.franka_system import FrankaSystem
 from learning.data_utils import build_dataset_features
 from learning.dagger.collection import collect_dagger_rollouts
 from learning.dagger.episode_starts import _setup_episode_start
-from learning.dagger.evaluation import evaluate_policy_rollouts
-from learning.dagger.policy_action import apply_execution_noise, build_policy_action
+from learning.dagger.evaluation import evaluate_policy_rollouts, rollout_policy_with_action_fn
+from learning.dagger.policy_action import _policy_action_fn, apply_execution_noise, build_policy_actions
 from learning.dagger.workers import RolloutWorkerSpec
 from learning.models.policy_factory import PolicyFactory, PolicySpec
-from planning.casadi_planner import CasadiPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
-from planning.planner_config import PlannerConfig
-from test.planner_fixtures import pose_goal
+from planning.planner_factory import PlannerFactory
+from test.planner_fixtures import pinned_config, pose_goal, rest_state
 from systems.seed_utils import (
     action_noise_seed_for_rollout,
     initial_state_seed_for_rollout,
     torch_inference_seed_for_rollout,
 )
 
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_casadi_config.yaml")
 PREDICTION_HORIZON = 2  # the chunk length of the fake system's labels (and of the arm's, in the arm tests)
+HISTORY_LENGTH = 3
+EXECUTION_HORIZON = 2  # control periods the first jerks of a chunk are executed for, in the arm tests
 
 
 class _FakeSimulator:
@@ -91,17 +89,21 @@ class _FakeSimulator:
     def collides(self, state: np.ndarray) -> bool:
         return bool(np.asarray(state, dtype=float)[0] >= self.collision_threshold)
 
-    def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """Mirrors SystemSimulator.policy_observation: the dataset's two observation keys, float32."""
+    def policy_observation(self, obs: np.ndarray, history: np.ndarray) -> dict[str, np.ndarray]:
+        """Mirrors SystemSimulator.policy_observation: the dataset's three observation keys, float32."""
         return {
             "observation.environment_state": self.goal.astype(np.float32),
             "observation.state": np.asarray(obs, dtype=np.float32),
+            "observation.history": np.asarray(history, dtype=np.float32),
         }
 
 
+PLAN_ROWS = PREDICTION_HORIZON + 1  # the rows the fake expert plans, one more than the policy's chunk
+
+
 class _FakePlantPlanner(Planner):
-    """A planner of the 1-D fake plant (state += action) that plans one step: the state and the state after the
-    scripted action of this call. A subclass chooses the action (or fails)."""
+    """A planner of the 1-D fake plant (state += action) whose plan moves on at the scripted action of this call: row k
+    is the state k + 1 steps ahead. A subclass chooses the action (or fails)."""
 
     def __init__(self) -> None:
         self.call_count = 0
@@ -110,10 +112,11 @@ class _FakePlantPlanner(Planner):
     def reset(self) -> None:
         self.reset_count += 1
 
-    def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
+    def plan(self, observation: np.ndarray) -> Plan:
         self.call_count += 1
         action = self._action_of_call()
-        return Plan(positions=np.stack([observation, observation + action]), actions=action[None, :])
+        steps = np.arange(1, PLAN_ROWS + 1)[:, None]
+        return Plan(positions=observation + steps * action, actions=np.tile(action, (PLAN_ROWS, 1)))
 
     def _action_of_call(self) -> np.ndarray:
         raise NotImplementedError
@@ -168,13 +171,19 @@ class _FakeDatasetWriter:
         self.episode_boundaries.append(len(self.frames))
 
 
-def _frame_builder(observation: np.ndarray, action: np.ndarray) -> dict[str, object]:
-    return {"observation": np.asarray(observation).tolist(), "action": np.asarray(action).tolist()}
+def _frame_builder(observation: np.ndarray, history: np.ndarray, positions: np.ndarray) -> dict[str, object]:
+    return {
+        "observation": np.asarray(observation).tolist(),
+        "history": np.asarray(history).tolist(),
+        "action": np.asarray(positions).tolist(),
+    }
 
 
-def _assert_label_is_the_plan_of_one_step(test: unittest.TestCase, frame: dict[str, object], action: float) -> None:
-    """The label of a frame is the expert's planned actions from its state: the planned action, then zeros."""
-    test.assertEqual(frame["action"], [[action], [0.0]])
+def _assert_label_is_the_plan_of_the_action(test: unittest.TestCase, frame: dict[str, object], action: float) -> None:
+    """The label of a frame is the first ``PREDICTION_HORIZON`` rows of the expert's plan from its state."""
+    state = frame["observation"][0]
+    test.assertEqual(len(frame["action"]), PREDICTION_HORIZON)
+    np.testing.assert_allclose(frame["action"], [[state + (k + 1) * action] for k in range(PREDICTION_HORIZON)])
 
 
 class _AlwaysFailingPlanner(_FakePlantPlanner):
@@ -184,7 +193,9 @@ class _AlwaysFailingPlanner(_FakePlantPlanner):
         raise PlannerSolveError("forced solver failure for test")
 
 
-def _collect(simulator, planner, writer, *, trajectories=1, steps=3, beta=1.0, policy_action_fn=None, initial_states=None):
+def _collect(
+    simulator, planner, writer, *, trajectories=1, steps=3, beta=1.0, policy_action_fn=None, initial_states=None, execution_horizon=1
+):
     """collect_dagger_rollouts with the boilerplate arguments fixed; returns (metrics, captured stdout)."""
     stdout = io.StringIO()
     with contextlib.redirect_stdout(stdout):
@@ -199,6 +210,8 @@ def _collect(simulator, planner, writer, *, trajectories=1, steps=3, beta=1.0, p
             initial_state_seed=0,
             expert_mixing_beta=beta,
             prediction_horizon=PREDICTION_HORIZON,
+            history_length=HISTORY_LENGTH,
+            execution_horizon=execution_horizon,
             policy_action_fn=policy_action_fn,
             frame_builder=_frame_builder,
             initial_states=initial_states,
@@ -266,7 +279,7 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual(metrics.num_episodes, 1)
         self.assertEqual(planner.call_count, 2)
         self.assertEqual(len(writer.frames), 1)
-        _assert_label_is_the_plan_of_one_step(self, writer.frames[0], 1.0)
+        _assert_label_is_the_plan_of_the_action(self, writer.frames[0], 1.0)
         self.assertNotEqual(writer.frames[0]["observation"], [0.0])
         self.assertIn("Planner failed to solve", output)
         self.assertIn("Discarding DAgger episode", output)
@@ -294,6 +307,39 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual((metrics.truncated_episodes, metrics.planner_failures), (1, 1))
         self.assertNotIn("Discarding DAgger episode", output)
 
+    def test_the_label_of_a_state_is_the_first_rows_of_the_experts_plan(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
+        writer = _FakeDatasetWriter()
+
+        _collect(simulator, _ConstantPlanner(action=[1.0]), writer, steps=2, initial_states=[[0.0]])
+
+        self.assertLess(PREDICTION_HORIZON, PLAN_ROWS)
+        self.assertEqual([frame["action"] for frame in writer.frames], [[[1.0], [2.0]], [[2.0], [3.0]]])
+
+    def test_every_frame_carries_the_history_of_the_rollout_so_far(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
+        writer = _FakeDatasetWriter()
+
+        _collect(simulator, _ConstantPlanner(action=[1.0]), writer, steps=4, initial_states=[[0.0]])
+
+        self.assertEqual(
+            [frame["history"] for frame in writer.frames],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 2.0], [1.0, 2.0, 3.0]],
+        )
+
+    def test_the_history_of_the_policy_query_is_that_of_the_frame(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=100.0)
+        writer = _FakeDatasetWriter()
+        queried: list[list[float]] = []
+
+        def policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            queried.append(history.tolist())
+            return np.array([[1.0]])
+
+        _collect(simulator, _ConstantPlanner(action=[1.0]), writer, steps=3, beta=0.0, policy_action_fn=policy, initial_states=[[0.0]])
+
+        self.assertEqual(queried, [frame["history"] for frame in writer.frames])
+
     def test_gives_up_after_three_times_the_requested_episodes(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=-10.0)
         planner = _AlwaysFailingPlanner()
@@ -311,10 +357,10 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         planner = _FailOnCallPlanner(action=[0.5], fail_calls={2})
         policy_calls = 0
 
-        def policy(observation: np.ndarray) -> np.ndarray:
+        def policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
             nonlocal policy_calls
             policy_calls += 1
-            return np.array([0.4])
+            return np.array([[0.4]])
 
         writer = _FakeDatasetWriter()
 
@@ -325,14 +371,14 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertIn("realized_expert_fraction=0.000", output)
         self.assertIn("executed_steps=1", output)
         # The dataset carries the expert's relabelled plan (a step of 0.5), not what the policy executed (0.4)
-        _assert_label_is_the_plan_of_one_step(self, writer.frames[0], 0.5)
+        _assert_label_is_the_plan_of_the_action(self, writer.frames[0], 0.5)
 
     def test_policy_solve_failure_falls_back_to_the_expert_instead_of_dropping_the_episode(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=0.5)
         planner = _ConstantPlanner(action=[1.0])
         writer = _FakeDatasetWriter()
 
-        def failing_policy(observation: np.ndarray) -> np.ndarray:
+        def failing_policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
             raise PlannerSolveError("projector failed")
 
         metrics, output = _collect(
@@ -343,7 +389,7 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertEqual(metrics.success_rate, 1.0)
         self.assertEqual(planner.reset_count, 1)  # no retry
         self.assertEqual(writer.frames[0]["observation"], [0.0])
-        self.assertIn("Policy action unavailable this step", output)
+        self.assertIn("Policy actions unavailable, falling back to the expert for the block", output)
         self.assertNotIn("Discarding DAgger episode", output)
         self.assertEqual((metrics.discarded_episodes, metrics.planner_failures, metrics.policy_solve_fallbacks), (0, 0, 1))
         # The executed step was the expert's, and is recorded as such
@@ -382,6 +428,117 @@ class CollectDaggerRolloutsDropAndRetryTests(unittest.TestCase):
         self.assertNotEqual(simulator.goal.tolist(), [0.0])
 
 
+class CollectionBlockTests(unittest.TestCase):
+    """The policy is asked once per block of ``execution_horizon`` steps and executes its jerks one after the other, the
+    expert plans and labels at every step, and a block is the expert's or the policy's as a whole.
+
+    On the fake plant (state += action) the expert's jerk is 1.0, so a block can be told from the step it takes.
+    """
+
+    BLOCK = 3
+    POLICY_JERKS = np.array([[0.1], [0.2], [0.3]])
+
+    def _policy(self, queries: list[list[float]]):
+        def policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            queries.append(history.tolist())
+            return self.POLICY_JERKS
+
+        return policy
+
+    def _run(self, *, steps=6, beta=0.0, policy=None, trajectories=1):
+        simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=1e9)
+        planner, writer = _ConstantPlanner(action=[1.0]), _FakeDatasetWriter()
+        metrics, output = _collect(
+            simulator, planner, writer, trajectories=trajectories, steps=steps, beta=beta, policy_action_fn=policy,
+            initial_states=[[0.0]], execution_horizon=self.BLOCK,
+        )
+        return planner, writer, metrics, output
+
+    def test_the_policy_is_asked_once_per_block_and_its_jerks_are_executed_in_order(self) -> None:
+        queries: list[list[float]] = []
+
+        _, writer, _, _ = self._run(policy=self._policy(queries))
+
+        self.assertEqual(len(queries), 2)
+        states = [frame["observation"][0] for frame in writer.frames]
+        np.testing.assert_allclose(states, [0.0, 0.1, 0.3, 0.6, 0.7, 0.9])  # the jerks 0.1, 0.2, 0.3 twice
+
+    def test_the_expert_labels_every_step_of_a_block_the_policy_executes(self) -> None:
+        _, writer, _, _ = self._run(policy=self._policy([]))
+
+        for frame in writer.frames:
+            _assert_label_is_the_plan_of_the_action(self, frame, 1.0)
+
+    def test_the_expert_plans_at_every_step(self) -> None:
+        planner, _, _, _ = self._run(policy=self._policy([]))
+
+        self.assertEqual(planner.call_count, 6)
+
+    def test_the_history_slides_at_every_step_of_a_block(self) -> None:
+        queries: list[list[float]] = []
+
+        _, writer, _, _ = self._run(policy=self._policy(queries))
+
+        histories = [frame["history"] for frame in writer.frames]
+        np.testing.assert_allclose(histories[:4], [[0.0, 0.0, 0.0], [0.0, 0.0, 0.1], [0.0, 0.1, 0.3], [0.1, 0.3, 0.6]])
+        self.assertEqual(queries, [histories[0], histories[3]])  # asked at the first step of each block
+
+    def test_a_block_is_the_experts_or_the_policys_as_a_whole_and_both_occur(self) -> None:
+        _, writer, _, _ = self._run(steps=6, beta=0.5, policy=self._policy([]), trajectories=8)
+
+        states = np.array([frame["observation"][0] for frame in writer.frames]).reshape(8, 6)
+        by_the_expert = np.isclose(np.diff(states, axis=1), 1.0)  # the jerks of steps 1 to 5; the expert's is 1.0
+        blocks = [by_the_expert[:, :3], by_the_expert[:, 3:]]
+        for block in blocks:
+            self.assertTrue(np.all(block == block[:, :1]))  # one actor per block
+        self.assertTrue(any(block.any() for block in blocks) and not all(block.all() for block in blocks))
+
+    def test_the_realized_expert_fraction_counts_every_step_of_the_blocks_the_expert_executes(self) -> None:
+        _, _, _, output = self._run(steps=6, beta=1.0, policy=self._policy([]))
+
+        self.assertIn("realized_expert_fraction=1.000", output)
+        self.assertIn("executed_steps=6", output)
+
+    def test_a_failed_policy_solve_makes_the_block_the_experts_and_the_episode_goes_on(self) -> None:
+        calls = 0
+
+        def policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise PlannerSolveError("projector failed")
+            return self.POLICY_JERKS
+
+        _, writer, metrics, output = self._run(policy=policy)
+
+        self.assertEqual(calls, 2)  # asked again at the next block
+        states = [frame["observation"][0] for frame in writer.frames]
+        np.testing.assert_allclose(states, [0.0, 1.0, 2.0, 3.0, 3.1, 3.3])  # the expert's block, then the policy's
+        self.assertEqual((metrics.num_episodes, metrics.discarded_episodes, metrics.policy_solve_fallbacks), (1, 0, 1))
+        self.assertIn("realized_expert_fraction=0.500", output)
+
+    def test_nothing_is_queried_with_only_the_expert_acting(self) -> None:
+        def policy(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            raise AssertionError("the policy must not be queried")
+
+        _, writer, _, _ = self._run(beta=1.0, policy=policy)
+
+        np.testing.assert_allclose([frame["observation"][0] for frame in writer.frames], np.arange(6.0))
+
+    def test_the_policy_is_not_asked_again_after_the_episode_ends_inside_a_block(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=0.25)
+        queries: list[list[float]] = []
+        writer = _FakeDatasetWriter()
+
+        metrics, _ = _collect(
+            simulator, _ConstantPlanner(action=[1.0]), writer, steps=6, beta=0.0, policy_action_fn=self._policy(queries),
+            initial_states=[[0.0]], execution_horizon=self.BLOCK,
+        )
+
+        self.assertEqual(len(queries), 1)  # the goal is reached with the second jerk
+        self.assertEqual((metrics.success_rate, metrics.max_steps), (1.0, 2))
+
+
 class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
     """A flow/safeflow policy's inference draws from an unseeded torch.randn
     for its ODE initial noise, so without pinning torch's RNG per episode,
@@ -399,7 +556,8 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
                 num_episodes=3,
                 num_steps=2,
                 seed_start=100,
-                action_fn=lambda observation: np.array([0.0]),
+                action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
             )
         # evaluation_seed_specs yields plain ints seed_start, seed_start+1,
         # ... ; the torch seed is the *derived* (stream-ID-mixed) value, not
@@ -430,9 +588,25 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
                     num_episodes=2,
                     num_steps=2,
                     seed_start=7,
-                    action_fn=lambda observation: np.array([0.0]),
+                    action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
                 )
         self.assertEqual(seeds_seen[0], seeds_seen[1])
+
+    def test_the_action_fn_is_given_the_history_of_the_rollout(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=1e9, goal_threshold=1e9)
+        seen: list[list[float]] = []
+
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            seen.append(history.tolist())
+            return np.array([[1.0]])
+
+        evaluate_policy_rollouts(
+            simulator=simulator, num_episodes=1, num_steps=4, seed_start=0, action_fn=action_fn,
+            history_length=HISTORY_LENGTH, initial_states=[[0.0]],
+        )
+
+        self.assertEqual(seen, [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 2.0], [1.0, 2.0, 3.0]])
 
     def test_global_torch_rng_state_is_restored_after_evaluation(self) -> None:
         """Regression guard: torch.manual_seed(...) mutates the same
@@ -449,7 +623,8 @@ class EvaluatePolicyRolloutsTorchSeedingTests(unittest.TestCase):
             num_episodes=3,
             num_steps=2,
             seed_start=100,
-            action_fn=lambda observation: np.array([0.0]),
+            action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
         )
         after_state = torch.get_rng_state()
         self.assertTrue(torch.equal(before_state, after_state))
@@ -477,6 +652,8 @@ class RestartInitialStateRoundTests(unittest.TestCase):
             initial_state_seed=7,
             expert_mixing_beta=1.0,
             prediction_horizon=PREDICTION_HORIZON,
+            history_length=HISTORY_LENGTH,
+            execution_horizon=1,
             policy_action_fn=None,
             frame_builder=_frame_builder,
             initial_states=None,
@@ -520,7 +697,8 @@ class EvaluatePolicyRolloutsSourceSplitTests(unittest.TestCase):
             num_episodes=5,
             num_steps=3,
             seed_start=0,
-            action_fn=lambda observation: np.array([0.0]),
+            action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
             initial_states=[[1000.0], [1000.0]],
             goal_states=[[0.0], [0.0]],
         )
@@ -540,7 +718,8 @@ class EvaluatePolicyRolloutsSourceSplitTests(unittest.TestCase):
             num_episodes=3,
             num_steps=2,
             seed_start=0,
-            action_fn=lambda observation: np.array([0.0]),
+            action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
         )
         assert metrics is not None
         self.assertEqual(metrics.config_num_episodes, 0)
@@ -559,10 +738,10 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
     def test_timeout_and_solve_failure_are_counted_separately(self) -> None:
         simulator = _FakeSimulator(goal_threshold=1000.0)
 
-        def action_fn(observation: np.ndarray) -> np.ndarray:
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
             if float(np.asarray(observation)[0]) == 5.0:
                 raise PlannerSolveError("forced failure for test")
-            return np.array([0.0])
+            return np.array([[0.0]])
 
         metrics = evaluate_policy_rollouts(
             simulator=simulator,
@@ -570,6 +749,7 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
             num_steps=3,
             seed_start=0,
             action_fn=action_fn,
+            history_length=HISTORY_LENGTH,
             initial_states=[[0.0], [5.0]],
         )
 
@@ -582,16 +762,16 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         simulator = _FakeSimulator(goal_threshold=1000.0)
         durations = iter([0.010, 0.030, 0.020])  # the call that fails is not timed
 
-        def action_fn(observation: np.ndarray) -> np.ndarray:
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
             if float(np.asarray(observation)[0]) == 5.0:
                 raise PlannerSolveError("forced failure for test")
-            return np.array([0.0])
+            return np.array([[0.0]])
 
         clock = mock.patch("learning.dagger.evaluation.time.perf_counter", side_effect=self._clock(durations))
         with clock:
             metrics = evaluate_policy_rollouts(
                 simulator=simulator, num_episodes=2, num_steps=3, seed_start=0, action_fn=action_fn,
-                initial_states=[[0.0], [5.0]],
+                history_length=HISTORY_LENGTH, initial_states=[[0.0], [5.0]],
             )
 
         assert metrics is not None
@@ -608,12 +788,12 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
         return iter(readings + [now] * 20).__next__
 
     def test_an_evaluation_in_which_every_call_fails_has_no_inference_time(self) -> None:
-        def failing(observation: np.ndarray) -> np.ndarray:
+        def failing(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
             raise PlannerSolveError("forced failure for test")
 
         metrics = evaluate_policy_rollouts(
             simulator=_FakeSimulator(goal_threshold=1000.0), num_episodes=1, num_steps=2, seed_start=0,
-            action_fn=failing, initial_states=[[0.0]],
+            action_fn=failing, history_length=HISTORY_LENGTH, initial_states=[[0.0]],
         )
 
         assert metrics is not None
@@ -628,7 +808,8 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
             num_episodes=2,
             num_steps=3,
             seed_start=0,
-            action_fn=lambda observation: np.array([1.0]),
+            action_fn=lambda observation, history: np.array([[1.0]]),
+            history_length=HISTORY_LENGTH,
             initial_states=[[0.0], [-5.0]],
         )
 
@@ -644,13 +825,90 @@ class EvaluatePolicyRolloutsFailureBreakdownTests(unittest.TestCase):
             num_episodes=2,
             num_steps=3,
             seed_start=0,
-            action_fn=lambda observation: np.array([0.0]),
+            action_fn=lambda observation, history: np.array([[0.0]]),
+            history_length=HISTORY_LENGTH,
             initial_states=[[0.0], [0.0]],
         )
         assert metrics is not None
         self.assertEqual(metrics.success_rate, 1.0)
         self.assertEqual(metrics.timeout_failures, 0)
         self.assertEqual(metrics.solve_failures, 0)
+
+
+class RolloutPolicyWithActionFnBlockTests(unittest.TestCase):
+    """All the actions an ``action_fn`` call returns are executed one after the other before it is called again."""
+
+    @staticmethod
+    def _rollout(action_fn, *, num_steps=6, goal_threshold=1e9, collision_threshold=1e9, call_times=None):
+        simulator = _FakeSimulator(collision_threshold=collision_threshold, goal_threshold=goal_threshold)
+        outcome = rollout_policy_with_action_fn(
+            simulator, np.array([0.0]), num_steps, action_fn, HISTORY_LENGTH, call_times=call_times
+        )
+        return simulator, outcome
+
+    def test_every_returned_action_is_executed_and_the_calls_are_counted_not_the_steps(self) -> None:
+        histories: list[list[float]] = []
+
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            histories.append(history.tolist())
+            return np.array([[1.0], [2.0], [3.0]])
+
+        call_times: list[float] = []
+        simulator, outcome = self._rollout(action_fn, call_times=call_times)
+
+        self.assertEqual(outcome, (False, 6, "timeout"))
+        self.assertEqual((simulator.step_call_count, len(call_times)), (6, 2))
+        self.assertEqual(histories, [[0.0, 0.0, 0.0], [1.0, 3.0, 6.0]])  # the history slid through the block
+
+    def test_the_rollout_stops_at_num_steps_inside_a_block(self) -> None:
+        simulator, outcome = self._rollout(lambda observation, history: np.ones((3, 1)), num_steps=4)
+
+        self.assertEqual(outcome, (False, 4, "timeout"))
+        self.assertEqual(simulator.step_call_count, 4)
+
+    def test_the_rollout_stops_at_a_collision_inside_a_block(self) -> None:
+        simulator, outcome = self._rollout(lambda observation, history: np.ones((3, 1)), collision_threshold=2.0)
+
+        self.assertEqual(outcome, (False, 2, "collision"))
+        self.assertEqual(simulator.step_call_count, 2)
+
+    def test_the_rollout_stops_at_the_goal_inside_a_block(self) -> None:
+        simulator, outcome = self._rollout(lambda observation, history: np.ones((3, 1)), goal_threshold=2.0)
+
+        self.assertEqual(outcome, (True, 2, None))
+        self.assertEqual(simulator.step_call_count, 2)
+
+    def test_a_solve_failure_reports_the_steps_executed_before_the_failing_call(self) -> None:
+        calls = 0
+
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise PlannerSolveError("forced failure for test")
+            return np.ones((3, 1))
+
+        call_times: list[float] = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            _, outcome = self._rollout(action_fn, num_steps=10, call_times=call_times)
+
+        self.assertEqual(outcome, (False, 3, "solve_failure"))
+        self.assertEqual(len(call_times), 1)  # the failed call is not timed
+
+    def test_evaluation_metrics_count_the_calls_of_the_inference_time_not_the_steps(self) -> None:
+        durations = iter([0.010, 0.030])
+        clock = mock.patch("learning.dagger.evaluation.time.perf_counter", side_effect=EvaluatePolicyRolloutsFailureBreakdownTests._clock(durations)
+        )
+
+        with clock:
+            metrics = evaluate_policy_rollouts(
+                simulator=_FakeSimulator(goal_threshold=1e9), num_episodes=1, num_steps=6, seed_start=0,
+                action_fn=lambda observation, history: np.ones((3, 1)), history_length=HISTORY_LENGTH, initial_states=[[0.0]],
+            )
+
+        assert metrics is not None
+        self.assertAlmostEqual(metrics.mean_inference_ms, 20.0)  # two calls for six steps
+        self.assertEqual(metrics.max_steps, 6)
 
 
 class SetupEpisodeStartTests(unittest.TestCase):
@@ -693,38 +951,28 @@ class SetupEpisodeStartTests(unittest.TestCase):
 
 
 class ApplyExecutionNoiseTests(unittest.TestCase):
-    """apply_execution_noise perturbs the executed action with seeded Gaussian
-    noise and clips the result to the simulator's max_action.
-    """
+    """apply_execution_noise perturbs the executed action with seeded Gaussian noise."""
 
     def test_zero_noise_returns_the_action_unchanged(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
         action = np.array([0.3])
-        self.assertIs(apply_execution_noise(simulator, action, 0.0), action)
+        self.assertIs(apply_execution_noise(action, 0.0), action)
 
     def test_noise_perturbs_the_action_and_is_reproducible_for_the_same_rng_seed(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
         action = np.array([0.3])
 
-        first = apply_execution_noise(simulator, action, 0.1, np.random.default_rng(5))
-        second = apply_execution_noise(simulator, action, 0.1, np.random.default_rng(5))
+        first = apply_execution_noise(action, 0.1, np.random.default_rng(5))
+        second = apply_execution_noise(action, 0.1, np.random.default_rng(5))
 
         np.testing.assert_array_equal(first, second)
         self.assertNotEqual(first[0], action[0])
-
-    def test_noisy_action_is_clipped_to_max_action(self) -> None:
-        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
-        simulator.max_action = np.array([1.0])
-        # A noise std this large pushes the action far past +-max_action.
-        noisy = apply_execution_noise(simulator, np.array([0.9]), 100.0, np.random.default_rng(0))
-        np.testing.assert_array_equal(noisy, [1.0])
 
 
 class _StubPolicy:
     """Records the policy input it is queried with and returns a fixed action tensor."""
 
-    def __init__(self, output: torch.Tensor) -> None:
+    def __init__(self, output: torch.Tensor, execution_horizon: int = 1) -> None:
         self.output = output
+        self.execution_horizon = execution_horizon
         self.received: dict[str, torch.Tensor] | None = None
         self.queried_in_inference_mode: bool | None = None
 
@@ -734,33 +982,52 @@ class _StubPolicy:
         return self.output
 
 
-class BuildPolicyActionTests(unittest.TestCase):
-    """build_policy_action queries the policy once, on a batch of one built
-    from simulator.policy_observation, and hands back the first row of the
-    predicted action chunk.
+class BuildPolicyActionsTests(unittest.TestCase):
+    """build_policy_actions queries the policy once, on a batch of one built from simulator.policy_observation, and hands
+    back the first ``execution_horizon`` rows of the predicted action chunk.
     """
 
-    def test_returns_the_first_action_of_the_chunk(self) -> None:
+    HISTORY = np.array([0.1, 0.3, 0.5])
+
+    def test_returns_the_first_execution_horizon_actions_of_the_chunk(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
         chunk = torch.tensor([[[0.5, 0.25], [3.0, 4.0], [5.0, 6.0]]])  # (batch, horizon, nu)
 
-        action = build_policy_action(simulator, _StubPolicy(chunk), np.array([0.5]), torch.device("cpu"))
+        actions = build_policy_actions(
+            simulator, _StubPolicy(chunk, execution_horizon=2), np.array([0.5]), self.HISTORY, torch.device("cpu")
+        )
 
-        self.assertEqual(action.shape, (2,))
-        np.testing.assert_allclose(action, [0.5, 0.25])
+        self.assertEqual(actions.shape, (2, 2))
+        np.testing.assert_allclose(actions, [[0.5, 0.25], [3.0, 4.0]])
 
-    def test_policy_input_is_a_batch_of_one_with_exactly_the_two_observation_keys(self) -> None:
+    def test_an_execution_horizon_of_one_returns_a_single_row(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
+
+        actions = build_policy_actions(
+            simulator, _StubPolicy(torch.ones(1, 3, 2)), np.array([0.5]), self.HISTORY, torch.device("cpu")
+        )
+
+        self.assertEqual(actions.shape, (1, 2))
+
+    def test_policy_input_is_a_batch_of_one_with_exactly_the_three_observation_keys(self) -> None:
         simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
         simulator.set_goal(np.array([0.25]))
         policy = _StubPolicy(torch.zeros(1, 3, 2))
 
-        build_policy_action(simulator, policy, np.array([0.5]), torch.device("cpu"))
+        build_policy_actions(simulator, policy, np.array([0.5]), self.HISTORY, torch.device("cpu"))
 
         assert policy.received is not None
-        self.assertEqual(set(policy.received), {"observation.environment_state", "observation.state"})
-        for name, expected in (("observation.environment_state", [[0.25]]), ("observation.state", [[0.5]])):
+        self.assertEqual(
+            set(policy.received), {"observation.environment_state", "observation.state", "observation.history"}
+        )
+        expected = {
+            "observation.environment_state": [[0.25]],
+            "observation.state": [[0.5]],
+            "observation.history": [self.HISTORY.tolist()],
+        }
+        for name, values in expected.items():
             self.assertEqual(policy.received[name].dtype, torch.float32, name)
-            np.testing.assert_allclose(policy.received[name].numpy(), expected, err_msg=name)
+            np.testing.assert_allclose(policy.received[name].numpy(), values, err_msg=name)
         self.assertTrue(policy.queried_in_inference_mode)
 
     def test_malformed_policy_output_is_rejected(self) -> None:
@@ -769,7 +1036,25 @@ class BuildPolicyActionTests(unittest.TestCase):
         for output in (torch.zeros(2), torch.zeros(1, 2), torch.zeros(1, 2, 3, 4), torch.zeros(1, 0, 2)):
             with self.subTest(shape=tuple(output.shape)):
                 with self.assertRaises(ValueError):
-                    build_policy_action(simulator, _StubPolicy(output), np.array([0.5]), torch.device("cpu"))
+                    build_policy_actions(
+                        simulator, _StubPolicy(output), np.array([0.5]), self.HISTORY, torch.device("cpu")
+                    )
+
+    def test_a_chunk_shorter_than_the_execution_horizon_is_rejected(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
+
+        with self.assertRaises(ValueError):
+            build_policy_actions(
+                simulator, _StubPolicy(torch.zeros(1, 2, 2), execution_horizon=3), np.array([0.5]), self.HISTORY, torch.device("cpu")
+            )
+
+    def test_the_policy_action_function_is_the_same_query_on_the_cpu(self) -> None:
+        simulator = _FakeSimulator(collision_threshold=10.0, goal_threshold=1.0)
+        chunk = torch.tensor([[[0.5], [1.5], [2.5]]])
+
+        actions = _policy_action_fn(simulator, _StubPolicy(chunk, execution_horizon=2))(np.array([0.5]), self.HISTORY)
+
+        np.testing.assert_allclose(actions, [[0.5], [1.5]])
 
 
 class DefaultFrameBuilderTests(unittest.TestCase):
@@ -792,6 +1077,8 @@ class DefaultFrameBuilderTests(unittest.TestCase):
             initial_state_seed=0,
             expert_mixing_beta=1.0,
             prediction_horizon=PREDICTION_HORIZON,
+            history_length=HISTORY_LENGTH,
+            execution_horizon=1,
             policy_action_fn=None,
             initial_states=[[0.0]],
             goal_states=None,
@@ -807,11 +1094,15 @@ class DefaultFrameBuilderTests(unittest.TestCase):
 
         self.assertEqual(len(writer.frames), 1)
         frame = writer.frames[0]
-        self.assertEqual(set(frame), {"observation.environment_state", "observation.state", "action", "task"})
+        self.assertEqual(
+            set(frame),
+            {"observation.environment_state", "observation.state", "observation.history", "action", "task"},
+        )
         self.assertEqual(frame["task"], "reach fake target")
         np.testing.assert_allclose(frame["observation.state"], [0.0])
-        # The expert's planned actions (the action 1, then zeros), flattened row by row
-        np.testing.assert_allclose(frame["action"], [1.0, 0.0])
+        np.testing.assert_allclose(frame["observation.history"], [0.0] * HISTORY_LENGTH)  # the start repeated
+        # The first prediction_horizon rows of the expert's plan (the states 1 and 2 steps ahead), flattened row by row
+        np.testing.assert_allclose(frame["action"], [1.0, 2.0])
         self.assertEqual(writer.episode_boundaries, [1])
 
     def test_a_frame_builder_must_return_a_single_mapping(self) -> None:
@@ -819,53 +1110,57 @@ class DefaultFrameBuilderTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             self._collect(
                 simulator,
-                frame_builder=lambda observation, action: [_frame_builder(observation, action)],
+                frame_builder=lambda observation, history, positions: [_frame_builder(observation, history, positions)],
             )
 
 
 class RolloutsWithTheArmTests(unittest.TestCase):
-    """The same entry points on the real FrankaSystem/CasadiPlanner instead of
-    the 1-D fake: a few steps from a start near the ready pose towards a
-    nearby goal pose, so this stays fast and deterministic -- what it checks
-    is the interfaces (frame schema, the 12-dim goal, the policy input), not
-    task success.
+    """The same entry points on the real FrankaSystem and its OMPL + TOTG expert instead of the 1-D fake: a few steps
+    from a start near the ready pose towards a nearby goal pose, so this stays fast and deterministic -- what it checks is
+    the interfaces (frame schema, the 12-dim goal, the history, the policy input), not task success.
     """
 
     @classmethod
     def setUpClass(cls) -> None:
-        with open(CONFIG_PATH) as f:
-            cls.config = validate_system_config(raw_config=yaml.safe_load(f))
+        cls.config = pinned_config()
         cls.simulator = FrankaSystem(cls.config)
-        q = Q_READY.copy()
-        q += np.array([0.12, -0.10, 0.08, 0.10, -0.12, 0.10, 0.25])
-        cls.initial_state = np.concatenate([q, np.zeros(2 * cls.simulator.n)])
-        cls.goal = pose_goal(cls.simulator, q + 0.1)
+        cls.initial_state = rest_state(cls.simulator)
+        cls.goal = pose_goal(cls.simulator, cls.initial_state[: cls.simulator.n] + 0.1)
+
+    def _collect(self, simulator: FrankaSystem, config: dict, writer: _FakeDatasetWriter, **kwargs) -> object:
+        settings = dict(
+            trajectories_per_iteration=1,
+            steps_per_trajectory=3,
+            action_noise_std=0.0,
+            action_noise_seed=0,
+            initial_state_seed=0,
+            expert_mixing_beta=1.0,
+            prediction_horizon=PREDICTION_HORIZON,
+            history_length=HISTORY_LENGTH,
+            execution_horizon=EXECUTION_HORIZON,
+            policy_action_fn=None,
+        )
+        with contextlib.redirect_stdout(io.StringIO()):
+            return collect_dagger_rollouts(
+                simulator=simulator,
+                expert_planner=PlannerFactory.create(config["expert"], simulator, config),
+                dataset_writer=writer,
+                **{**settings, **kwargs},
+            )
 
     def test_collect_dagger_rollouts_writes_frames_matching_the_dataset_schema(self) -> None:
-        simulator = self.simulator
+        simulator, n = self.simulator, self.simulator.n
         writer = _FakeDatasetWriter()
 
-        with contextlib.redirect_stdout(io.StringIO()):
-            metrics = collect_dagger_rollouts(
-                simulator=simulator,
-                expert_planner=CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(self.config))),
-                dataset_writer=writer,
-                trajectories_per_iteration=1,
-                steps_per_trajectory=3,
-                action_noise_std=0.0,
-                action_noise_seed=0,
-                initial_state_seed=0,
-                expert_mixing_beta=1.0,
-                prediction_horizon=PREDICTION_HORIZON,
-                policy_action_fn=None,
-                initial_states=[self.initial_state.tolist()],
-                goal_states=[self.goal.tolist()],
-            )
+        metrics = self._collect(
+            simulator, self.config, writer, initial_states=[self.initial_state.tolist()], goal_states=[self.goal.tolist()]
+        )
 
         self.assertEqual(metrics.num_episodes, 1)
         self.assertEqual(len(writer.frames), 3)
         self.assertEqual(writer.episode_boundaries, [3])
-        features = build_dataset_features(simulator, PREDICTION_HORIZON)
+        features = build_dataset_features(simulator, PREDICTION_HORIZON, HISTORY_LENGTH)
+        self.assertEqual(set(features), {"observation.environment_state", "observation.state", "observation.history", "action"})
         for frame in writer.frames:
             self.assertEqual(set(frame), set(features) | {"task"})
             for name, feature in features.items():
@@ -880,30 +1175,53 @@ class RolloutsWithTheArmTests(unittest.TestCase):
                 atol=1e-4,
             )
         np.testing.assert_allclose(writer.frames[0]["observation.state"], self.initial_state, atol=1e-6)
-        # The label of a step is the expert's plan from its state: its jerks, the first of which is the action the
-        # expert executed (it leads to the next frame's state)
-        for step, frame in enumerate(writer.frames[:-1]):
-            actions = frame["action"].reshape(PREDICTION_HORIZON, simulator.nu)
-            np.testing.assert_allclose(
-                simulator.predict_next_state(frame["observation.state"].astype(float), actions[0]),
-                writer.frames[step + 1]["observation.state"],
-                atol=1e-4,
-            )
 
-    def test_evaluate_policy_rollouts_queries_the_policy_through_build_policy_action(self) -> None:
+    def test_the_history_of_a_frame_ends_at_its_state_and_slides_with_the_rollout(self) -> None:
+        simulator, n = self.simulator, self.simulator.n
+        writer = _FakeDatasetWriter()
+
+        self._collect(
+            simulator, self.config, writer, initial_states=[self.initial_state.tolist()], goal_states=[self.goal.tolist()]
+        )
+
+        histories = [frame["observation.history"].astype(float).reshape(HISTORY_LENGTH, n) for frame in writer.frames]
+        np.testing.assert_allclose(histories[0], np.tile(self.initial_state[:n], (HISTORY_LENGTH, 1)), atol=1e-6)
+        for frame, history in zip(writer.frames, histories):
+            np.testing.assert_allclose(history[-1], frame["observation.state"][:n], atol=1e-6)
+        for previous, history in zip(histories, histories[1:]):
+            np.testing.assert_allclose(history[:-1], previous[1:], atol=1e-6)
+
+    def test_the_label_of_a_frame_is_the_experts_positions_plan_that_the_arm_follows(self) -> None:
+        simulator, n = self.simulator, self.simulator.n
+        writer = _FakeDatasetWriter()
+
+        self._collect(
+            simulator, self.config, writer, initial_states=[self.initial_state.tolist()], goal_states=[self.goal.tolist()]
+        )
+
+        for step, frame in enumerate(writer.frames[:-1]):
+            plan = frame["action"].reshape(PREDICTION_HORIZON, n)
+            self.assertTrue(np.all(np.isfinite(plan)))
+            # the expert's step tracks the first row of its plan
+            np.testing.assert_allclose(plan[0], writer.frames[step + 1]["observation.state"][:n], atol=0.05)
+
+    def test_evaluate_policy_rollouts_queries_the_policy_through_build_policy_actions(self) -> None:
         simulator = self.simulator
         policy = PolicyFactory.create(
             PolicySpec(
-                policy_type="flow", action_dim=simulator.nu, state_dim=simulator.environment_dim + simulator.nx,
-                prediction_horizon=4, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
-                action_scale=tuple(simulator.max_action.tolist()),
+                policy_type="flow", action_dim=simulator.n, cond_dim=simulator.environment_dim + HISTORY_LENGTH * simulator.n,
+                history_length=HISTORY_LENGTH, execution_horizon=EXECUTION_HORIZON, prediction_horizon=4, unet_dim=8, unet_dim_mults=(1, 2), num_inference_steps=2,
+                action_scale=tuple(simulator.position_scale.tolist()),
             ),
             simulator,
+            self.config,
         ).eval()
         actions: list[np.ndarray] = []
+        histories: list[np.ndarray] = []
 
-        def action_fn(observation: np.ndarray) -> np.ndarray:
-            action = build_policy_action(simulator, policy, observation, torch.device("cpu"))
+        def action_fn(observation: np.ndarray, history: np.ndarray) -> np.ndarray:
+            histories.append(history)
+            action = build_policy_actions(simulator, policy, observation, history, torch.device("cpu"))
             actions.append(action)
             return action
 
@@ -914,6 +1232,7 @@ class RolloutsWithTheArmTests(unittest.TestCase):
                 num_steps=2,
                 seed_start=0,
                 action_fn=action_fn,
+                history_length=HISTORY_LENGTH,
                 reset_fn=policy.reset,
                 initial_states=[self.initial_state.tolist()],
                 goal_states=[self.goal.tolist()],
@@ -928,8 +1247,9 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         self.assertEqual(failures + round(metrics.success_rate * metrics.num_episodes), metrics.num_episodes)
         self.assertGreaterEqual(len(actions), 2)
         for action in actions:
-            self.assertEqual(action.shape, (simulator.nu,))
+            self.assertEqual(action.shape, (EXECUTION_HORIZON, simulator.nu))
             self.assertTrue(np.all(np.isfinite(action)))
+        np.testing.assert_allclose(histories[0], np.tile(self.initial_state[: simulator.n], HISTORY_LENGTH), atol=1e-6)
 
     def test_parallel_workers_produce_the_same_frames_and_metrics_as_one_process(self) -> None:
         config = {**self.config, "randomize_goal": True}
@@ -937,30 +1257,17 @@ class RolloutsWithTheArmTests(unittest.TestCase):
         writers = [_FakeDatasetWriter(), _FakeDatasetWriter()]
         metrics_by_workers = []
         for num_workers, writer in zip((1, 2), writers):
-            simulator = FrankaSystem(config)
-            planner = CasadiPlanner(simulator, PlannerConfig.from_mapping(dict(config)))
-            with contextlib.redirect_stdout(io.StringIO()):
-                metrics = collect_dagger_rollouts(
-                    simulator=simulator,
-                    expert_planner=planner,
-                    dataset_writer=writer,
-                    trajectories_per_iteration=2,
-                    steps_per_trajectory=2,
-                    action_noise_std=0.0,
-                    action_noise_seed=0,
-                    initial_state_seed=0,
-                    expert_mixing_beta=1.0,
-                    prediction_horizon=PREDICTION_HORIZON,
-                    policy_action_fn=None,
-                    num_workers=num_workers,
-                    worker_spec=worker_spec,
+            metrics_by_workers.append(
+                self._collect(
+                    FrankaSystem(config), config, writer,
+                    trajectories_per_iteration=2, steps_per_trajectory=2, num_workers=num_workers, worker_spec=worker_spec,
                 )
-            metrics_by_workers.append(metrics)
+            )
 
         self.assertEqual(metrics_by_workers[0], metrics_by_workers[1])
         self.assertEqual(writers[0].episode_boundaries, writers[1].episode_boundaries)
         for frame_single, frame_multi in zip(writers[0].frames, writers[1].frames):
-            for key in ("observation.environment_state", "observation.state", "action"):
+            for key in ("observation.environment_state", "observation.state", "observation.history", "action"):
                 np.testing.assert_allclose(frame_single[key], frame_multi[key], atol=1e-6)
 
 

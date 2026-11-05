@@ -92,7 +92,10 @@ class FrankaSystem(TripleIntegratorBase):
         self.sampler = EpisodeSampler(
             {name: SamplingMode.from_fields(mode) for name, mode in fields["sampling"].items()},
             fields["sampling_modes"],
-            lambda position, rotation: self.kinematics.solve_ik(position, rotation, Q_READY, self._is_valid),
+            self.kinematics.inverse_kinematics,
+            self.kinematics.lower,
+            self.kinematics.upper,
+            self._is_valid,
         )
         self._mode: SamplingMode | None = None  # the mode of the episode whose goal was drawn, until its start is
         self._mesh_collision: tuple | None = None  # (obstacles, geometry model, geometry data), built on first use
@@ -130,9 +133,9 @@ class FrankaSystem(TripleIntegratorBase):
             and pin.computeCollisions(self.model, self.data, geometry_model, geometry_data, np.asarray(state, dtype=float)[: self.n], True)
         )
 
-    def policy_observation(self, obs: np.ndarray) -> dict[str, np.ndarray]:
-        """The goal pose in the TCP frame (``T_tcp^-1 T_goal``), the centers of the arm's bounding spheres in the base
-        frame, and the state."""
+    def policy_observation(self, obs: np.ndarray, history: np.ndarray) -> dict[str, np.ndarray]:
+        """The goal pose in the TCP frame (``T_tcp^-1 T_goal``) and the centers of the arm's bounding spheres in the base
+        frame, the state, and the history of positions."""
         obs_array = np.asarray(obs, dtype=float)
         goal, state = obs_array[:POSE_DIM], obs_array[POSE_DIM:]
         relative = self.tcp_placement(state[: self.n]).actInv(self.vector_pose(goal))
@@ -142,6 +145,7 @@ class FrankaSystem(TripleIntegratorBase):
                 np.float32
             ),
             "observation.state": state.astype(np.float32),
+            "observation.history": np.asarray(history, dtype=np.float32),
         }
 
     def observation_from_policy(self, environment_state: np.ndarray, state: np.ndarray) -> np.ndarray:

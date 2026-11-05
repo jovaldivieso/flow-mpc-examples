@@ -3,213 +3,378 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from unittest import mock
+import warnings
 
 import numpy as np
+import yaml
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from systems.franka_system import FrankaSystem
 from learning.dagger.utils import sample_initial_state
-from planning.casadi_planner import CasadiPlanner
-from systems.rollout_termination import RolloutTerminationTracker
-from planning.ompl_initial_guess import OmplInitialGuess
-from planning.planner import Planner, PlannerSolveError
+from planning.config import validate_system_config
+from planning.ompl_casadi_planner import OmplCasadiPlanner
+from planning.planner import Plan, Planner, PlannerSolveError
+from planning.planner_config import ExpertConfig, ProjectionConfig
 from planning.planner_factory import PlannerFactory
-from test.planner_fixtures import initial_guess, pinned_config, pose_goal
+from systems.franka_system import Q_READY, FrankaSystem
+from test.planner_fixtures import PINNED_EXPERT_SETTINGS, pinned_config, pose_goal, rest_state
 
 N = 7
-SEED = 1  # a start and goal pair far enough apart for the MPC to plan a long motion
+HORIZON = PINNED_EXPERT_SETTINGS["horizon"]
+TABLE_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_table_config.yaml")
+OBSTACLES = [
+    {"position": [0.45, -0.12, 0.40], "radius": 0.08},
+    {"position": [0.45, 0.15, 0.48], "radius": 0.08},
+]
+STATISTICS = ("ompl_paths", "ompl_replans", "ompl_path_failures", "trimmed_labels")
 
 
-def _step_along(simulator: FrankaSystem, planner: Planner, state: np.ndarray) -> np.ndarray:
-    """The state after one control step along the first action of the planner's plan from ``state``."""
-    return simulator.step(state, planner.plan(simulator.observe(state)).actions[0])
+def _far_goal_configuration() -> np.ndarray:
+    """A configuration far from the rest state (a path of well over the horizon's rows)."""
+    q = Q_READY.copy()
+    q[0] += 1.6
+    q[1] += 0.5
+    q[3] -= 0.8
+    q[5] += 0.6
+    return q
 
 
-def _closed_loop(simulator: FrankaSystem, planner: Planner, start: np.ndarray, steps: int) -> bool:
-    """Whether the planner in closed loop on the plant reaches the goal."""
-    state = simulator.reset(start)
-    termination = RolloutTerminationTracker(simulator)
-    planner.reset()
-    for _ in range(steps):
-        state = _step_along(simulator, planner, state)
-        if termination.update(state):
-            return True
-    return False
+def _table_config(**overrides) -> dict:
+    with open(TABLE_CONFIG_PATH) as f:
+        raw_config = yaml.safe_load(f)
+    raw_config.update(PINNED_EXPERT_SETTINGS)
+    raw_config.update(overrides)
+    return validate_system_config(raw_config=raw_config)
 
 
-class OmplCasadiPlannerTests(unittest.TestCase):
+def _expert(simulator: FrankaSystem, config: dict) -> OmplCasadiPlanner:
+    return OmplCasadiPlanner(simulator, ExpertConfig.from_mapping(config), ProjectionConfig.from_mapping(config))
+
+
+def _rollout(expert: OmplCasadiPlanner, simulator: FrankaSystem, state: np.ndarray, steps: int) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Close the loop with the first action of every plan until the goal is reached: the final state and every label."""
+    labels = []
+    state = simulator.reset(state)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # a fallback of the projection warns
+        for _ in range(steps):
+            plan = expert.plan(simulator.observe(state))
+            labels.append(plan.positions)
+            state = simulator.step(state, plan.actions[0])
+            assert simulator.collision.is_collision_free(state[:N]), "the arm collided"
+            if simulator.is_done(state):
+                break
+    return state, labels
+
+
+class ExpertLabelTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.config = pinned_config()
         cls.simulator = FrankaSystem(cls.config)
-        cls.start = sample_initial_state(cls.simulator, SEED)  # also sets the goal
-        cls.goal = cls.simulator.goal.copy()
+        cls.simulator.set_goal(pose_goal(cls.simulator, _far_goal_configuration()))
+        cls.state = rest_state(cls.simulator)
+        cls.expert = _expert(cls.simulator, cls.config)
+        cls.plan = cls.expert.plan(cls.simulator.observe(cls.state))
+        cls.max_velocity = PINNED_EXPERT_SETTINGS["totg_velocity_scale"] * cls.simulator.state_upper_bounds[N : 2 * N]
 
+    def test_the_expert_is_a_planner_the_factory_builds_under_its_name(self) -> None:
+        self.assertIsInstance(self.expert, Planner)
+        self.assertIsInstance(PlannerFactory.create("ompl_casadi", self.simulator, self.config), OmplCasadiPlanner)
+
+    def test_the_plan_has_the_positions_of_the_horizon_and_the_actions_that_track_them(self) -> None:
+        self.assertIsInstance(self.plan, Plan)
+        self.assertEqual(self.plan.positions.shape, (HORIZON, N))
+        self.assertEqual(self.plan.actions.shape, (HORIZON, self.simulator.nu))
+        self.assertTrue(np.isfinite(self.plan.positions).all() and np.isfinite(self.plan.actions).all())
+        self.assertEqual(self.plan.actions[0].shape, (self.simulator.nu,))
+
+    def test_the_horizon_is_the_number_of_rows_of_the_label(self) -> None:
+        config = pinned_config(horizon=7)
+        expert = _expert(self.simulator, config)
+
+        plan = expert.plan(self.simulator.observe(self.state))
+
+        self.assertEqual((plan.positions.shape, plan.actions.shape), ((7, N), (7, self.simulator.nu)))
+
+    def test_the_label_starts_near_the_arm_and_heads_to_the_goal(self) -> None:
+        q = self.state[:N]
+        reach = np.linalg.norm(self.max_velocity) * self.simulator.dt  # what the arm covers in a control period at most
+
+        self.assertLessEqual(np.linalg.norm(self.plan.positions[0] - q), reach)
+        start_error = self.simulator.goal_errors(self.state)[0]
+        errors = [self.simulator.goal_errors(np.concatenate([row, np.zeros(2 * N)]))[0] for row in self.plan.positions]
+        self.assertLess(errors[-1], start_error)
+        self.assertLess(errors[-1], errors[0])
+
+    def test_the_label_respects_the_velocity_limits(self) -> None:
+        rows = np.vstack([self.state[:N], self.plan.positions])
+
+        velocities = np.abs(np.diff(rows, axis=0)) / self.simulator.dt
+
+        self.assertTrue(np.all(velocities <= self.max_velocity * 1.05))
+
+    def test_the_label_speeds_up_smoothly_from_rest(self) -> None:
+        rows = np.vstack([self.state[:N], self.plan.positions])
+        steps = np.linalg.norm(np.diff(rows, axis=0), axis=1)
+
+        self.assertLess(steps[0], steps[2])
+
+    def test_the_actions_track_the_label_from_the_state(self) -> None:
+        rolled = self.simulator.rollout_positions(self.state, self.plan.actions)[1:]
+
+        np.testing.assert_allclose(rolled[:5], self.plan.positions[:5], atol=0.1)  # within what the jerk limit lets the arm follow
+
+    def test_the_first_action_is_within_the_limits_of_the_plant(self) -> None:
+        self.assertTrue(np.all(np.abs(self.plan.actions[0]) <= self.simulator.max_action + 1e-6))
+
+    def test_the_label_is_the_same_from_the_same_state_with_a_new_expert(self) -> None:
+        again = _expert(self.simulator, self.config).plan(self.simulator.observe(self.state))
+
+        np.testing.assert_allclose(again.positions, self.plan.positions, atol=1e-9)
+
+    def test_the_label_follows_the_path_ahead_of_the_arm_and_never_goes_back(self) -> None:
+        expert = _expert(self.simulator, self.config)
+        first = expert.plan(self.simulator.observe(self.state))
+        ahead = np.concatenate([first.positions[4], np.zeros(2 * N)])
+        behind = np.concatenate([first.positions[0], np.zeros(2 * N)])
+
+        at_ahead = expert.plan(self.simulator.observe(ahead))
+        at_behind = expert.plan(self.simulator.observe(behind))
+
+        self.assertEqual(expert.statistics["ompl_paths"], 1)
+        np.testing.assert_allclose(at_behind.positions, at_ahead.positions, atol=1e-9)
+
+    def test_an_arm_that_is_already_at_the_goal_is_labelled_with_holding_still(self) -> None:
+        q_goal = self.simulator.goal_configuration(self.simulator.goal, self.state[:N])
+        state = np.concatenate([q_goal, np.zeros(2 * N)])
+        expert = _expert(self.simulator, self.config)
+
+        plan = expert.plan(self.simulator.observe(state))
+
+        np.testing.assert_allclose(plan.positions, np.tile(q_goal, (HORIZON, 1)), atol=1e-6)
+        np.testing.assert_allclose(plan.actions, 0.0, atol=1e-2)
+
+
+class ExpertAmongObstaclesTests(unittest.TestCase):
+    def test_every_label_row_is_collision_free_on_the_table_scene(self) -> None:
+        config = _table_config()
+        simulator = FrankaSystem(config)
+        for seed in (0, 1):
+            expert = _expert(simulator, config)
+            state = sample_initial_state(simulator, seed)
+            with self.subTest(seed=seed), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                for _ in range(6):
+                    plan = expert.plan(simulator.observe(state))
+                    self.assertTrue(simulator.collision.trajectory_is_collision_free(plan.positions))
+                    state = simulator.step(state, plan.actions[0])
+
+    def test_a_rollout_from_rest_reaches_the_goal_among_obstacles_without_collision(self) -> None:
+        config = pinned_config(obstacles=OBSTACLES)
+        simulator = FrankaSystem(config)
+        simulator.set_goal(pose_goal(simulator, _far_goal_configuration()))
+        expert = _expert(simulator, config)
+
+        state, labels = _rollout(expert, simulator, rest_state(simulator), steps=150)
+
+        self.assertTrue(simulator.is_done(state), simulator.goal_errors(state))
+        self.assertEqual(expert.statistics["ompl_replans"], 0)
+        for label in labels:
+            self.assertTrue(simulator.collision.trajectory_is_collision_free(label))
+
+    def test_a_rollout_across_the_table_reaches_the_goal_without_collision(self) -> None:
+        config = _table_config()
+        simulator = FrankaSystem(config)
+        state = sample_initial_state(simulator, 0)
+        expert = _expert(simulator, config)
+
+        state, _ = _rollout(expert, simulator, state, steps=100)
+
+        self.assertTrue(simulator.is_done(state), simulator.goal_errors(state))
+
+
+class ExpertReplanningTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.simulator.set_goal(self.goal)
-        self.planner = PlannerFactory.create("ompl_casadi", self.simulator, self.config)
-        self.guess = self.planner.initial_guess_generator
+        self.config = pinned_config()
+        self.simulator = FrankaSystem(self.config)
+        self.simulator.set_goal(pose_goal(self.simulator, _far_goal_configuration()))
+        self.state = rest_state(self.simulator)
+        self.expert = _expert(self.simulator, self.config)
 
-    def _first_observation(self) -> np.ndarray:
-        self.planner.reset()
-        return self.simulator.observe(self.simulator.reset(self.start))
+    def test_a_rollout_that_follows_the_path_plans_it_once(self) -> None:
+        state, _ = _rollout(self.expert, self.simulator, self.state, steps=150)
 
-    def _elsewhere(self) -> np.ndarray:
-        """An observation of the arm far from the last solution, with the planner's goal."""
-        elsewhere = sample_initial_state(self.simulator, 5)
-        self.simulator.set_goal(self.goal)  # the sample drew a new goal; the planner's goal stays the same
-        distance = np.min(np.linalg.norm(self.planner.last_X_sol[:N].T - elsewhere[:N], axis=1))
-        self.assertGreater(distance, self.guess.replan_distance)
-        return self.simulator.observe(elsewhere)
+        self.assertTrue(self.simulator.is_done(state))
+        self.assertEqual(self.expert.statistics["ompl_paths"], 1)
+        self.assertEqual(self.expert.statistics["ompl_replans"], 0)
 
-    def test_it_is_a_casadi_planner_composed_with_an_ompl_initial_guess(self) -> None:
-        self.assertIs(type(self.planner), CasadiPlanner)
-        self.assertIsInstance(self.guess, OmplInitialGuess)
+    def test_an_arm_near_the_path_does_not_replan(self) -> None:
+        self.expert.plan(self.simulator.observe(self.state))
+        nudged = self.state.copy()
+        nudged[0] += 0.5 * self.config["replan_distance"]
 
-    def test_the_mpc_heads_for_the_point_ahead_on_the_path_not_for_its_end(self) -> None:
-        self.planner.plan(self._first_observation())
+        self.expert.plan(self.simulator.observe(nudged))
 
-        target = self.guess.target(self.simulator.reset(self.start)[:N])
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["ompl_replans"]), (1, 0))
 
-        self.assertIsNotNone(target)
-        self.assertGreater(np.linalg.norm(target - self.planner.goal_configuration), 0.1)
-        self.assertLessEqual(np.linalg.norm(target - self.start[:N]), self.guess.lookahead + 1e-9)
-        np.testing.assert_allclose(self.planner._graph.value(self.planner.goal_param)[:N], target, atol=1e-9)
+    def test_a_new_path_is_planned_when_the_arm_is_pushed_far_from_the_path(self) -> None:
+        self.expert.plan(self.simulator.observe(self.state))
+        pushed = self.state.copy()
+        pushed[2] += 2.0 * self.config["replan_distance"]
+        pushed[4] -= 0.6 * self.config["replan_distance"]
 
-    def test_the_target_is_none_before_a_path_and_after_a_reset(self) -> None:
-        self.assertIsNone(self.guess.target(self.start[:N]))
-        self.planner.plan(self._first_observation())
-        self.assertIsNotNone(self.guess.target(self.start[:N]))
+        plan = self.expert.plan(self.simulator.observe(pushed))
 
-        self.planner.reset()
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["ompl_replans"]), (2, 1))
+        reach = np.linalg.norm(PINNED_EXPERT_SETTINGS["totg_velocity_scale"] * self.simulator.state_upper_bounds[N : 2 * N]) * self.simulator.dt
+        self.assertLessEqual(np.linalg.norm(plan.positions[0] - pushed[:N]), reach)
 
-        self.assertIsNone(self.guess.target(self.start[:N]))
+    def test_reset_forgets_the_path_and_the_next_plan_is_not_a_replan(self) -> None:
+        self.expert.plan(self.simulator.observe(self.state))
 
-    def test_it_reaches_the_goal_pose_and_comes_to_rest(self) -> None:
-        reached = _closed_loop(self.simulator, self.planner, self.start, 80)
+        self.expert.reset()
+        self.expert.plan(self.simulator.observe(self.state))
 
-        self.assertTrue(reached)
-        self.assertEqual((self.guess.path_plans, self.guess.path_failures), (1, 0))
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["ompl_replans"]), (2, 0))
 
-    def test_the_goal_configuration_is_the_end_of_the_path_and_the_first_solve_starts_from_the_path(self) -> None:
-        observation = self._first_observation()
-        path = self.guess.path_planner.plan(observation)
 
-        with mock.patch.object(self.guess.path_planner, "plan", return_value=path):
-            states, _ = initial_guess(self.planner, observation)
+class ExpertTrimmingTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # an obstacle far from the arm: the scene has obstacles, so the tracker has its half-spaces
+        self.config = pinned_config(obstacles=[{"position": [0.0, -0.9, 0.9], "radius": 0.02}])
+        self.simulator = FrankaSystem(self.config)
+        self.simulator.set_goal(pose_goal(self.simulator, _far_goal_configuration()))
+        self.state = rest_state(self.simulator)
+        self.expert = _expert(self.simulator, self.config)
 
-        np.testing.assert_array_equal(self.planner.goal_configuration, path.positions[-1])
-        ahead = path.positions[1 : self.planner.N + 1]  # a path shorter than the horizon is held at its end
-        np.testing.assert_allclose(states[:N, 1 : 1 + len(ahead)], ahead.T, atol=1e-9)
+    def _obstacle_on_row(self, label: np.ndarray, row: int) -> int:
+        """Put a small obstacle on the bounding sphere that moves most between ``row`` and the ends of ``label``."""
+        centers = np.array([self.simulator.collision_spheres(q)[0] for q in label])
+        motion = np.minimum(np.linalg.norm(centers[row] - centers[0], axis=1), np.linalg.norm(centers[row] - centers[-1], axis=1))
+        sphere = int(np.argmax(motion))
+        self.simulator.collision.obstacles[:] = [(centers[row][sphere], 0.02)]
+        return self.simulator.collision.free_prefix(label)
 
-    def test_later_solves_start_from_the_previous_solution_and_plan_no_new_path(self) -> None:
-        state = self.simulator.reset(self.start)
-        self.planner.reset()
+    def test_a_free_reference_is_not_trimmed(self) -> None:
+        reference = self.expert.plan(self.simulator.observe(self.state)).positions
 
-        for _ in range(5):
-            state = _step_along(self.simulator, self.planner, state)
+        trimmed = self.expert._trimmed(reference, self.state[:N])
 
-        self.assertEqual((self.guess.path_plans, self.planner.optimizations), (1, 5))
+        np.testing.assert_array_equal(trimmed, reference)
+        self.assertEqual(self.expert.statistics["trimmed_labels"], 0)
 
-    def test_the_plan_is_the_mpcs_over_its_horizon_and_starts_at_the_state(self) -> None:
-        plan = self.planner.plan(self._first_observation())
+    def test_the_rows_from_the_first_penetration_hold_the_last_free_row(self) -> None:
+        reference = self.expert.plan(self.simulator.observe(self.state)).positions
+        free = self._obstacle_on_row(reference, 10)
+        self.assertTrue(0 < free < len(reference))
 
-        self.assertEqual(plan.positions.shape, (self.planner.N + 1, N))
-        np.testing.assert_allclose(plan.positions[0], self.start[:N], atol=1e-9)
+        trimmed = self.expert._trimmed(reference, self.state[:N])
 
-    def test_a_failing_solve_falls_back_to_the_path_it_started_from(self) -> None:
-        observation = self._first_observation()
-        path = self.guess.path_planner.plan(observation)
+        np.testing.assert_array_equal(trimmed[:free], reference[:free])
+        np.testing.assert_array_equal(trimmed[free:], np.tile(reference[free - 1], (len(reference) - free, 1)))
+        self.assertTrue(self.simulator.collision.trajectory_is_collision_free(trimmed))
+        self.assertEqual(self.expert.statistics["trimmed_labels"], 1)
 
-        with mock.patch.object(self.guess.path_planner, "plan", return_value=path):  # the path is the planner's own
-            with mock.patch.object(CasadiPlanner, "_solve", side_effect=PlannerSolveError("no solution")):
-                plan = self.planner.plan(observation)
+    def test_a_reference_that_penetrates_from_its_first_row_holds_the_current_configuration(self) -> None:
+        reference = self.expert.plan(self.simulator.observe(self.state)).positions
+        centers = self.simulator.collision_spheres(reference[0])[0]
+        self.simulator.collision.obstacles[:] = [(centers[-1], 0.02)]
+        self.assertEqual(self.simulator.collision.free_prefix(reference), 0)
 
-        self.assertEqual((self.planner.optimizations, self.planner.statistics["trajectory_fallbacks"]), (0, 1))
-        np.testing.assert_allclose(plan.positions[1 : len(path.positions)], path.positions[1 : self.planner.N + 1], atol=1e-9)
+        trimmed = self.expert._trimmed(reference, self.state[:N])
 
-    def test_a_failing_solve_without_a_path_to_fall_back_to_is_the_planners_failure(self) -> None:
-        observation = self._first_observation()
+        np.testing.assert_array_equal(trimmed, np.tile(self.state[:N], (len(reference), 1)))
 
-        with mock.patch.object(self.guess.path_planner, "plan", side_effect=PlannerSolveError("no path")):
-            with mock.patch.object(CasadiPlanner, "_solve", side_effect=PlannerSolveError("no solution")):
-                with self.assertRaises(PlannerSolveError):
-                    self.planner.plan(observation)
+    def test_a_plan_is_trimmed_where_an_obstacle_lies_on_the_path(self) -> None:
+        reference = self.expert.plan(self.simulator.observe(self.state)).positions
+        free = self._obstacle_on_row(reference, 10)
+        self.assertTrue(0 < free < len(reference))
 
-    def test_a_failing_path_planner_leaves_the_mpc_alone_and_is_not_retried_every_step(self) -> None:
-        state = self.simulator.reset(self.start)
-        self.planner.reset()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            plan = self.expert.plan(self.simulator.observe(self.state))
 
-        with mock.patch.object(self.guess.path_planner, "plan", side_effect=PlannerSolveError("no path")) as plan:
-            for _ in range(3):
-                state = _step_along(self.simulator, self.planner, state)
+        np.testing.assert_allclose(plan.positions[:free], reference[:free], atol=1e-9)
+        np.testing.assert_allclose(plan.positions[free:], np.tile(reference[free - 1], (len(reference) - free, 1)), atol=1e-9)
+        self.assertTrue(self.simulator.collision.trajectory_is_collision_free(plan.positions))
+        self.assertEqual(self.expert.statistics["trimmed_labels"], 1)
 
-        self.assertEqual(plan.call_count, 1)
-        self.assertEqual((self.guess.path_plans, self.guess.path_failures), (0, 1))
-        self.assertEqual(self.planner.optimizations, 3)
-        # the goal configuration then comes from IK
-        self.assertLess(max(self.simulator.goal_errors(self.planner.goal_configuration)), 1e-5)
 
-    def test_the_arm_driven_far_from_the_last_solution_gets_a_new_path_from_where_it_is(self) -> None:
-        self.planner.plan(self._first_observation())
-        self.assertEqual(self.guess.path_plans, 1)
+class ExpertFailureTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = pinned_config()
+        self.simulator = FrankaSystem(self.config)
+        self.simulator.set_goal(pose_goal(self.simulator, _far_goal_configuration()))
+        self.state = rest_state(self.simulator)
+        self.expert = _expert(self.simulator, self.config)
 
-        self.planner.plan(self._elsewhere())
+    def test_a_goal_that_no_configuration_reaches_raises_and_is_counted(self) -> None:
+        goal = self.simulator.goal.copy()
+        goal[:3] = [5.0, 0.0, 0.0]
+        self.simulator.set_goal(goal)
 
-        self.assertEqual(self.guess.path_plans, 2)
+        with self.assertRaises(PlannerSolveError):
+            self.expert.plan(self.simulator.observe(self.state))
+        with self.assertRaises(PlannerSolveError):  # the path is planned again at the next call
+            self.expert.plan(self.simulator.observe(self.state))
 
-    def test_the_statistics_count_paths_replans_failures_solves_and_fallbacks(self) -> None:
-        def counts(paths: int, replans: int, failures: int, optimizations: int) -> dict[str, int]:
-            return {
-                "ompl_paths": paths,
-                "ompl_replans": replans,
-                "ompl_path_failures": failures,
-                "trajectory_optimizations": optimizations,
-                "relaxed_solutions": 0,
-                "trajectory_fallbacks": 0,
-            }
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["ompl_path_failures"]), (0, 2))
 
-        self.assertEqual(self.planner.statistics, counts(0, 0, 0, 0))
+    def test_a_start_in_collision_raises(self) -> None:
+        centers = self.simulator.collision_spheres(self.state[:N])[0]
+        self.simulator.collision.obstacles[:] = [(centers[-1], 0.02)]
 
-        self.planner.plan(self._first_observation())  # the first path of the episode is no replan
-        self.assertEqual(self.planner.statistics, counts(1, 0, 0, 1))
+        with self.assertRaises(PlannerSolveError):
+            self.expert.plan(self.simulator.observe(self.state))
 
-        self.planner.plan(self._elsewhere())  # the arm left the last solution: a replan
-        self.assertEqual(self.planner.statistics, counts(2, 1, 0, 2))
+        self.assertEqual(self.expert.statistics["ompl_path_failures"], 1)
 
-        with mock.patch.object(self.guess.path_planner, "plan", side_effect=PlannerSolveError("no path")):
-            self.planner.plan(self.simulator.observe(self.start))  # far from the new solution again, planning fails
-        self.assertEqual(self.planner.statistics, counts(2, 2, 1, 3))
+    def test_a_timeout_without_a_path_raises(self) -> None:
+        config = pinned_config(ompl_timeout=1e-9, obstacles=OBSTACLES)
+        simulator = FrankaSystem(config)
+        simulator.set_goal(pose_goal(simulator, _far_goal_configuration()))
+        expert = _expert(simulator, config)
 
-    def test_the_statistics_survive_a_reset_while_a_new_episode_starts_with_a_first_path(self) -> None:
-        self.planner.plan(self._first_observation())
+        with self.assertRaises(PlannerSolveError):
+            expert.plan(simulator.observe(self.state))
 
-        self.planner.reset()
-        self.planner.plan(self.simulator.observe(self.start))
+        self.assertEqual(expert.statistics["ompl_path_failures"], 1)
 
-        self.assertEqual(self.planner.statistics["ompl_paths"], 2)
-        self.assertEqual(self.planner.statistics["ompl_replans"], 0)
+    def test_a_plan_the_arm_cannot_track_safely_raises(self) -> None:
+        def cannot_track(state, reference):
+            raise PlannerSolveError("no safe plan")
 
-    def test_a_new_goal_gets_a_new_path(self) -> None:
-        observation = self._first_observation()
-        self.planner.plan(observation)
+        self.expert._tracker.project = cannot_track
 
-        self.simulator.set_goal(pose_goal(self.simulator, self.start[:N] + 0.2))
-        self.planner.plan(self.simulator.observe(self.start))
+        with self.assertRaises(PlannerSolveError):
+            self.expert.plan(self.simulator.observe(self.state))
 
-        self.assertEqual(self.guess.path_plans, 2)
 
-    def test_reset_forgets_the_solution_and_the_goal_configuration(self) -> None:
-        self.planner.plan(self._first_observation())
-        self.assertIsNotNone(self.planner.last_X_sol)
+class ExpertStatisticsTests(unittest.TestCase):
+    def test_the_counters_start_at_zero(self) -> None:
+        config = pinned_config()
 
-        self.planner.reset()
+        statistics = _expert(FrankaSystem(config), config).statistics
 
-        self.assertIsNone(self.planner.last_X_sol)
-        self.assertIsNone(self.planner.goal_configuration)
+        self.assertEqual(statistics, {name: 0 for name in STATISTICS})
+
+    def test_the_counters_are_cumulative_over_episodes(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        simulator.set_goal(pose_goal(simulator, _far_goal_configuration()))
+        expert = _expert(simulator, config)
+        observation = simulator.observe(rest_state(simulator))
+
+        for episode in range(1, 4):
+            expert.reset()
+            expert.plan(observation)
+            expert.plan(observation)  # the same episode: the path is kept
+
+            self.assertEqual(expert.statistics["ompl_paths"], episode)
+
+        self.assertEqual(expert.statistics["ompl_replans"], 0)
 
 
 if __name__ == "__main__":

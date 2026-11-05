@@ -3,8 +3,8 @@
     venv/bin/python -m scripts.meshcat_dataset --root data/lerobot_dataset_franka_dagger_<timestamp> --first --episodes 10 --show-plan
 
 The episodes are the first --episodes ones (--first), the explicit --indices, or random ones (--seed). With --show-plan
-the expert's plan that labels each frame (the action chunk the flow network is trained to predict from that frame's
-observation) is drawn as the TCP path of the motion it leads to, in cyan, while the arm moves. --no-viewer prints the
+the expert's plan that labels each frame (the chunk of joint positions the flow network is trained to predict from that
+frame's observation) is drawn as the TCP path of the motion it leads to, in cyan, while the arm moves. --no-viewer prints the
 per-episode table only. With --overview the TCP paths of every episode are also drawn at once (green if the episode
 ended within --success-tol of the goal, orange otherwise, blue dots at the starts, red dots at the goals).
 
@@ -40,20 +40,20 @@ class Episode(NamedTuple):
     index: int
     states: np.ndarray  # (T, 3n) joint positions, velocities and accelerations
     goal: np.ndarray  # (12,) goal TCP pose [position, rotation matrix row-major]
-    actions: np.ndarray  # (T, H, n) the expert's planned jerks that label each frame
+    plans: np.ndarray  # (T, H, n) the expert's planned joint positions that label each frame
 
     @property
     def positions(self) -> np.ndarray:
-        return self.states[:, : self.actions.shape[2]]
+        return self.states[:, : self.plans.shape[2]]
 
     @property
     def velocities(self) -> np.ndarray:
-        return self.states[:, self.actions.shape[2] : 2 * self.actions.shape[2]]
+        return self.states[:, self.plans.shape[2] : 2 * self.plans.shape[2]]
 
 
-def plan_positions(dyn: FrankaSystem, episode: Episode) -> np.ndarray:
+def plan_positions(episode: Episode) -> np.ndarray:
     """The joint positions (T, H + 1, n) of the plan that labels each frame, row 0 the frame's own configuration."""
-    return np.stack([dyn.rollout_positions(state, actions) for state, actions in zip(episode.states, episode.actions)])
+    return np.concatenate([episode.positions[:, None], episode.plans], axis=1)
 
 
 def read_frames(root: Path) -> pd.DataFrame:
@@ -97,8 +97,8 @@ def load_episodes(
         n = state.shape[1] // 3
         environment = np.stack(rows["observation.environment_state"].to_numpy()).astype(float)[0]
         goal = dyn.observation_from_policy(environment, state[0])[: dyn.goal_dim]
-        action = np.stack(rows["action"].to_numpy()).astype(float)
-        episodes.append(Episode(int(index), state, goal, action.reshape(len(rows), -1, n)))
+        plans = np.stack(rows["action"].to_numpy()).astype(float)
+        episodes.append(Episode(int(index), state, goal, plans.reshape(len(rows), -1, n)))
     return episodes
 
 
@@ -106,7 +106,7 @@ def episode_summary(dyn: FrankaSystem, episode: Episode) -> dict[str, float]:
     """What the episode ends like and what its labels say: how far from the goal, how much of it at rest or 'stay'."""
     dyn.set_goal(episode.goal)
     position_error, rotation_error = dyn.goal_errors(episode.positions[-1])
-    plans = plan_positions(dyn, episode)
+    plans = plan_positions(episode)
     excursion = np.abs(plans[:, 1:] - plans[:, :1]).max(axis=(1, 2))
     return {
         "frames": len(episode.positions),
@@ -147,7 +147,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("scripts/config/franka_casadi_config.yaml"),
+        default=Path("scripts/config/franka_config.yaml"),
         help="expert yaml config, only its dt and the robot model are used (default: %(default)s)",
     )
     parser.add_argument("--episodes", type=int, default=10)
@@ -191,7 +191,7 @@ def main() -> None:
                 viz.viewer["goal"].set_transform(dyn.goal_transform(episode.goal))
                 start = dyn.tcp_placement(episode.positions[0]).translation
                 viz.viewer["start"].set_transform(tf.translation_matrix(start))
-                for q, plan in zip(episode.positions, plan_positions(dyn, episode)):
+                for q, plan in zip(episode.positions, plan_positions(episode)):
                     viz.display(q)
                     if args.show_plan:
                         draw_plan(viz, "plan", plan_tcp_points(dyn, plan), PLAN_COLOR)

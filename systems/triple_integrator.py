@@ -123,6 +123,11 @@ class TripleIntegratorBase(SystemSimulator):
         return self._path_upper
 
     @property
+    def position_scale(self) -> np.ndarray:
+        """Half the range of every coordinate's path box: the scale the positions of a policy's chunk are normalized by."""
+        return (self._path_upper - self._path_lower) / 2.0
+
+    @property
     def rest_state_indices(self) -> tuple[int, ...]:
         return tuple(range(self.n, self.nx))  # velocity and acceleration
 
@@ -243,6 +248,12 @@ class TripleIntegratorBase(SystemSimulator):
     @property
     def action_names(self) -> list[str]:
         return [f"{name}.jerk" for name in self.coordinate_names]
+
+    def history_names(self, length: int) -> list[str]:
+        return [f"{name}.pos[t-{length - 1 - k}]" for k in range(length) for name in self.coordinate_names]
+
+    def plan_names(self, rows: int) -> list[str]:
+        return [f"{name}.pos[t+{k + 1}]" for k in range(rows) for name in self.coordinate_names]
 
     # --- sampling ---------------------------------------------------------------
 

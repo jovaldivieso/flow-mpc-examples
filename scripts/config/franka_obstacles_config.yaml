@@ -1,0 +1,50 @@
+# Expert (OMPL RRT-Connect path timed by time-optimal trajectory generation) config for the Franka FR3 arm with spherical obstacles.
+# State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
+system: franka
+dt: 0.1
+# Limits of the arm [rad/s^2, rad/s^3]; joint position and velocity limits come from the URDF
+max_acceleration: 5.0
+max_jerk: 15.0
+
+# The expert planner (planning/planner_factory.py): ompl_casadi, the positions along an OMPL RRT-Connect path timed by
+# time-optimal trajectory generation, tracked by the safety projection's jerks
+expert: ompl_casadi
+# Rows of positions the expert plans per state. DAgger labels a state with the first prediction_horizon (the policy config's
+# chunk length, at most this) of them.
+horizon: 20
+
+# Settings of the OMPL path and its timing
+ompl_timeout: 5.0               # s per RRT-Connect solve
+ompl_candidates: 10              # RRT-Connect paths planned per path, the one the end effector travels the shortest along is kept
+ompl_seed: 0
+replan_distance: 0.5            # rad from the timed path (the learner drove the arm away): plan a new path
+progress_window: 1.5            # rad of path length ahead of the arm's progress searched for its nearest point on the path
+totg_velocity_scale: 0.8        # fractions of the velocity and acceleration limits the path is timed within
+totg_acceleration_scale: 0.5
+totg_max_deviation: 0.05        # rad the timed path may cut the corner of a waypoint
+
+
+# Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
+pos_tol: 0.03
+vel_tol: 0.01
+
+# The projection that tracks the positions (the expert's, and the safeflow policy's): the weights of the derivatives of the
+# tracking (the positions weigh 1) as in the authors' safety filter, and of the soft rest at the end of the chunk
+projection_velocity_weight: 0.001
+projection_acceleration_weight: 0.001
+projection_jerk_weight: 0.0001
+terminal_velocity_weight: 10.0
+
+# Random start configurations and goal poses (the TCP pose of a random configuration): minimum TCP-to-goal distance [m]
+min_start_goal_distance: 0.3
+
+# Spherical obstacles in the world frame [m]
+obstacles:
+  - position: [0.45, -0.12, 0.40]
+    radius: 0.08
+  - position: [0.45, 0.15, 0.48]
+    radius: 0.08
+
+initial_state_seed: 0
+action_noise_seed: 0
+

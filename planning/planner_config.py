@@ -3,107 +3,103 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Mapping
 
-from planning.casadi_graph import SLACK_TOLERANCE
-from systems.config_fields import (
-    ConfigurationError,
-    read_bool,
-    read_float,
-    read_int,
-    read_positive_vector,
-)
+from systems.config_fields import ConfigurationError, read_float, read_int
 
 
 @dataclass(frozen=True)
-class PlannerConfig:
-    # The expert planner: a name of planning.planner_factory.PLANNER_REGISTRY (``validate_system_config`` checks it)
-    expert: str = "casadi"
+class ExpertConfig:
+    """The expert ``ompl_casadi``: an OMPL RRT-Connect path to the goal configuration, timed by time-optimal trajectory
+    generation (``planning/totg.py``), whose positions ahead of the arm are the plan.
+
+    The field names are the YAML keys (and the keys of the validated config).
+    """
+
+    # The expert's name, a key of planning.planner_factory.PLANNER_REGISTRY (``validate_system_config`` checks it)
+    expert: str = "ompl_casadi"
+    # Rows of positions the expert plans (at least the policy's ``prediction_horizon``)
     horizon: int = 20
-    q_diag: tuple[float, ...] = ()
-    r_weight: float = 0.1
-    r_diag: tuple[float, ...] = ()
-    terminal_cost_multiplier: float = 10.0
-    # Read by CasadiPlanner: the obstacle slack [m] its solutions may use. Above SLACK_TOLERANCE a state the strict solve
-    # rejects is still labelled (the plan that brakes at the least violation); the projector always keeps SLACK_TOLERANCE.
-    expert_slack_tolerance: float = SLACK_TOLERANCE
-    # Read by CasadiTrajectoryProjector (planning/casadi_projector.py); a config
-    # that omits them gets these defaults.
-    terminal_velocity_weight: float = 1.0
-    projection_full_weight_steps: int = 3
+    ompl_timeout: float = 5.0  # [s] per RRT-Connect solve
+    # RRT-Connect paths planned per path; the one along which the end effector travels the shortest is kept
+    ompl_candidates: int = 1
+    ompl_seed: int = 0
+    # Distance [rad] from the timed path at which a new path is planned from where the arm is (the learner drove it away)
+    replan_distance: float = 0.5
+    # Path length [rad] ahead of the arm's progress searched for the point of the path nearest to it
+    progress_window: float = 1.5
+    # The fractions of the velocity and acceleration limits the path is timed within: the arm tracks it within its jerk limit
+    totg_velocity_scale: float = 0.8
+    totg_acceleration_scale: float = 0.5
+    # How far [rad] the timed path may cut the corner of a waypoint of the OMPL path (the circular blend of the path)
+    totg_max_deviation: float = 0.05
+
+    def __post_init__(self) -> None:
+        if self.horizon <= 0:
+            raise ConfigurationError("'horizon' must be positive.")
+        if self.ompl_candidates < 1:
+            raise ConfigurationError("'ompl_candidates' must be at least 1.")
+        for name in ("ompl_timeout", "replan_distance", "progress_window", "totg_max_deviation"):
+            if getattr(self, name) <= 0:
+                raise ConfigurationError(f"'{name}' must be positive.")
+        for name in ("totg_velocity_scale", "totg_acceleration_scale"):
+            if not 0 < getattr(self, name) <= 1:
+                raise ConfigurationError(f"'{name}' must be in (0, 1].")
+
+    @classmethod
+    def from_mapping(cls, config: Mapping[str, Any]) -> ExpertConfig:
+        """The settings of a (raw) config; keys it omits keep their defaults, wrong types and values are rejected."""
+        defaults = asdict(cls())
+        values: dict[str, Any] = {}
+        for name, default in defaults.items():
+            if isinstance(default, str):
+                values[name] = str(config.get(name, default))
+            elif isinstance(default, int):
+                values[name] = read_int(config, name, default)
+            else:
+                values[name] = read_float(config, name, default)
+        return cls(**values)
+
+    @classmethod
+    def keys(cls) -> set[str]:
+        return {field.name for field in fields(cls)}
+
+
+@dataclass(frozen=True)
+class ProjectionConfig:
+    """The cost of ``CasadiTrajectoryProjector`` (the tracking of a chunk of positions, after SafeFlowMPC's safety filter,
+    which weights the positions 1, the velocities and accelerations 1e-3 and the jerks 1e-4) and its fallback."""
+
+    velocity_weight: float = 1e-3
+    acceleration_weight: float = 1e-3
+    jerk_weight: float = 1e-4
+    # Weight of the soft rest at the end of the chunk, which keeps the problem feasible from a high speed
+    terminal_velocity_weight: float = 10.0
     fallback_terminal_velocity_tol: float = 1e-2
     max_consecutive_fallbacks: int = 5
 
     def __post_init__(self) -> None:
-        if self.r_weight <= 0:
-            raise ConfigurationError("'R_weight' must be positive.")
-        if self.horizon <= 0:
-            raise ConfigurationError("'horizon' must be positive.")
-        if self.terminal_cost_multiplier <= 0:
-            raise ConfigurationError("'terminal_cost_multiplier' must be positive.")
-        if self.expert_slack_tolerance < SLACK_TOLERANCE:
-            raise ConfigurationError(f"'expert_slack_tolerance' must be at least {SLACK_TOLERANCE}.")
-        if self.terminal_velocity_weight <= 0:
-            raise ConfigurationError("'terminal_velocity_weight' must be positive.")
-        if self.projection_full_weight_steps <= 0:
-            raise ConfigurationError("'projection_full_weight_steps' must be positive.")
+        for name in ("velocity_weight", "acceleration_weight", "jerk_weight", "terminal_velocity_weight"):
+            if getattr(self, name) <= 0:
+                raise ConfigurationError(f"'{name}' must be positive.")
         if self.fallback_terminal_velocity_tol < 0:
             raise ConfigurationError("'fallback_terminal_velocity_tol' must be non-negative.")
         if self.max_consecutive_fallbacks <= 0:
             raise ConfigurationError("'max_consecutive_fallbacks' must be positive.")
 
     @classmethod
-    def from_mapping(cls, config: Mapping[str, Any]) -> PlannerConfig:
-        """The planner settings of a (raw) config; keys it omits keep their defaults, wrong types and values are
-        rejected. ``Q_diag`` and ``R_diag`` stay empty when omitted: their lengths and defaults depend on the system, so
-        ``CasadiPlanner`` checks and completes them."""
-        defaults = cls()
-        return cls(
-            expert=str(config.get("expert", defaults.expert)),
-            horizon=read_int(config, "horizon", defaults.horizon),
-            q_diag=read_positive_vector(config["Q_diag"], key="Q_diag") if "Q_diag" in config else (),
-            r_weight=read_float(config, "R_weight", defaults.r_weight),
-            r_diag=read_positive_vector(config["R_diag"], key="R_diag") if "R_diag" in config else (),
-            terminal_cost_multiplier=read_float(config, "terminal_cost_multiplier", defaults.terminal_cost_multiplier),
-            expert_slack_tolerance=read_float(config, "expert_slack_tolerance", defaults.expert_slack_tolerance),
-            terminal_velocity_weight=read_float(config, "terminal_velocity_weight", defaults.terminal_velocity_weight),
-            projection_full_weight_steps=read_int(
-                config, "projection_full_weight_steps", defaults.projection_full_weight_steps
-            ),
-            fallback_terminal_velocity_tol=read_float(
-                config, "fallback_terminal_velocity_tol", defaults.fallback_terminal_velocity_tol
-            ),
-            max_consecutive_fallbacks=read_int(config, "max_consecutive_fallbacks", defaults.max_consecutive_fallbacks),
-        )
-
-
-@dataclass(frozen=True)
-class OmplConfig:
-    """Global path planning of the expert ``ompl_casadi``: an OMPL RRT-Connect path to the goal configuration.
-
-    The field names are the YAML keys (and the keys of the validated config).
-    """
-
-    # Speed [rad/s] in joint space the OMPL path is traversed at (its timing: one configuration per control period)
-    ompl_speed: float = 2.0
-    # Distance [rad] from the optimized trajectory at which a new path is planned from where the arm is
-    ompl_replan_distance: float = 0.5
-    # Length [rad] of the path ahead of the arm that the MPC heads for
-    ompl_lookahead: float = 1.5
-    ompl_timeout: float = 5.0  # [s] per RRT-Connect solve
-    ompl_seed: int = 0
-
-    def __post_init__(self) -> None:
-        positive = ("ompl_speed", "ompl_replan_distance", "ompl_lookahead", "ompl_timeout")
-        for name in positive:
-            if getattr(self, name) <= 0:
-                raise ConfigurationError(f"'{name}' must be positive.")
-
-    @classmethod
-    def from_mapping(cls, config: Mapping[str, Any]) -> OmplConfig:
-        """The settings of a (raw) config; keys it omits keep their defaults, wrong types and values are rejected."""
-        read = {bool: read_bool, int: read_int, float: read_float}
+    def from_mapping(cls, config: Mapping[str, Any]) -> ProjectionConfig:
+        """The settings of a (raw) config, under the keys ``projection_<field>`` (``terminal_velocity_weight`` and the two
+        fallback fields under their own names); keys it omits keep their defaults."""
         defaults = asdict(cls())
-        return cls(**{name: read[type(default)](config, name, default) for name, default in defaults.items()})
+        values: dict[str, Any] = {}
+        for name, default in defaults.items():
+            key = cls.key(name)
+            values[name] = read_int(config, key, default) if isinstance(default, int) else read_float(config, key, default)
+        return cls(**values)
+
+    @staticmethod
+    def key(name: str) -> str:
+        return name if name in ("terminal_velocity_weight", "fallback_terminal_velocity_tol", "max_consecutive_fallbacks") else f"projection_{name}"
 
     @classmethod
     def keys(cls) -> set[str]:
-        return {field.name for field in fields(cls)}
+        return {cls.key(field.name) for field in fields(cls)}

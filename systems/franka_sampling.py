@@ -2,8 +2,9 @@
 for the goal.
 
 A region is a box of TCP positions and a cone of hand directions (the tool z-axis within a tilt of an axis, at a random
-roll). A pose of the region is accepted when inverse kinematics reaches it with a valid configuration, so the regions
-can lie anywhere the arm reaches, however far its configuration is from the ready pose.
+roll). A pose of the region is accepted when inverse kinematics from one of a few random configurations reaches it with
+a valid one, so the regions can lie anywhere the arm reaches, however far its configuration is from the ready pose, and
+a pose is reached in different configurations from one draw to the next.
 """
 
 from __future__ import annotations
@@ -13,7 +14,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 
-POSE_ATTEMPTS = 100  # poses drawn per start or goal (each is a multi-start inverse kinematics)
+POSE_ATTEMPTS = 100  # poses drawn per start or goal
+IK_STARTS = 6  # random configurations inverse kinematics starts from for a pose, which is dropped when none gives a valid one
 
 
 @dataclass(frozen=True)
@@ -70,17 +72,24 @@ class SamplingMode:
 
 class EpisodeSampler:
     """Draws the mode of an episode among the selected ones by weight, and the start configuration and goal pose in its
-    regions. ``reach`` returns a valid configuration for a pose (raising ``RuntimeError`` when there is none)."""
+    regions. ``inverse_kinematics(position, rotation, q_init)`` returns the configuration of a pose that it finds from
+    ``q_init`` (raising ``RuntimeError`` when it does not), which ``is_valid`` must accept; the starts are drawn
+    uniformly between the joint limits ``lower`` and ``upper``."""
 
     def __init__(
         self,
         modes: Mapping[str, SamplingMode],
         selected: Sequence[str],
-        reach: Callable[[np.ndarray, np.ndarray], np.ndarray],
+        inverse_kinematics: Callable[[np.ndarray, np.ndarray, np.ndarray], np.ndarray],
+        lower: np.ndarray,
+        upper: np.ndarray,
+        is_valid: Callable[[np.ndarray], bool],
     ) -> None:
         self.modes = [modes[name] for name in selected]
         self._probabilities = np.array([mode.weight for mode in self.modes]) / sum(mode.weight for mode in self.modes)
-        self._reach = reach
+        self._inverse_kinematics = inverse_kinematics
+        self._lower, self._upper = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
+        self._is_valid = is_valid
 
     def draw_mode(self, rng: np.random.Generator) -> SamplingMode:
         return self.modes[rng.choice(len(self.modes), p=self._probabilities)]
@@ -97,8 +106,18 @@ class EpisodeSampler:
     def _reach_in(self, region: PoseRegion, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         for _ in range(POSE_ATTEMPTS):
             position, rotation = region.pose(rng)
+            q = self._reach(position, rotation, rng)
+            if q is not None:
+                return position, q, rotation
+        raise RuntimeError(f"Unable to sample a pose of the region in {POSE_ATTEMPTS} attempts.")
+
+    def _reach(self, position: np.ndarray, rotation: np.ndarray, rng: np.random.Generator) -> np.ndarray | None:
+        """The first valid configuration of the pose that inverse kinematics finds from random starts, or None."""
+        for _ in range(IK_STARTS):
             try:
-                return position, self._reach(position, rotation), rotation
+                q = self._inverse_kinematics(position, rotation, rng.uniform(self._lower, self._upper))
             except RuntimeError:
                 continue
-        raise RuntimeError(f"Unable to sample a pose of the region in {POSE_ATTEMPTS} attempts.")
+            if self._is_valid(q):
+                return q
+        return None

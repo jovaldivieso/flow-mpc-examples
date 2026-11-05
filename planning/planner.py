@@ -21,27 +21,20 @@ def goal_configuration(simulator: TripleIntegratorBase, goal: np.ndarray, q_refe
 
 @dataclass(frozen=True)
 class Plan:
-    """A plan: where the system is to be at the control steps and the actions that take it there.
+    """What an expert plans from a state: where it wants the arm and the actions that track it.
 
-    ``positions`` has one row of joint positions per control period: row k is the configuration k control periods
-    from now, row 0 the configuration the plan starts from. ``actions`` has one row per control period: row k is the
-    action at step k (a path planner has none).
+    ``positions`` has one row of joint positions per control period: row k is the configuration k + 1 control periods
+    from now, which is what the policy imitates; it holds only collision-free configurations. ``actions`` has the
+    action of every control period of the tracking of ``positions`` (row 0 is executed).
     """
 
     positions: np.ndarray
-    actions: np.ndarray | None = None
-
-    def first_actions(self, rows: int) -> np.ndarray:
-        """The first ``rows`` actions; a plan that ends sooner goes on with zero actions. A path (no actions) has none."""
-        if self.actions is None:
-            raise ValueError("A path plan has no actions.")
-        actions = np.asarray(self.actions, dtype=float)
-        return np.vstack([actions, np.zeros((max(0, rows - len(actions)), actions.shape[1]))])[:rows]
+    actions: np.ndarray
 
 
 class Planner(ABC):
     """
-    Abstract base class for all motion planners: a planner plans from the arm's state to its goal pose.
+    Abstract base class for all experts: an expert plans from the arm's state to its goal pose.
     """
 
     @abstractmethod
@@ -52,14 +45,8 @@ class Planner(ABC):
         """
 
     @abstractmethod
-    def plan(self, observation: np.ndarray, initial_plan: Plan | None = None) -> Plan:
-        """
-        Plan from the arm's state in ``observation`` to the goal pose in it.
-
-        ``initial_plan`` is a plan to start from, for planners that optimize: it is their initial guess (a plan shorter
-        than their horizon is held at its last configuration), and nothing holds their solution to it. A planner that
-        has no use for one ignores it.
-        """
+    def plan(self, observation: np.ndarray) -> Plan:
+        """Plan from the arm's state in ``observation`` to the goal pose in it; raises ``PlannerSolveError`` when it cannot."""
 
     @property
     def statistics(self) -> dict[str, int]:

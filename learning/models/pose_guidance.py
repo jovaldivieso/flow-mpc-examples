@@ -9,16 +9,14 @@ from systems.triple_integrator import TripleIntegratorBase
 GUIDANCE_DECAY = 10.0  # alpha of the guidance weight (SafeFlowMPC, Eq. 14)
 GUIDANCE_ONSET = 0.09  # beta: the weight is 1 once the goal is closer than this fraction of the start distance
 JACOBIAN_DAMPING = 1e-3  # of the damped pseudo-inverse of the task Jacobian
-JERK_RIDGE = 1e-6  # of the jerk correction, relative to the largest singular value squared of the jerk-to-state map
-REST_WEIGHT = 10.0  # of keeping the final velocity and acceleration of the chunk, against the positions it moves
 
 
 class PoseGuidance:
     """Guidance of the flow's proposals toward the goal pose (SafeFlowMPC, Oelerich et al., 2026, Eq. 9, 13, 14).
 
     The goal is read from the policy observation (the goal in the TCP frame), so, like the projector, the guidance
-    reads no goal of its simulator. ``guide`` turns the proposed chunk of jerks into the chunk of the same plant whose
-    positions are moved toward the goal, once per Euler step of the flow, before the projection.
+    reads no goal of its simulator. ``guide`` moves the proposed chunk of positions toward the goal, once per Euler step of
+    the flow, before the projection.
 
     For the positions q_k, k = 1..H, of the proposed chunk, the task error e_k (the logarithm of the pose of the goal in the
     TCP frame, in se(3)) and its Jacobian J_k, with e(q + dq) = e(q) - J dq (the body Jacobian times the left Jacobian of
@@ -28,57 +26,24 @@ class PoseGuidance:
         w_k = min(1, exp(-alpha (d_k / d_0 - beta))) k / H,
 
     d_k the position error of q_k and d_0 that of the start of the episode: the guidance only acts close to the goal
-    (relative to the start distance) and more so on the later positions of the horizon. The jerks of that move solve
-
-        min_du  ||M du - [w dq; 0; 0]||_W^2 + lambda ||du||^2,
-
-    M the linear map from the jerks of one joint to [q_1..q_H, v_H, a_H] (the exact triple integrator), so that the
-    final velocity and acceleration of the chunk, which the policy brings to rest, are kept.
+    (relative to the start distance) and more so on the later positions of the horizon.
 
     The moves of the positions are first spread along the chunk by the smoothness metric of CHOMP (``SmoothSpread``), so
-    that the correction is smooth in velocity and acceleration instead of the sum of one step per position.
+    that the correction is smooth in velocity and acceleration instead of the sum of one step per position. Close to the goal
+    the chunk is then brought to rest: ``RestProjection`` scales its final velocity and acceleration by one minus the closeness
+    of its last position to the goal, CHOMP's projection onto a constraint (Eq. 39 of Zucker et al. 2013).
     """
 
     def __init__(self, simulator: TripleIntegratorBase, horizon: int) -> None:
         self.sim = simulator
         self.horizon = int(horizon)
         self._start_distance: float | None = None
-        jerk_to_state = self._jerk_to_state()
-        self._correction = self._correction_map(jerk_to_state)
-        self._rest = RestProjection(jerk_to_state[self.horizon :])
         self._spread = SmoothSpread(self.horizon)
-
-    @property
-    def max_action(self) -> np.ndarray:
-        """The jerk limits of the system the guidance serves."""
-        return self.sim.max_action
+        self._rest = RestProjection(self.horizon, simulator.dt)
 
     def reset(self) -> None:
         """A new episode: the start distance is the one of its first call."""
         self._start_distance = None
-
-    def _jerk_to_state(self) -> np.ndarray:
-        """The (H + 2, H) linear map from the jerks of one joint to [q_1..q_H, v_H, a_H] (the exact triple integrator)."""
-        n, horizon = self.sim.n, self.horizon
-        jerk_to_state = np.zeros((horizon + 2, horizon))
-        for column in range(horizon):
-            state = np.zeros(self.sim.nx)
-            for step in range(horizon):
-                jerk = np.zeros(self.sim.nu)
-                jerk[0] = float(step == column)
-                state = np.array(self.sim.casadi_dynamics(state, jerk), dtype=float).ravel()
-                jerk_to_state[step, column] = state[0]
-            jerk_to_state[horizon, column], jerk_to_state[horizon + 1, column] = state[n], state[2 * n]
-        return jerk_to_state
-
-    def _correction_map(self, jerk_to_state: np.ndarray) -> np.ndarray:
-        """The (H, H + 2) map from the wanted changes of [q_1..q_H, v_H, a_H] of a joint to its change of jerks."""
-        horizon = self.horizon
-        weights = np.concatenate([np.ones(horizon), np.full(2, REST_WEIGHT)])
-        weighted = jerk_to_state * weights[:, None]
-        gram = weighted.T @ weighted
-        ridge = JERK_RIDGE * np.linalg.norm(gram, 2)
-        return np.linalg.solve(gram + ridge * np.eye(horizon), weighted.T * weights[None, :])
 
     def _closeness(self, distance: np.ndarray | float) -> np.ndarray | float:
         """1 once the goal is closer than ``GUIDANCE_ONSET`` of the start distance, falling off exponentially beyond it
@@ -86,24 +51,14 @@ class PoseGuidance:
         return np.minimum(1.0, np.exp(-GUIDANCE_DECAY * (np.asarray(distance, dtype=float) / self._start_distance - GUIDANCE_ONSET)))
 
     def guide(self, environment_state: np.ndarray, state: np.ndarray, proposal: np.ndarray) -> np.ndarray:
-        """The proposed chunk (H, nu) moved toward the goal and brought toward rest."""
+        """The proposed chunk of positions (H, n) moved toward the goal."""
         sim, horizon = self.sim, self.horizon
-        x0 = sim.state_from_policy(state)
         goal = sim.observation_from_policy(environment_state, state)[: sim.goal_dim]
         if self._start_distance is None:
-            self._start_distance = max(sim.goal_task_error(x0[: sim.n], goal)[2], 1e-6)
-        tasks = [sim.goal_task_error(q, goal) for q in sim.rollout_positions(x0, proposal)[1:]]
-        errors, jacobians, distances = (np.array(values) for values in zip(*tasks))
+            self._start_distance = max(sim.goal_task_error(np.asarray(state, dtype=float)[: sim.n], goal)[2], 1e-6)
+        errors, jacobians, distances = (np.array(values) for values in zip(*[sim.goal_task_error(q, goal) for q in proposal]))
         damped = np.einsum("hmi,hmj->hij", jacobians, jacobians) + JACOBIAN_DAMPING * np.eye(sim.n)
         steps = np.linalg.solve(damped, np.einsum("hmi,hm->hi", jacobians, errors)[..., None])[..., 0]
         weights = self._closeness(distances) * np.arange(1, horizon + 1) / horizon
-        moves = np.zeros((horizon + 2, sim.n))
-        moves[:horizon] = self._spread(weights[:, None] * steps)
-        guided = proposal + self._correction @ moves
-        final = sim.rollout_states(x0, guided)[-1]
-        guided = self._rest(
-            guided, final[sim.n : 2 * sim.n], final[2 * sim.n :], float(self._closeness(sim.goal_task_error(final[: sim.n], goal)[2]))
-        )
-        # The guidance never takes a jerk past its limit; a proposal beyond it is left to the projection
-        bound = np.maximum(sim.max_action, np.abs(proposal))
-        return np.clip(guided, -bound, bound)
+        guided = proposal + self._spread(weights[:, None] * steps)
+        return self._rest(guided, float(self._closeness(sim.goal_task_error(guided[-1], goal)[2])))

@@ -23,6 +23,7 @@ from learning.config_loaders import (
     load_dagger_training_config,
     load_flow_config,
     load_policy_type,
+    load_execution_horizon,
     load_prediction_horizon,
     load_unet_config,
 )
@@ -221,7 +222,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--policy-config",
         type=Path,
-        default=Path(PROJECT_ROOT) / "learning/config/franka_casadi_flow_config.yaml",
+        default=Path(PROJECT_ROOT) / "learning/config/franka_flow_config.yaml",
     )
     p.add_argument("--checkpoint-dir", type=Path)
     p.add_argument("--seed", type=int)
@@ -346,6 +347,7 @@ def main() -> None:
         learning_rate=float(option("learning_rate", 1e-4)),
         unet=load_unet_config(args.policy_config),
         prediction_horizon=load_prediction_horizon(args.policy_config),
+        execution_horizon=load_execution_horizon(args.policy_config, load_prediction_horizon(args.policy_config)),
         policy_type=load_policy_type(args.policy_config),
         flow_config=load_flow_config(args.policy_config),
         checkpoint_dir=experiment_dir,
