@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -8,8 +8,7 @@ import numpy as np
 
 from learning.config_loaders import FlowConfig, UnetConfig
 
-SOURCES = ("random", "config")  # the curriculum entries besides the names of the regions
-REGION_KEYS = ("sampling_modes",)  # what a region may override in the system config
+SOURCES = ("random", "config")  # the entries of the training curriculum
 
 
 def _per_round(values: list[Any], rounds: int, name: str) -> list[Any]:
@@ -28,10 +27,8 @@ class DaggerConfig:
     given) are taken as they come, with one value for all rounds or one per round, and are expanded here to one value
     per round.
 
-    ``regions`` names selections of the system config's ``sampling_modes``. A round of the ``training_curriculum``
-    collects in one of them by its name (or draws from all the modes of the system config with ``random``, or from the
-    explicit states with ``config``), and every region is evaluated after every round next to the evaluation on all the
-    modes."""
+    A round of the ``training_curriculum`` collects from random starts and goals of the workspace with ``random``, or
+    from the explicit states with ``config``."""
 
     experiment_config: dict[str, Any]
     repo_id: str
@@ -60,7 +57,6 @@ class DaggerConfig:
     initial_states: list[np.ndarray] | None = None
     goal_states: list[np.ndarray] | None = None
     training_curriculum: list[str] | None = None
-    regions: dict[str, dict[str, Any]] = field(default_factory=dict)
     round_seeds: list[int] | None = None
     restart_round_seed: bool = False
     tolerance_overrides: dict[str, float] | None = None
@@ -101,17 +97,8 @@ class DaggerConfig:
             raise ValueError("Batch size and learning rate must be positive.")
         if self.max_train_steps is not None and self.max_train_steps <= 0:
             raise ValueError("Max train steps must be positive.")
-        for name, region in self.regions.items():
-            if name in SOURCES:
-                raise ValueError(f"A region cannot be named '{name}': that is a curriculum entry of its own.")
-            if not region or set(region) - set(REGION_KEYS):
-                raise ValueError(f"Region '{name}' must set some of {list(REGION_KEYS)} and nothing else.")
-        if self.training_curriculum is not None and any(
-            mode not in (*SOURCES, *self.regions) for mode in self.training_curriculum
-        ):
-            raise ValueError(
-                f"'training_curriculum' entries must be 'random', 'config' or the name of a region ({list(self.regions)})."
-            )
+        if self.training_curriculum is not None and any(mode not in SOURCES for mode in self.training_curriculum):
+            raise ValueError(f"'training_curriculum' entries must be one of {SOURCES}.")
         if self.tolerance_overrides is not None and any(
             value <= 0 for value in self.tolerance_overrides.values()
         ):

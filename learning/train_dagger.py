@@ -84,7 +84,6 @@ def _summarize_cli_args(args: argparse.Namespace) -> dict[str, Any]:
         "action_noise_std": args.action_noise_std,
         "expert_beta_per_iteration": args.expert_beta_per_iteration,
         "training_curriculum": args.training_curriculum,
-        "regions": args.regions,
         "round_seeds": args.round_seeds,
         "restart_round_seed": args.restart_round_seed,
         "initial_states_count": len(parse_initial_states_argument(args.initial_states)) if isinstance(args.initial_states, str) and args.initial_states else (len(args.initial_states) if args.initial_states is not None else 0),
@@ -108,7 +107,6 @@ def _summarize_dagger_config(cfg: Any) -> dict[str, Any]:
         "action_noise_std": cfg.action_noise_std,
         "expert_beta_per_iteration": cfg.expert_beta_per_iteration,
         "training_curriculum": cfg.training_curriculum,
-        "regions": cfg.regions,
         "initial_states_count": len(cfg.initial_states) if cfg.initial_states is not None else 0,
         "goal_states_count": len(cfg.goal_states) if cfg.goal_states is not None else 0,
         "eval_episodes": cfg.eval_episodes,
@@ -139,18 +137,8 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help=(
-            "one entry per DAgger round: 'random' (episodes drawn from all the sampling modes of the system config), 'config' "
-            "(the explicit --initial-states/--goal-states lists) or the name of a region of --regions."
-        ),
-    )
-    p.add_argument(
-        "--regions",
-        type=str,
-        default=None,
-        help=(
-            "named regions as a Python-literal dict from a name to the sampling_modes of the system config it draws "
-            "from, e.g. \"{'table': {'sampling_modes': ['crossing']}}\". A --training-curriculum entry collects in a "
-            "region by its name, and every region is evaluated after every round."
+            "one entry per DAgger round: 'random' (random starts and goals in the workspace) or 'config' "
+            "(the explicit --initial-states/--goal-states lists)."
         ),
     )
     p.add_argument(
@@ -291,7 +279,6 @@ def main() -> None:
         else goal_states_config
     )
     training_curriculum_config = option("training_curriculum", None)
-    regions = _parse_dict_override(option("regions", None), "--regions", "{'table': {'sampling_modes': ['crossing']}}") or {}
     round_seeds_config = option("round_seeds", None)
     restart_round_seed = bool(option("restart_round_seed", False))
     tolerance_overrides = _parse_dict_override(
@@ -332,7 +319,6 @@ def main() -> None:
         initial_states=initial_states,
         goal_states=goal_states,
         training_curriculum=training_curriculum_config,
-        regions=regions,
         round_seeds=round_seeds_config,
         restart_round_seed=restart_round_seed,
         tolerance_overrides=tolerance_overrides,

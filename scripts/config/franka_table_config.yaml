@@ -1,5 +1,5 @@
 # Expert (OMPL RRT-Connect path timed by time-optimal trajectory generation) config for the Franka FR3 arm with a table:
-# episodes drawn from the modes of 'sampling' below (the learning config's regions restrict them to some of the modes).
+# starts and goals anywhere in the workspace in front of the arm, not in collision with the table.
 # State x = [q (7), v (7), a (7)], action u = joint jerks (7), goal = target TCP pose (position and rotation matrix).
 system: franka
 dt: 0.1
@@ -38,31 +38,8 @@ terminal_velocity_weight: 10.0
 # Minimum TCP-to-goal distance [m] of a start
 min_start_goal_distance: 0.3
 
-# How an episode is drawn: one mode by weight, then a start configuration and a goal pose in its regions, each a box of TCP
-# positions with the hand (tool z-axis) within tool_tilt [rad] of tool_axis (default: between forward and down, tilt 0.9).
-# start_speed is the fraction of the joint velocity limits the arm starts with (at random velocities, default 0: at rest).
-sampling:
-  broad:                        # anywhere in front of the arm
-    weight: 0.35
-  crossing:                     # from above the table to underneath it, the hand forward
-    weight: 0.25
-    start: {x: [0.38, 0.56], y: [-0.25, 0.25], z: [0.70, 0.90]}
-    goal: {x: [0.38, 0.56], y: [-0.25, 0.25], z: [0.15, 0.34], tool_axis: [1.0, 0.0, 0.0], tool_tilt: 0.4}
-  recross:                      # from underneath the table to above it
-    weight: 0.10
-    start: {x: [0.38, 0.56], y: [-0.25, 0.25], z: [0.15, 0.34], tool_axis: [1.0, 0.0, 0.0], tool_tilt: 0.4}
-    goal: {x: [0.38, 0.56], y: [-0.25, 0.25], z: [0.70, 0.90]}
-  under:                        # adjustments underneath the table
-    weight: 0.10
-    start: {x: [0.35, 0.60], y: [-0.40, 0.40], z: [0.15, 0.34], tool_axis: [1.0, 0.0, 0.0], tool_tilt: 0.4}
-    goal: {x: [0.35, 0.60], y: [-0.40, 0.40], z: [0.15, 0.34], tool_axis: [1.0, 0.0, 0.0], tool_tilt: 0.4}
-  near_table:                   # from just above the table surface to underneath it
-    weight: 0.10
-    start: {x: [0.30, 0.64], y: [-0.30, 0.30], z: [0.62, 0.75]}
-    goal: {x: [0.38, 0.56], y: [-0.25, 0.25], z: [0.15, 0.34], tool_axis: [1.0, 0.0, 0.0], tool_tilt: 0.4}
-  moving:                       # anywhere, the arm already in motion
-    weight: 0.10
-    start_speed: 0.3
+# Starts and goals are drawn anywhere in front of the arm (a TCP box x 0.2-0.8, y +-0.6, z 0.1-0.8 m, the hand between
+# pointing forward and pointing down), each a valid configuration or pose clear of the table.
 
 # The table: a 2 x 9 grid of spheres (0.14 m apart, at most sqrt(2) radii, so the four spheres of a cell leave no hole), a slab
 # 0.2 m thick at z = 0.4 .. 0.6 m, x = 0.30 .. 0.64 m, y = -0.66 .. 0.66 m, its front edge 0.3 m from the base. It is wide

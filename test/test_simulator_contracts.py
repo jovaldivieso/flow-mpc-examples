@@ -25,8 +25,7 @@ from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from systems import franka_sampling
-from systems.franka_config import HAND_AXIS, HAND_TILT, WORKSPACE_BOX
-from systems.franka_sampling import IK_STARTS, EpisodeSampler, PoseRegion, SamplingMode
+from systems.franka_sampling import HAND_AXIS, HAND_TILT, IK_STARTS, WORKSPACE_BOX, WorkspaceSampler
 from systems.franka_system import FLOOR_CLEARANCE, Q_READY, FrankaSystem
 from systems.collision_spheres import RADIUS_MARGIN, fit_collision_spheres, surface_points
 from systems.franka_kinematics import COLLISION_SPHERE_MAX_RADIUS
@@ -621,37 +620,33 @@ class SamplingTests(unittest.TestCase):
 
 
 TABLE = [{"position": [x, y, 0.50], "radius": 0.10} for x in (0.40, 0.54) for y in (-0.28, -0.14, 0.0, 0.14, 0.28)]
-START_REGION = {"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.70, 0.90]}
-GOAL_REGION = {"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.15, 0.34], "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4}
 
 
 def _in_region(point: np.ndarray, region: dict) -> bool:
     return all(region[axis][0] - 1e-3 <= value <= region[axis][1] + 1e-3 for axis, value in zip("xyz", point))
 
 
-class PoseRegionTests(unittest.TestCase):
-    def test_a_pose_has_its_position_in_the_box_and_the_hand_within_the_tilt_of_the_axis(self) -> None:
-        region = PoseRegion.from_fields({**GOAL_REGION})
-        rng = np.random.default_rng(0)
-        for _ in range(200):
-            position, rotation = region.pose(rng)
+class WorkspaceSamplerTests(unittest.TestCase):
+    def _sampler(self, inverse_kinematics, is_valid=lambda q: True) -> WorkspaceSampler:
+        return WorkspaceSampler(inverse_kinematics, np.full(7, -1.0), np.full(7, 1.0), is_valid)
 
-            self.assertTrue(_in_region(position, GOAL_REGION))
+    def test_a_goal_has_its_position_in_the_workspace_and_the_hand_within_the_tilt_of_the_axis(self) -> None:
+        sampler = self._sampler(lambda position, rotation, q_init: q_init)
+        rng = np.random.default_rng(0)
+        axis = np.array(HAND_AXIS) / np.linalg.norm(HAND_AXIS)
+        for _ in range(200):
+            goal = sampler.goal(rng)
+            rotation = goal[3:].reshape(3, 3)
+
+            self.assertTrue(_in_region(goal[:3], WORKSPACE_BOX))
             np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-9)
             self.assertAlmostEqual(np.linalg.det(rotation), 1.0)
-            self.assertGreaterEqual(rotation[:, 2] @ np.array([1.0, 0.0, 0.0]), np.cos(GOAL_REGION["tool_tilt"]) - 1e-9)
+            self.assertGreaterEqual(rotation[:, 2] @ axis, np.cos(HAND_TILT) - 1e-9)
 
-    def test_the_hand_cone_of_the_workspace_spans_pointing_forward_to_pointing_down(self) -> None:
+    def test_the_hand_cone_spans_pointing_forward_to_pointing_down(self) -> None:
         axis = np.array(HAND_AXIS) / np.linalg.norm(HAND_AXIS)
         for direction in ([1.0, 0.0, 0.0], [0.0, 0.0, -1.0]):
             self.assertLessEqual(np.arccos(axis @ np.array(direction)), HAND_TILT)
-
-
-class EpisodeSamplerTests(unittest.TestCase):
-    def _sampler(self, inverse_kinematics, is_valid=lambda q: True) -> EpisodeSampler:
-        region = PoseRegion.from_fields({**GOAL_REGION})
-        mode = SamplingMode(1.0, region, region, 0.0)
-        return EpisodeSampler({"a": mode}, ["a"], inverse_kinematics, np.full(7, -1.0), np.full(7, 1.0), is_valid)
 
     def test_the_first_valid_configuration_of_a_pose_is_taken_from_a_random_start(self) -> None:
         starts = []
@@ -660,7 +655,7 @@ class EpisodeSamplerTests(unittest.TestCase):
             starts.append(q_init)
             return q_init
 
-        q = self._sampler(reach).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+        q = self._sampler(reach).configuration(np.random.default_rng(0))
 
         self.assertEqual(len(starts), 1)
         np.testing.assert_array_equal(q, starts[0])
@@ -678,11 +673,11 @@ class EpisodeSamplerTests(unittest.TestCase):
         invalid_first = iter([False, True])
         sampler = self._sampler(reach, is_valid=lambda q: next(invalid_first))
 
-        sampler.configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+        sampler.configuration(np.random.default_rng(0))
 
         self.assertEqual(len(calls), 3)  # a failure, an invalid solution, then a valid one
 
-    def test_a_pose_no_start_reaches_is_dropped_after_the_starts_and_the_region_raises_after_the_poses(self) -> None:
+    def test_a_pose_no_start_reaches_is_dropped_after_the_starts_and_the_workspace_raises_after_the_poses(self) -> None:
         calls = []
 
         def never(position, rotation, q_init):
@@ -690,7 +685,7 @@ class EpisodeSamplerTests(unittest.TestCase):
             raise RuntimeError("no convergence")
 
         with mock.patch.object(franka_sampling, "POSE_ATTEMPTS", 2), self.assertRaises(RuntimeError):
-            self._sampler(never).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(0))
+            self._sampler(never).configuration(np.random.default_rng(0))
 
         self.assertEqual(len(calls), 2 * IK_STARTS)
 
@@ -704,7 +699,7 @@ class EpisodeSamplerTests(unittest.TestCase):
                     raise RuntimeError("no convergence")
                 return q_init
 
-            q = self._sampler(reach).configuration(PoseRegion.from_fields({**GOAL_REGION}), np.random.default_rng(seed))
+            q = self._sampler(reach).configuration(np.random.default_rng(seed))
             return q, starts
 
         q_a, starts_a = draw(5)
@@ -715,121 +710,38 @@ class EpisodeSamplerTests(unittest.TestCase):
         self.assertTrue(all(np.all(np.abs(start) <= 1.0) for start in starts_a))
 
 
-class SamplingModeTests(unittest.TestCase):
-    BOX = {"x": [0.40, 0.60], "y": [-0.4, -0.2], "z": [0.45, 0.65]}
-    OPPOSITE = {**BOX, "y": [0.2, 0.4]}
-
-    def _two_modes(self, **overrides) -> FrankaSystem:
-        modes = {
-            "left_to_right": {"weight": 1, "start": self.BOX, "goal": self.OPPOSITE},
-            "right_to_left": {"weight": 1, "start": self.OPPOSITE, "goal": self.BOX},
-        }
-        return _build_simulator(sampling=modes, **overrides)
-
-    def test_an_episode_starts_and_ends_in_the_regions_of_the_same_mode(self) -> None:
-        simulator = self._two_modes()
-        sides = set()
-        for seed in range(8):
-            rng = np.random.default_rng(seed)
-            simulator.randomize_goal_for_reset(rng)
-            start = simulator.tcp_position(simulator.random_initial_state(rng)[: simulator.n])
-
-            self.assertLess(start[1] * simulator.goal[1], 0.0)
-            sides.add(bool(start[1] < 0))
-        self.assertEqual(sides, {True, False})
-
-    def test_a_start_without_a_drawn_goal_draws_its_own_mode(self) -> None:
-        simulator = self._two_modes()
-        sides = {bool(simulator.tcp_position(simulator.random_initial_state(np.random.default_rng(seed))[: simulator.n])[1] < 0) for seed in range(8)}
-        self.assertEqual(sides, {True, False})
-
-    def test_only_the_selected_modes_are_drawn(self) -> None:
-        simulator = self._two_modes(sampling_modes=["right_to_left"])
-        for seed in range(4):
-            rng = np.random.default_rng(seed)
-            simulator.randomize_goal_for_reset(rng)
-            self.assertTrue(_in_region(simulator.goal[:3], self.BOX))
-
-    def test_the_modes_are_drawn_by_their_weights(self) -> None:
-        modes = {"rare": {"weight": 1}, "common": {"weight": 3}}
-        simulator = _build_simulator(sampling=modes)
-        rng = np.random.default_rng(0)
-        common = sum(simulator.sampler.draw_mode(rng) is simulator.sampler.modes[1] for _ in range(400))
-        self.assertTrue(260 <= common <= 340, common)
-
-    def test_the_arm_starts_in_motion_at_a_fraction_of_the_velocity_limits(self) -> None:
-        simulator = _build_simulator(sampling={"moving": {"start_speed": 0.5}})
-        limit = simulator.state_upper_bounds[simulator.n : 2 * simulator.n]
-        for seed in range(3):
-            state = simulator.random_initial_state(np.random.default_rng(seed))
-            velocity = state[simulator.n : 2 * simulator.n]
-
-            self.assertTrue(np.any(velocity != 0.0))
-            self.assertTrue(np.all(np.abs(velocity) <= 0.5 * limit))
-            np.testing.assert_array_equal(state[2 * simulator.n :], 0.0)
-            self.assertTrue(np.all(state <= simulator.state_upper_bounds) and np.all(state >= simulator.state_lower_bounds))
-            self.assertTrue(simulator._can_brake(state[: simulator.n], velocity))
-
-
-    def test_a_start_in_motion_must_be_able_to_brake_inside_the_limits_and_clear_of_the_obstacles(self) -> None:
-        simulator = _build_simulator()
-        at_rest, fast = np.zeros(simulator.n), np.full(simulator.n, 1.0)
-        near_the_limit = simulator.model.upperPositionLimit - 0.01
-
-        self.assertTrue(simulator._can_brake(Q_READY, at_rest))
-        self.assertFalse(simulator._can_brake(near_the_limit, fast))  # it stops beyond the joint limit
-        self.assertTrue(simulator._can_brake(near_the_limit, -fast))  # away from it
-
-        simulator.collision.obstacles[:] = [(simulator.tcp_position(Q_READY) + np.array([0.0, 0.0, 0.08]), 0.05)]
-        self.assertTrue(simulator._can_brake(Q_READY, at_rest) == simulator.collision.is_collision_free(Q_READY))
-
-    def test_a_start_in_motion_that_can_never_brake_raises(self) -> None:
-        simulator = _build_simulator(sampling={"moving": {"start_speed": 1.0}})
-        with mock.patch.object(simulator, "_can_brake", return_value=False), mock.patch("systems.franka_system.START_ATTEMPTS", 3):
-            with self.assertRaisesRegex(RuntimeError, "can brake"):
-                simulator.random_initial_state(np.random.default_rng(0))
-
-
-class RegionSamplingTests(unittest.TestCase):
+class WorkspaceSamplingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.simulator = _build_simulator(obstacles=TABLE, sampling={"crossing": {"start": START_REGION, "goal": GOAL_REGION}})
+        cls.simulator = _build_simulator(obstacles=TABLE)
 
-    def test_without_sampling_the_workspace_and_the_default_hand_cone_are_sampled(self) -> None:
-        [mode] = _build_simulator().sampler.modes
-
-        np.testing.assert_allclose(mode.start.low, [WORKSPACE_BOX[axis][0] for axis in "xyz"])
-        np.testing.assert_allclose(mode.goal.high, [WORKSPACE_BOX[axis][1] for axis in "xyz"])
-        self.assertEqual(mode.start.tilt, HAND_TILT)
-        self.assertEqual(mode.start_speed, 0.0)
-
-    def test_starts_are_collision_free_with_the_tcp_in_the_start_region(self) -> None:
+    def test_starts_are_at_rest_and_collision_free_with_the_tcp_in_the_workspace(self) -> None:
         simulator = self.simulator
         for seed in range(4):
             rng = np.random.default_rng(seed)
             simulator.randomize_goal_for_reset(rng)
-            q = simulator.random_initial_state(rng)[: simulator.n]
+            state = simulator.random_initial_state(rng)
 
-            self.assertTrue(_in_region(simulator.tcp_position(q), START_REGION))
-            self.assertTrue(simulator.collision.is_collision_free(q))
+            np.testing.assert_array_equal(state[simulator.n :], 0.0)
+            self.assertTrue(_in_region(simulator.tcp_position(state[: simulator.n]), WORKSPACE_BOX))
+            self.assertTrue(simulator.collision.is_collision_free(state[: simulator.n]))
 
-    def test_goals_are_in_the_goal_region_with_the_hand_along_the_tool_axis_and_reached_without_a_collision(self) -> None:
+    def test_goals_are_in_the_workspace_and_reached_without_a_collision(self) -> None:
         simulator = self.simulator
         for seed in range(4):
             simulator.randomize_goal_for_reset(np.random.default_rng(seed))
-            position, rotation = simulator.goal[:3], simulator.goal[3:].reshape(3, 3)
+            position = simulator.goal[:3]
 
-            self.assertTrue(_in_region(position, GOAL_REGION))
-            self.assertGreaterEqual(rotation[:, 2] @ np.array([1.0, 0.0, 0.0]), np.cos(GOAL_REGION["tool_tilt"]) - 1e-9)
+            self.assertTrue(_in_region(position, WORKSPACE_BOX))
             q_goal = simulator.goal_configuration(simulator.goal)
             self.assertTrue(simulator.collision.is_collision_free(q_goal))
             np.testing.assert_allclose(simulator.tcp_position(q_goal), position, atol=1e-3)
 
-    def test_an_empty_region_raises_instead_of_looping_forever(self) -> None:
-        inside_the_table = {"x": [0.38, 0.56], "y": [-0.25, 0.25], "z": [0.45, 0.55]}
-        simulator = _build_simulator(obstacles=TABLE, sampling={"inside": {"start": inside_the_table}})
-        with mock.patch.object(franka_sampling, "POSE_ATTEMPTS", 3), self.assertRaises(RuntimeError):
-            simulator.random_initial_state(np.random.default_rng(0))
+    def test_a_workspace_without_a_valid_pose_raises_instead_of_looping_forever(self) -> None:
+        simulator = _build_simulator()
+        with mock.patch.object(simulator.sampler, "_is_valid", lambda q: False), mock.patch.object(franka_sampling, "POSE_ATTEMPTS", 3):
+            with self.assertRaises(RuntimeError):
+                simulator.random_initial_state(np.random.default_rng(0))
 
 
 POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_config.yaml")

@@ -16,9 +16,9 @@ joint position limits narrowed by ``JOINT_LIMIT_MARGIN``, the velocity limits sc
 acceleration and jerk limits from the config). No masses or torques: a joint tracking controller is assumed to
 follow the motion.
 
-The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. An episode is drawn
-from the modes of the config's ``sampling`` (``franka_sampling``): the start is a configuration, the goal a pose, both in
-regions of TCP positions and hand directions that inverse kinematics reaches well inside the joint limits and free of
+The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. A start (at rest) and
+a goal are drawn in the workspace in front of the arm (``franka_sampling``): the start is a configuration, the goal a pose,
+both of TCP positions and hand directions that inverse kinematics reaches well inside the joint limits and free of
 spherical obstacles. The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the orientation is
 not tested (``goal_errors`` reports it).
 """
@@ -31,14 +31,13 @@ import pinocchio as pin
 
 from .config_fields import SYSTEM_CONFIG_KEYS
 from .franka_config import (
-    FRANKA_CONFIG_KEYS,
     FRANKA_NUM_JOINTS,
     POSE_COMPONENTS,
     POSE_DIM,
     validate_franka_config,
 )
 from .franka_kinematics import franka_kinematics
-from .franka_sampling import EpisodeSampler, SamplingMode
+from .franka_sampling import WorkspaceSampler
 from .franka_model import Q_READY, TCP_FRAME, build_model, build_robot
 from .triple_integrator import PlantLimits, TripleIntegratorBase
 
@@ -47,8 +46,6 @@ from .triple_integrator import PlantLimits, TripleIntegratorBase
 # frame at least FLOOR_CLEARANCE above the floor (z = 0)
 JOINT_SAMPLING_MARGIN = 0.1
 FLOOR_CLEARANCE = 0.1
-BRAKING_MARGIN = 1.5  # of the stopping distance at the acceleration limits: braking within the jerk limits takes longer
-START_ATTEMPTS = 100  # starts drawn for a start in motion that can brake
 
 
 class FrankaSystem(TripleIntegratorBase):
@@ -58,7 +55,7 @@ class FrankaSystem(TripleIntegratorBase):
 
     @classmethod
     def config_keys(cls) -> set[str]:
-        return SYSTEM_CONFIG_KEYS | FRANKA_CONFIG_KEYS
+        return SYSTEM_CONFIG_KEYS
 
     @classmethod
     def validate_config(cls, raw_config: Mapping[str, Any]) -> dict[str, Any]:
@@ -89,15 +86,12 @@ class FrankaSystem(TripleIntegratorBase):
         self.data = model.createData()
         self.kinematics = kinematics
         self.tcp_id = model.getFrameId(TCP_FRAME)
-        self.sampler = EpisodeSampler(
-            {name: SamplingMode.from_fields(mode) for name, mode in fields["sampling"].items()},
-            fields["sampling_modes"],
+        self.sampler = WorkspaceSampler(
             self.kinematics.inverse_kinematics,
             self.kinematics.lower,
             self.kinematics.upper,
             self._is_valid,
         )
-        self._mode: SamplingMode | None = None  # the mode of the episode whose goal was drawn, until its start is
         self._mesh_collision: tuple | None = None  # (obstacles, geometry model, geometry data), built on first use
         self._cached_goal: np.ndarray | None = None  # the goal whose joint configuration is cached, and that configuration
         self._cached_q_goal: np.ndarray | None = None
@@ -110,7 +104,6 @@ class FrankaSystem(TripleIntegratorBase):
         """Reset for a new rollout. The cached joint configuration of the goal is dropped, so one rollout never reuses
         what was solved for another."""
         state = super().reset(initial_state)
-        self._mode = None
         self._cached_goal = None
         self._cached_q_goal = None
         return state
@@ -244,41 +237,10 @@ class FrankaSystem(TripleIntegratorBase):
         return [f"{name}.{kind}" for kind in ("pos", "vel", "acc") for name in self.coordinate_names]
 
     def _sample_configuration(self, rng: np.random.Generator) -> np.ndarray:
-        return self.sampler.configuration(self._episode_mode(rng).start, rng)
-
-    def _sample_start(self, rng: np.random.Generator) -> np.ndarray:
-        mode = self._episode_mode(rng)
-        for _ in range(START_ATTEMPTS):
-            q = self._sample_configuration(rng)
-            velocity = mode.start_speed * self.state_upper_bounds[self.n : 2 * self.n] * rng.uniform(-1.0, 1.0, self.n)
-            if self._can_brake(q, velocity):
-                return np.concatenate([q, velocity, np.zeros(self.n)])
-        raise RuntimeError(f"Unable to sample a start in motion that can brake within {START_ATTEMPTS} attempts.")
-
-    def _can_brake(self, q: np.ndarray, velocity: np.ndarray) -> bool:
-        """True if the arm moving at ``velocity`` from ``q`` can stop inside the joint limits and clear of the obstacles: along
-        the path of its stopping distance, ``BRAKING_MARGIN`` times that at the acceleration limits."""
-        stop = BRAKING_MARGIN * velocity * np.abs(velocity) / (2 * self.max_acceleration)
-        path = q + stop * np.linspace(0.0, 1.0, 5)[:, None]
-        in_limits = np.all(path >= self.model.lowerPositionLimit) and np.all(path <= self.model.upperPositionLimit)
-        return bool(in_limits and self.collision.trajectory_is_collision_free(path))
-
-    def random_initial_state(self, rng: np.random.Generator) -> np.ndarray:
-        self._episode_mode(rng)
-        try:
-            return super().random_initial_state(rng)
-        finally:
-            self._mode = None
-
-    def _episode_mode(self, rng: np.random.Generator) -> SamplingMode:
-        """The mode of the episode: drawn with its goal, or with its start when the goal is not drawn."""
-        if self._mode is None:
-            self._mode = self.sampler.draw_mode(rng)
-        return self._mode
+        return self.sampler.configuration(rng)
 
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
-        self._mode = None
-        return self.sampler.goal(self._episode_mode(rng).goal, rng)
+        return self.sampler.goal(rng)
 
     def _is_valid(self, q: np.ndarray) -> bool:
         """Inside the joint margins, every joint frame at least ``FLOOR_CLEARANCE`` above the floor and no obstacle touched."""

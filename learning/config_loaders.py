@@ -24,7 +24,6 @@ DEFAULT_DAGGER_TRAINING_CONFIG: dict[str, object] = {
     "seed": 99,
     "max_train_steps": None,
     "training_curriculum": None,
-    "regions": None,
     "round_seeds": None,
     "restart_round_seed": False,
     "initial_states": None,

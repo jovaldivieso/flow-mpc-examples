@@ -18,7 +18,6 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from planning.config import load_and_validate_system_config
-from systems.config_fields import ConfigurationError
 from systems.franka_system import FrankaSystem
 from learning.config_loaders import FlowConfig, UnetConfig
 from learning.data_utils import build_dataset_features
@@ -166,29 +165,14 @@ class DaggerConfigPerRoundExpansionTests(unittest.TestCase):
         self.assertFalse(hasattr(DaggerTrainer, "persist_round_summary"))
 
 
-class DaggerConfigRegionsTests(unittest.TestCase):
-    TABLE = {"table": {"sampling_modes": ["crossing"]}}
+class DaggerConfigCurriculumTests(unittest.TestCase):
+    def test_a_curriculum_entry_is_random_or_config(self) -> None:
+        cfg = _minimal_dagger_config(dagger_iterations=2, training_curriculum=["random", "config"])
+        self.assertEqual(cfg.training_curriculum, ["random", "config"])
 
-    def test_a_curriculum_entry_may_name_a_region(self) -> None:
-        cfg = _minimal_dagger_config(dagger_iterations=2, regions=self.TABLE, training_curriculum=["random", "table"])
-        self.assertEqual(cfg.training_curriculum, ["random", "table"])
-
-    def test_a_curriculum_entry_naming_no_region_is_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "name of a region"):
-            _minimal_dagger_config(dagger_iterations=2, regions=self.TABLE, training_curriculum=["random", "shelf"])
-
-    def test_a_region_cannot_take_the_name_of_a_curriculum_entry(self) -> None:
-        for name in ("random", "config"):
-            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "curriculum entry"):
-                _minimal_dagger_config(regions={name: self.TABLE["table"]})
-
-    def test_a_region_selects_only_sampling_modes(self) -> None:
-        for region in ({}, {"obstacles": []}, {"sampling_modes": ["crossing"], "pos_tol": 0.1}):
-            with self.subTest(region=region), self.assertRaisesRegex(ValueError, "nothing else"):
-                _minimal_dagger_config(regions={"table": region})
-
-    def test_the_regions_default_to_none(self) -> None:
-        self.assertEqual(_minimal_dagger_config().regions, {})
+    def test_any_other_curriculum_entry_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "'training_curriculum' entries"):
+            _minimal_dagger_config(dagger_iterations=2, training_curriculum=["random", "table"])
 
 
 class DaggerEvalMetricsSummaryTests(unittest.TestCase):
@@ -340,24 +324,6 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
         self.assertNotIn("safeflow_eval", summary["rounds"][0])
         self.assertEqual(summary["best_success_rate"], 0.1)
 
-    def test_the_evaluation_in_each_region_is_reported_by_region_and_policy_type(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            trainer = DaggerTrainer(_minimal_dagger_config(checkpoint_dir=Path(directory)))
-            flow = DaggerEvalMetrics(success_rate=0.1, mean_steps=80.0, min_steps=4, max_steps=100, num_episodes=10, timeout_failures=9)
-            safeflow = DaggerEvalMetrics(success_rate=0.9, mean_steps=60.0, min_steps=40, max_steps=100, num_episodes=10, timeout_failures=1)
-            trainer.save_round_summary(
-                round_index=0, train_loss=0.3, eval_metrics=flow,
-                region_eval_metrics={"table": {"flow": flow, "safeflow": safeflow, "skipped": None}},
-            )
-            trainer.save_round_summary(round_index=1, train_loss=0.3, eval_metrics=flow)
-
-            summary = yaml.safe_load((Path(directory) / "training_summary.yaml").read_text())
-
-        self.assertEqual(summary["rounds"][0]["regions"]["table"]["flow"]["eval_success_rate"], 0.1)
-        self.assertEqual(summary["rounds"][0]["regions"]["table"]["safeflow"]["eval_success_rate"], 0.9)
-        self.assertNotIn("skipped", summary["rounds"][0]["regions"]["table"])
-        self.assertNotIn("regions", summary["rounds"][1])
-
     def test_the_wall_time_of_the_phases_of_a_round_is_reported_when_it_is_known(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             trainer = DaggerTrainer(_minimal_dagger_config(checkpoint_dir=Path(directory)))
@@ -366,7 +332,6 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
             timing.add_training(304.26)
             timing.add_evaluation("flow", 40.12)
             timing.add_evaluation("safeflow", 301.7)
-            timing.add_evaluation("safeflow", 280.54, region="table")
             trainer.save_round_summary(round_index=1, train_loss=0.3, eval_metrics=None, timing=timing)
             trainer.save_round_summary(round_index=2, train_loss=0.3, eval_metrics=None)
 
@@ -375,17 +340,16 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
         self.assertEqual(
             summary["rounds"][0]["timing_seconds"],
             {
-                "collection": 612.3, "training": 1304.3, "evaluation": {"flow": 40.1, "safeflow": 301.7},
-                "regions": {"table": {"safeflow": 280.5}}, "total": 2581.1,
+                "collection": 612.3, "training": 1304.3, "evaluation": {"flow": 40.1, "safeflow": 301.7}, "total": 2581.1,
             },
         )
         self.assertNotIn("timing_seconds", summary["rounds"][1])
         self.assertEqual(RoundTiming(total=3.0).to_dict(), {"total": 3.0})  # a phase that did not run is left out
 
-    def test_the_coverage_of_the_evaluation_starts_is_reported_by_region_when_it_is_known(self) -> None:
+    def test_the_coverage_of_the_evaluation_starts_is_reported_when_it_is_known(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             trainer = DaggerTrainer(_minimal_dagger_config(checkpoint_dir=Path(directory)))
-            coverage = {"random": CoverageMetrics(2.12345, 5.0, 0.25, 50), "table": CoverageMetrics(8.0, 11.0, 0.9, 50)}
+            coverage = CoverageMetrics(2.12345, 5.0, 0.25, 50)
             timing = RoundTiming(coverage=61.26)
             trainer.save_round_summary(round_index=1, train_loss=0.3, eval_metrics=None, coverage=coverage, timing=timing)
             trainer.save_round_summary(round_index=2, train_loss=0.3, eval_metrics=None)
@@ -394,10 +358,7 @@ class DaggerTrainerSummaryYamlTests(unittest.TestCase):
 
         self.assertEqual(
             summary["rounds"][0]["coverage"],
-            {
-                "random": {"median": 2.123, "p90": 5.0, "far_fraction": 0.25, "num_queries": 50},
-                "table": {"median": 8.0, "p90": 11.0, "far_fraction": 0.9, "num_queries": 50},
-            },
+            {"median": 2.123, "p90": 5.0, "far_fraction": 0.25, "num_queries": 50},
         )
         self.assertEqual(summary["rounds"][0]["timing_seconds"], {"coverage": 61.3})
         self.assertNotIn("coverage", summary["rounds"][1])
@@ -458,16 +419,6 @@ class DaggerTrainerRuntimeConfigOverridesTests(unittest.TestCase):
 
         self.assertEqual(collection_config["pos_tol"], 0.01)
         self.assertEqual(eval_config["pos_tol"], 0.02)
-
-    def test_a_region_selects_the_sampling_modes_of_the_config(self) -> None:
-        trainer = DaggerTrainer(_minimal_dagger_config(regions={"table": {"sampling_modes": ["b"]}}))
-        mode = self.expert_config["sampling"]["workspace"]
-        expert_config = {**self.expert_config, "sampling": {"a": mode, "b": mode}, "sampling_modes": ["a", "b"]}
-
-        config = trainer._apply_runtime_config_overrides(copy.deepcopy(expert_config), region="table")
-
-        self.assertEqual(config["sampling_modes"], ["b"])
-        self.assertEqual(trainer._apply_runtime_config_overrides(copy.deepcopy(expert_config))["sampling_modes"], ["a", "b"])
 
     def test_without_overrides_the_validated_config_is_unchanged(self) -> None:
         trainer = DaggerTrainer(_minimal_dagger_config())
@@ -708,34 +659,17 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         self.assertIsInstance(trainer.rollout_policy, FlowPolicy)
         self.assertNotIsInstance(trainer.rollout_policy, SafeFlowMPCPolicy)
 
-    def test_a_region_is_evaluated_for_the_trained_policy_type_only(self) -> None:
-        trainer = self._setup_trainer("flow", regions={"table": {"sampling_modes": ["workspace"]}})
-        calls: list[tuple[str, str | None]] = []
-
-        def record(label: str, region: str | None = None) -> str:
-            calls.append((label, region))
-            return "metrics"
-
-        with mock.patch.object(trainer, "evaluate_current_policy", side_effect=record):
-            results = trainer.evaluate_regions("Round 2")
-
-        self.assertEqual(results, {"table": {"flow": "metrics"}})
-        self.assertEqual(calls, [("Round 2 flow evaluation in region 'table'", "table")])
-
-    def test_an_evaluation_adds_its_wall_time_to_the_trained_policy_type_and_region_it_ran_in(self) -> None:
-        boxes = {"sampling_modes": ["workspace"]}
-        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2, regions={"table": boxes})
+    def test_an_evaluation_adds_its_wall_time_to_the_trained_policy_type(self) -> None:
+        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2)
 
         with mock.patch("learning.dagger.dagger_trainer.evaluate_policy_rollouts", return_value=None), \
-                mock.patch("learning.dagger.dagger_trainer.time.perf_counter", side_effect=[0.0, 2.0, 20.0, 21.5]):
+                mock.patch("learning.dagger.dagger_trainer.time.perf_counter", side_effect=[0.0, 2.0]):
             trainer.evaluate_current_policy("flow")
-            trainer.evaluate_current_policy("in the region", region="table")
 
         self.assertEqual(trainer.timing.evaluation, {"flow": 2.0})
-        self.assertEqual(trainer.timing.regions, {"table": {"flow": 1.5}})
 
-    def test_the_coverage_is_measured_on_the_evaluation_starts_of_all_the_modes_and_of_every_region(self) -> None:
-        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2, regions={"table": {"sampling_modes": ["workspace"]}})
+    def test_the_coverage_is_measured_on_the_evaluation_starts(self) -> None:
+        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2)
         measured: list[np.ndarray] = []
 
         class FakeCoverage:
@@ -747,8 +681,8 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             results = trainer.measure_coverage()
 
-        self.assertEqual(list(results), ["random", "table"])
-        self.assertEqual([queries.shape for queries in measured], [(2, self.COND_DIM)] * 2)
+        self.assertEqual(results, CoverageMetrics(1.0, 2.0, 0.5, 2))
+        self.assertEqual([queries.shape for queries in measured], [(2, self.COND_DIM)])
         self.assertGreaterEqual(trainer.timing.coverage, 0.0)
 
     def test_no_coverage_is_measured_without_an_evaluation(self) -> None:
@@ -825,22 +759,13 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
 
         self.assertEqual(timing.total, 60.0)
 
-    def test_an_evaluation_in_a_region_samples_its_modes_and_ignores_the_explicit_states(self) -> None:
-        boxes = {"sampling_modes": ["workspace"]}
-        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2, regions={"table": boxes}, initial_states=[np.zeros(14)])
+    def test_an_evaluation_uses_the_explicit_states(self) -> None:
+        trainer = self._setup_trainer("flow", eval_episodes=2, eval_steps=2, initial_states=[np.zeros(14)])
 
-        with mock.patch("learning.dagger.dagger_trainer.evaluate_policy_rollouts", return_value=None) as evaluate, \
-                mock.patch.object(trainer, "_apply_runtime_config_overrides", wraps=trainer._apply_runtime_config_overrides) as overrides:
-            trainer.evaluate_current_policy("in the region", region="table")
-            trainer.evaluate_current_policy("without")
+        with mock.patch("learning.dagger.dagger_trainer.evaluate_policy_rollouts", return_value=None) as evaluate:
+            trainer.evaluate_current_policy("evaluation")
 
-        self.assertEqual([call.kwargs["region"] for call in overrides.call_args_list], ["table", None])
-        self.assertIsNone(evaluate.call_args_list[0].kwargs["initial_states"])
-        self.assertIsNotNone(evaluate.call_args_list[1].kwargs["initial_states"])
-
-    def test_setup_rejects_an_invalid_region_before_any_round(self) -> None:
-        with self.assertRaisesRegex(ConfigurationError, "which 'sampling' does not define"):
-            self._setup_trainer("flow", regions={"table": {"sampling_modes": ["shelf"]}})
+        self.assertIsNotNone(evaluate.call_args.kwargs["initial_states"])
 
     def test_the_evaluation_of_an_offline_start_is_one_labeled_evaluation_of_the_trained_policy(self) -> None:
         trainer = self._setup_trainer("flow", eval_episodes=1, dagger_iterations=0)
@@ -848,7 +773,7 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
         labels: list[str] = []
         evaluation = DaggerEvalMetrics(success_rate=0.5, mean_steps=1.0, min_steps=1, max_steps=1, num_episodes=1)
 
-        def record(label: str, region: str | None = None) -> DaggerEvalMetrics:
+        def record(label: str) -> DaggerEvalMetrics:
             labels.append(label)
             return evaluation
 

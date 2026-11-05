@@ -314,59 +314,12 @@ class ExpertConfigValidationTests(unittest.TestCase):
                 with self.assertRaises(ConfigurationError):
                     validate_system_config(raw_config=raw_config)
 
-    def test_the_sampling_modes_are_validated_and_default_to_the_workspace(self) -> None:
-        raw_config = _load_raw_config()
-        for key in ("sampling", "sampling_modes"):
-            raw_config.pop(key, None)
-        validated = validate_system_config(raw_config=raw_config)
-        self.assertEqual(list(validated["sampling"]), ["workspace"])
-        self.assertEqual(validated["sampling_modes"], ["workspace"])
-        workspace = validated["sampling"]["workspace"]
-        self.assertEqual((workspace["weight"], workspace["start_speed"]), (1.0, 0.0))
-        self.assertEqual(workspace["start"], workspace["goal"])
-        self.assertEqual(workspace["start"]["tool_axis"], [1.0, 0.0, -1.0])
-
+    def test_a_franka_config_with_sampling_keys_is_rejected(self) -> None:
         box = {"x": [0.3, 0.6], "y": [-0.2, 0.2], "z": [0.1, 0.3]}
-        raw_config["sampling"] = {
-            "under": {"weight": 2, "start": box, "goal": {**box, "tool_axis": [1, 0, 0], "tool_tilt": 0.4}, "start_speed": 0.3},
-            "anywhere": {},
-        }
-        validated = validate_system_config(raw_config=raw_config)
-        under = validated["sampling"]["under"]
-        self.assertEqual((under["weight"], under["start_speed"]), (2.0, 0.3))
-        self.assertEqual(under["start"], {**box, "tool_axis": [1.0, 0.0, -1.0], "tool_tilt": 0.9})
-        self.assertEqual(under["goal"], {**box, "tool_axis": [1.0, 0.0, 0.0], "tool_tilt": 0.4})
-        self.assertEqual(validated["sampling_modes"], ["under", "anywhere"])
-        self.assertEqual(validate_system_config(raw_config=validated), validated)
-
-        raw_config["sampling_modes"] = ["anywhere"]
-        self.assertEqual(validate_system_config(raw_config=raw_config)["sampling_modes"], ["anywhere"])
-
-    def test_invalid_sampling_is_rejected(self) -> None:
-        box = {"x": [0.3, 0.6], "y": [-0.2, 0.2], "z": [0.1, 0.3]}
-        for key, bad in (
-            ("sampling", {}),  # no mode
-            ("sampling", [box]),  # not a mapping
-            ("sampling", {"a": None}),  # a mode that is not a mapping
-            ("sampling", {"a": {"extra": 1}}),  # unknown key
-            ("sampling", {"a": {"weight": 0}}),
-            ("sampling", {"a": {"start_speed": 1.5}}),
-            ("sampling", {"a": {"start": {"x": [0.3, 0.6], "y": [-0.2, 0.2]}}}),  # missing axis
-            ("sampling", {"a": {"start": {**box, "z": [0.3, 0.1]}}}),  # min above max
-            ("sampling", {"a": {"start": {**box, "z": [0.1]}}}),  # not a pair
-            ("sampling", {"a": {"start": {**box, "extra": 1}}}),  # unknown key
-            ("sampling", {"a": {"start": [0.3, 0.6]}}),  # not a mapping
-            ("sampling", {"a": {"goal": {**box, "tool_axis": [0, 0, 0]}}}),  # no direction
-            ("sampling", {"a": {"goal": {**box, "tool_axis": [1, 0]}}}),  # wrong length
-            ("sampling", {"a": {"goal": {**box, "tool_tilt": -0.1}}}),
-            ("sampling", {"a": {"goal": {**box, "tool_tilt": 4.0}}}),
-            ("sampling_modes", []),
-            ("sampling_modes", ["missing"]),
-        ):
-            with self.subTest(key=key, bad=bad):
-                invalid = {**_load_raw_config(), key: bad}
-                with self.assertRaises(ConfigurationError):
-                    validate_system_config(raw_config=invalid)
+        for key, value in (("sampling", {"workspace": {"start": box}}), ("sampling_modes", ["workspace"])):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ConfigurationError, key):
+                    validate_system_config(raw_config={**_load_raw_config(), key: value})
 
 if __name__ == "__main__":
     unittest.main()
