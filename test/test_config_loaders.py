@@ -221,26 +221,24 @@ class DefaultPathHelperTests(unittest.TestCase):
 
 
 class ShippedPolicyConfigTests(unittest.TestCase):
-    """Regression coverage for the policy configs shipped under learning/config:
-    train_dagger.py's default --policy-config must go through every loader
-    without tripping the 'training:' key allowlist above, and each config
-    must name the policy type its file name says.
-    """
+    """The policy configs shipped under learning/config go through every loader without tripping the 'training:' key
+    allowlist, name the policy type their file name says and agree with themselves. Their tuning values (horizons, network
+    size, epochs) are not pinned: they are what the files are for."""
 
     def test_shipped_policy_configs_load_through_every_loader(self) -> None:
-        for file_name, policy_type, expected_unet, expected_horizon, expected_execution in (
-            ("franka_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 5),
-            ("franka_safeflow_config.yaml", "safeflow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 5),
-            ("triple_integrator_flow_config.yaml", "flow", UnetConfig(dim=32, dim_mults=(1, 2)), 10, 1),
-            ("triple_integrator_safeflow_config.yaml", "safeflow", UnetConfig(), 16, 1),
+        for file_name, policy_type in (
+            ("franka_flow_config.yaml", "flow"),
+            ("franka_safeflow_config.yaml", "safeflow"),
+            ("triple_integrator_flow_config.yaml", "flow"),
+            ("triple_integrator_safeflow_config.yaml", "safeflow"),
         ):
             path = Path(PROJECT_ROOT) / "learning" / "config" / file_name
             with self.subTest(config=file_name):
                 self.assertEqual(set(load_dagger_training_config(path)), set(DEFAULT_DAGGER_TRAINING_CONFIG))
                 self.assertEqual(load_policy_type(path), policy_type)
-                self.assertEqual(load_unet_config(path), expected_unet)
-                self.assertEqual(load_prediction_horizon(path), expected_horizon)
-                self.assertEqual(load_execution_horizon(path, expected_horizon), expected_execution)
+                horizon, unet = load_prediction_horizon(path), load_unet_config(path)
+                self.assertEqual(horizon % 2 ** (len(unet.dim_mults) - 1), 0)  # every level but the first halves the horizon
+                self.assertLessEqual(load_execution_horizon(path, horizon), horizon)
                 self.assertGreater(load_flow_config(path).num_inference_steps, 0)
                 self.assertGreater(load_flow_config(path).history_length, 0)
 

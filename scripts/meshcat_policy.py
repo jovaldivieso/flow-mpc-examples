@@ -8,8 +8,9 @@ predicted action chunk is drawn as the TCP path of the motion it leads to (cyan)
 expert would make from the very same state (green): the two are the network's output and the label it is trained on.
 The TCP path actually executed so far is drawn in yellow.
 The policy is asked every execution_horizon steps and executes the first rows of its chunk (the jerks that track its plan). --show-collision-geometry draws the bounding spheres of the
-robot, which the planners and the safety filter keep clear of the obstacles. --no-viewer prints the outcome of every
-rollout only (reached, collision, timeout, solve failure).
+robot, which the planners and the safety filter keep clear of the obstacles. --show-workspace draws the box of TCP positions
+the starts and goals are sampled in (Franka only). --no-viewer prints the outcome of every rollout only (reached,
+collision, timeout, solve failure).
 """
 
 import argparse
@@ -36,7 +37,7 @@ from planning.planner import Planner, PlannerSolveError
 from planning.planner_factory import PlannerFactory
 
 from .evaluate_policy import checkpoint_policy_type, load_policy
-from .meshcat_utils import action_tcp_points, draw_collision_spheres, draw_frame, draw_obstacles, draw_plan, load_robot, move_collision_spheres
+from .meshcat_utils import action_tcp_points, draw_collision_spheres, draw_frame, draw_obstacles, draw_plan, draw_workspace_box, load_robot, move_collision_spheres
 
 POLICY_COLOR = 0x00D0FF
 EXPERT_COLOR = 0x20D040
@@ -122,11 +123,14 @@ def main() -> None:
     parser.add_argument("--show-expert", action="store_true", help="also plan with the expert from every visited state and draw its plan")
     parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu", help="device of the policy (default: %(default)s)")
     parser.add_argument("--show-collision-geometry", action="store_true", help="draw the bounding spheres the planners and the safety filter keep clear of the obstacles, on the robot")
+    parser.add_argument("--show-workspace", action="store_true", help="draw the box of TCP positions the starts and goals are sampled in (Franka only)")
     parser.add_argument("--no-viewer", action="store_true", help="print the outcomes only")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
     args = parser.parse_args()
 
     config = load_and_validate_system_config(args.config)
+    if args.show_workspace and config["system"] != "franka":
+        parser.error("--show-workspace is the workspace of the franka system")
     initialize_ompl(config["ompl_seed"])
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})
@@ -169,6 +173,8 @@ def main() -> None:
         viz.viewer["goal"].set_object(g.Sphere(0.03), g.MeshLambertMaterial(color=0xFF0000, opacity=0.6))
         show = lambda state: viz.viewer["point"].set_transform(tf.translation_matrix(dyn.tcp_position(state[: dyn.n])))
     draw_obstacles(viz, dyn.collision.obstacles)
+    if args.show_workspace:
+        draw_workspace_box(viz)
     if args.show_collision_geometry:
         draw_collision_spheres(viz, dyn.collision_spheres(rollouts[0][2].states[0][: dyn.n])[2])
         show_robot = show

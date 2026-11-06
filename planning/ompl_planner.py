@@ -30,8 +30,9 @@ LENGTH_STEP = 0.05
 class OmplPlanner:
     """Global joint-space path planner: a path from a configuration to the goal configuration (OMPL RRT-Connect).
 
-    A configuration is valid if it is within the joint limits and clear of the obstacles. The path is shortcut and smoothed
-    with OMPL's path simplifier and returned as its waypoints; the straight motions between them are validity checked.
+    A configuration is valid if it is within the joint limits, in the workspace of the system (``in_workspace``: the end
+    effector never leaves it along the path) and clear of the obstacles. The path is shortcut and smoothed with OMPL's path
+    simplifier and returned as its waypoints; the straight motions between them are validity checked.
 
     The planner is stateless regarding OMPL's global environment: its random seed (``ompl_seed``) and log level are set
     by ``initialize_ompl``, which the entry point of the application calls once.
@@ -46,17 +47,21 @@ class OmplPlanner:
     def path(self, observation: np.ndarray) -> np.ndarray:
         """The waypoints (M, n) of a path from the configuration in ``observation`` (the first row) to its goal
         configuration (the last): of ``ompl_candidates`` RRT-Connect paths (the ones that found none are left out), the one
-        along which the end effector (``tcp_position``) travels the shortest. Raises ``PlannerSolveError`` when the start or goal is out of bounds or in collision, or when none
+        along which the end effector (``tcp_position``) travels the shortest. Raises ``PlannerSolveError`` when the start or goal is out of bounds, outside the workspace or in collision, or when none
         of the candidates finds an exact path within ``ompl_timeout`` seconds."""
         q_start = np.asarray(self.sim.invert_obs(observation), dtype=float)[: self.n_joints]
         lower, upper = self.sim.path_lower, self.sim.path_upper
         if np.any(q_start < lower) or np.any(q_start > upper):
             raise PlannerSolveError("OMPL: the start configuration is out of bounds.")
+        if not self.sim.in_workspace(q_start):
+            raise PlannerSolveError("OMPL: the start configuration is outside the workspace.")
         if self.sim.collision.obstacles and not self.sim.collision.is_collision_free(q_start):
             raise PlannerSolveError("OMPL: the start configuration is in collision.")
         q_goal = goal_configuration(self.sim, observation[: self.sim.goal_dim], q_start)
         if np.any(q_goal < lower) or np.any(q_goal > upper):
             raise PlannerSolveError("OMPL: the goal configuration is out of bounds.")
+        if not self.sim.in_workspace(q_goal):
+            raise PlannerSolveError("OMPL: the goal configuration is outside the workspace.")
         if self.sim.collision.obstacles and not self.sim.collision.is_collision_free(q_goal):
             raise PlannerSolveError("OMPL: the goal configuration is in collision.")
         paths, failure = [], None
@@ -101,10 +106,8 @@ class OmplPlanner:
         def is_valid(state: ob.State) -> bool:
             if not space_information.satisfiesBounds(state):
                 return False
-            if not has_obstacles:
-                return True
             q = np.array([state[joint] for joint in range(self.n_joints)], dtype=float)
-            return self.sim.collision.is_collision_free(q)
+            return self.sim.in_workspace(q) and (not has_obstacles or self.sim.collision.is_collision_free(q))
 
         space_information.setStateValidityChecker(is_valid)
         space_information.setStateValidityCheckingResolution(VALIDITY_RESOLUTION)

@@ -37,7 +37,7 @@ from .franka_config import (
     validate_franka_config,
 )
 from .franka_kinematics import franka_kinematics
-from .franka_sampling import WorkspaceSampler
+from .franka_sampling import WorkspaceSampler, workspace_contains
 from .franka_model import Q_READY, TCP_FRAME, build_model, build_robot
 from .triple_integrator import PlantLimits, TripleIntegratorBase
 
@@ -242,10 +242,16 @@ class FrankaSystem(TripleIntegratorBase):
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
         return self.sampler.goal(rng)
 
+    def in_workspace(self, q: np.ndarray) -> bool:
+        """Whether the TCP is in the workspace box the starts and goals are drawn in."""
+        return workspace_contains(self.tcp_position(q))
+
     def _is_valid(self, q: np.ndarray) -> bool:
-        """Inside the joint margins, every joint frame at least ``FLOOR_CLEARANCE`` above the floor and no obstacle touched."""
+        """Inside the joint margins, the TCP in the workspace, every joint frame at least ``FLOOR_CLEARANCE`` above the
+        floor and no obstacle touched."""
         margin = JOINT_SAMPLING_MARGIN * (self.model.upperPositionLimit - self.model.lowerPositionLimit)
         if np.any(q < self.model.lowerPositionLimit + margin) or np.any(q > self.model.upperPositionLimit - margin):
             return False
-        self.tcp_placement(q)
+        if not self.in_workspace(q):
+            return False
         return all(joint.translation[2] >= FLOOR_CLEARANCE for joint in self.data.oMi[1:]) and self.collision.is_collision_free(q)

@@ -1,16 +1,21 @@
 """Shared Meshcat drawing helpers for the visualization scripts."""
 
+import itertools
+
 import meshcat.geometry as g
 import meshcat.transformations as tf
 import numpy as np
 from pinocchio.robot_wrapper import RobotWrapper
 
 from systems.franka_model import build_robot
+from systems.franka_sampling import WORKSPACE_BOX
 
 GREEN, ORANGE = np.array([0.1, 0.8, 0.2]), np.array([1.0, 0.55, 0.0])
 TUBE_SIDES = 6
 PLAN_RADIUS = 0.0022  # m, of a planned or predicted TCP path
 PATH_RADIUS = 0.0015  # m, of each of the many TCP paths of an overview
+WORKSPACE_COLOR = 0xB060FF
+WORKSPACE_RADIUS = 0.003  # m, of the edges of the workspace box
 
 
 def draw_frame(viz, name: str, length: float = 0.1, radius: float = 0.005) -> None:
@@ -118,6 +123,17 @@ def draw_obstacles(viz, obstacles: list[tuple[np.ndarray, float]]) -> None:
             g.MeshLambertMaterial(color=0xE03030, opacity=0.5),
         )
         viz.viewer["obstacles"][str(i)].set_transform(tf.translation_matrix(pos_3d))
+
+
+def draw_workspace_box(viz) -> None:
+    """Draw the edges of the box of TCP positions the Franka system draws its starts and goals in, in purple at
+    ``viz.viewer["workspace"]``."""
+    low, high = (np.array([WORKSPACE_BOX[axis][side] for axis in "xyz"]) for side in (0, 1))
+    bits = np.array(list(itertools.product([0, 1], repeat=3)))
+    corners = np.where(bits, high, low)
+    edges = [(i, j) for i in range(8) for j in range(i + 1, 8) if np.count_nonzero(bits[i] != bits[j]) == 1]
+    first, second = (corners[list(side)] for side in zip(*edges))
+    viz.viewer["workspace"].set_object(tube_geometry(first, second, WORKSPACE_RADIUS), g.MeshBasicMaterial(color=WORKSPACE_COLOR))
 
 
 def load_robot() -> RobotWrapper:

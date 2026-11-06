@@ -6,7 +6,8 @@ The episodes are the first --episodes ones (--first), the explicit --indices, or
 the expert's plan that labels each frame (the chunk of joint positions the flow network is trained to predict from that
 frame's observation) is drawn as the TCP path of the motion it leads to, in cyan, while the arm moves. --no-viewer prints the
 per-episode table only. With --overview the TCP paths of every episode are also drawn at once (green if the episode
-ended within --success-tol of the goal, orange otherwise, blue dots at the starts, red dots at the goals).
+ended within --success-tol of the goal, orange otherwise, blue dots at the starts, red dots at the goals). --show-workspace
+draws the box of TCP positions the starts and goals are sampled in.
 
 The parquet files are read directly, so a dataset a DAgger run is still writing to can be viewed: files that are not
 finished yet are skipped (their episodes are missing).
@@ -28,7 +29,7 @@ from pinocchio.visualize import MeshcatVisualizer
 from planning.config import load_and_validate_system_config
 from systems.franka_system import FrankaSystem
 
-from .meshcat_utils import draw_frame, draw_obstacles, draw_plan, draw_tcp_paths, load_robot, plan_tcp_points
+from .meshcat_utils import draw_frame, draw_obstacles, draw_plan, draw_tcp_paths, draw_workspace_box, load_robot, plan_tcp_points
 
 PLAN_COLOR = 0x00D0FF
 # A frame whose labelled plan stays within this many rad of the current configuration is a "stay" label
@@ -156,6 +157,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0, help="seed of the random choice of episodes")
     parser.add_argument("--show-plan", action="store_true", help="draw the expert's labelled plan of every frame as a TCP path")
     parser.add_argument("--cap", type=int, default=250, help="episode length at which the table notes the step cap (default: %(default)s)")
+    parser.add_argument("--show-workspace", action="store_true", help="draw the box of TCP positions the starts and goals are sampled in")
     parser.add_argument("--no-viewer", action="store_true", help="print the per-episode table only")
     parser.add_argument("--overview", action="store_true", help="additionally draw the TCP paths of all episodes at once")
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
@@ -175,6 +177,8 @@ def main() -> None:
     viz.initViewer(open=True)
     viz.loadViewerModel()
     draw_obstacles(viz, dyn.collision.obstacles)
+    if args.show_workspace:
+        draw_workspace_box(viz)
     if args.overview:
         show_overview(viz, dyn, episodes, args.success_tol)
     episodes = played

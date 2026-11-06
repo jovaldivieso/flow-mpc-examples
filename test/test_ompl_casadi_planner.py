@@ -17,7 +17,7 @@ from planning.ompl_casadi_planner import OmplCasadiPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
 from planning.planner_config import ExpertConfig, ProjectionConfig
 from planning.planner_factory import PlannerFactory
-from systems.franka_system import Q_READY, FrankaSystem
+from systems.franka_system import FrankaSystem
 from test.planner_fixtures import PINNED_EXPERT_SETTINGS, pinned_config, pose_goal, rest_state
 
 N = 7
@@ -31,13 +31,8 @@ STATISTICS = ("ompl_paths", "ompl_replans", "ompl_path_failures", "trimmed_label
 
 
 def _far_goal_configuration() -> np.ndarray:
-    """A configuration far from the rest state (a path of well over the horizon's rows)."""
-    q = Q_READY.copy()
-    q[0] += 1.6
-    q[1] += 0.5
-    q[3] -= 0.8
-    q[5] += 0.6
-    return q
+    """A configuration far from the rest state (a path of more than a dozen rows) with the end effector in the workspace."""
+    return np.array([0.8, -0.44, -0.78, -1.75, -1.32, 1.31, -0.26])
 
 
 def _table_config(**overrides) -> dict:

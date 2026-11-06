@@ -2,6 +2,8 @@
 (the tool z-axis) within ``HAND_TILT`` of ``HAND_AXIS``, at a random roll. A pose is accepted when inverse kinematics from
 one of a few random configurations reaches it with a valid one, so a pose is reached in different configurations from one
 draw to the next.
+
+The workspace is also where the TCP stays: ``workspace_contains`` is the test the planners keep their paths by.
 """
 
 from __future__ import annotations
@@ -22,6 +24,11 @@ IK_STARTS = 6  # random configurations inverse kinematics starts from for a pose
 _LOW = np.array([WORKSPACE_BOX[axis][0] for axis in "xyz"])
 _HIGH = np.array([WORKSPACE_BOX[axis][1] for axis in "xyz"])
 _AXIS = np.array(HAND_AXIS) / np.linalg.norm(HAND_AXIS)
+
+
+def workspace_contains(position: np.ndarray) -> bool:
+    """Whether the TCP ``position`` lies in the workspace box, its faces included."""
+    return bool(np.all(position >= _LOW) and np.all(position <= _HIGH))
 
 
 def _rotation(rng: np.random.Generator) -> np.ndarray:

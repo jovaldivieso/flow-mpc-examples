@@ -24,13 +24,16 @@ from scripts.evaluate_policy import load_policy
 from scripts.meshcat_dataset import episode_summary, load_episodes, plan_positions, read_frames
 from scripts.meshcat_utils import (
     TUBE_SIDES,
+    WORKSPACE_RADIUS,
     draw_collision_spheres,
     draw_plan,
+    draw_workspace_box,
     move_collision_spheres,
     plan_tcp_points,
     tube_geometry,
 )
 from scripts.meshcat_policy import rollout_policy
+from systems.franka_sampling import WORKSPACE_BOX
 from systems.position_history import PositionHistory
 from test.planner_fixtures import pinned_config, pose_goal
 
@@ -191,6 +194,21 @@ class CollisionGeometryDrawingTests(unittest.TestCase):
         self.assertEqual(sorted(round(sphere.radius, 6) for sphere in objects.values()), sorted(np.round(radii, 6)))
         for index, center in enumerate(centers):
             np.testing.assert_allclose(transforms[f"/collision_spheres/{index}"][:3, 3], center)
+
+
+class WorkspaceBoxDrawingTests(unittest.TestCase):
+    def test_the_box_is_twelve_edges_spanning_the_sampling_box(self) -> None:
+        objects, transforms = {}, {}
+        viz = type("Viewer", (), {"viewer": _RecordingNode(objects, transforms)})()
+
+        draw_workspace_box(viz)
+
+        mesh = objects["/workspace"]
+        self.assertEqual(len(mesh.vertices), 12 * 2 * TUBE_SIDES)
+        extent = np.array([[WORKSPACE_BOX[axis][0], WORKSPACE_BOX[axis][1]] for axis in "xyz"])
+        vertices = mesh.vertices.astype(float)
+        np.testing.assert_allclose(vertices.min(axis=0), extent[:, 0], atol=WORKSPACE_RADIUS)
+        np.testing.assert_allclose(vertices.max(axis=0), extent[:, 1], atol=WORKSPACE_RADIUS)
 
 
 class ThickPathDrawingTests(unittest.TestCase):

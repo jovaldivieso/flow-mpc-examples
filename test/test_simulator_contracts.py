@@ -25,7 +25,7 @@ from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
 from systems import franka_sampling
-from systems.franka_sampling import HAND_AXIS, HAND_TILT, IK_STARTS, WORKSPACE_BOX, WorkspaceSampler
+from systems.franka_sampling import HAND_AXIS, HAND_TILT, IK_STARTS, WORKSPACE_BOX, WorkspaceSampler, workspace_contains
 from systems.franka_system import FLOOR_CLEARANCE, Q_READY, FrankaSystem
 from systems.collision_spheres import RADIUS_MARGIN, fit_collision_spheres, surface_points
 from systems.franka_kinematics import COLLISION_SPHERE_MAX_RADIUS
@@ -744,7 +744,42 @@ class WorkspaceSamplingTests(unittest.TestCase):
                 simulator.random_initial_state(np.random.default_rng(0))
 
 
-POINT_MASS_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_config.yaml")
+class WorkspaceConstraintTests(unittest.TestCase):
+    """The TCP stays in the workspace box the starts and goals are drawn in: the test the planners keep their paths by."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.simulator = _build_simulator()
+        cls.outside = Q_READY.copy()
+        cls.outside[0] += 1.2  # swings the TCP around the base to in front of the box
+
+    def test_the_box_contains_its_faces_and_nothing_beyond_them(self) -> None:
+        low = np.array([WORKSPACE_BOX[axis][0] for axis in "xyz"])
+        high = np.array([WORKSPACE_BOX[axis][1] for axis in "xyz"])
+        for point in (low, high, (low + high) / 2):
+            self.assertTrue(workspace_contains(point))
+        for axis in range(3):
+            for face, direction in ((low, -1.0), (high, 1.0)):
+                point = (low + high) / 2
+                point[axis] = face[axis] + direction * 1e-9
+                self.assertFalse(workspace_contains(point))
+
+    def test_a_configuration_is_in_the_workspace_when_its_tcp_is(self) -> None:
+        self.assertTrue(self.simulator.in_workspace(Q_READY))
+        self.assertFalse(self.simulator.in_workspace(self.outside))
+
+    def test_a_configuration_with_its_tcp_outside_is_no_valid_start_or_goal(self) -> None:
+        with mock.patch.object(FrankaSystem, "in_workspace", return_value=True):
+            self.assertTrue(self.simulator._is_valid(self.outside))  # valid but for its TCP
+        self.assertFalse(self.simulator._is_valid(self.outside))
+
+    def test_a_system_without_a_workspace_has_every_configuration_in_it(self) -> None:
+        point_mass = SystemFactory.create("triple_integrator", _point_mass_config())
+
+        self.assertTrue(point_mass.in_workspace(np.full(point_mass.n, 1e6)))
+
+
+POINT_MASS_CONFIG_PATH =os.path.join(PROJECT_ROOT, "scripts", "config", "triple_integrator_config.yaml")
 # The tests pin the dimension they assume, so scaling the shipped config up does not break them
 POINT_MASS_SETTINGS = {"dimension": 2}
 

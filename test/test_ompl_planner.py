@@ -12,7 +12,8 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from systems.config_fields import ConfigurationError
-from systems.franka_system import FrankaSystem
+from systems.franka_sampling import WORKSPACE_BOX
+from systems.franka_system import Q_READY, FrankaSystem
 from systems.point_mass_system import PointMassSystem
 from learning.dagger.utils import sample_initial_state
 from ompl import util as ou
@@ -20,7 +21,7 @@ from planning.config import validate_system_config
 from planning.ompl_planner import OmplPlanner, initialize_ompl
 from planning.planner import Planner, PlannerSolveError
 from planning.planner_config import ExpertConfig
-from test.planner_fixtures import PINNED_EXPERT_SETTINGS, pinned_config
+from test.planner_fixtures import PINNED_EXPERT_SETTINGS, pinned_config, pose_goal, rest_state
 
 N = 7
 TABLE_CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_table_config.yaml")
@@ -143,6 +144,57 @@ class OmplPlannerAmongObstaclesTests(unittest.TestCase):
 
         with self.assertRaisesRegex(PlannerSolveError, "no path"):
             planner.path(self.observation)
+
+
+# A wall across the workspace in the plane y = 0 with a slot between z 0.38 and 0.615 m: its upper block reaches the top of the
+# workspace, so the arm gets round it only by taking its end effector out of the workspace
+WALL = [{"position": [x, 0.0, z], "radius": 0.08} for z in (0.08, 0.19, 0.30, 0.695, 0.805) for x in (0.28, 0.39, 0.50, 0.61, 0.72, 0.83)]
+SLOT = (0.38, 0.615)
+JOINT_STEP = 0.005  # rad between the configurations a motion is sampled at
+BETWEEN_CHECKS = 0.005  # m the end effector may cross a face of the workspace between two validity checks of a motion
+
+
+class OmplPlannerInTheWorkspaceTests(unittest.TestCase):
+    def test_a_start_with_the_end_effector_outside_the_workspace_raises(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        start = rest_state(simulator)
+        start[0] += 1.2  # swings the end effector around the base to in front of the workspace
+
+        with self.assertRaisesRegex(PlannerSolveError, "start configuration is outside the workspace"):
+            OmplPlanner(simulator, ExpertConfig.from_mapping(config)).path(simulator.observe(start))
+
+    def test_a_goal_with_the_end_effector_outside_the_workspace_raises(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        above = Q_READY.copy()
+        above[3] += 0.9  # lifts the end effector over the top of the workspace
+        simulator.set_goal(pose_goal(simulator, above))
+
+        with self.assertRaisesRegex(PlannerSolveError, "goal configuration is outside the workspace"):
+            OmplPlanner(simulator, ExpertConfig.from_mapping(config)).path(simulator.observe(rest_state(simulator)))
+
+    def test_the_path_between_the_two_sides_of_a_wall_stays_in_the_workspace_and_goes_through_its_slot(self) -> None:
+        config = pinned_config(obstacles=WALL, ompl_candidates=3)
+        simulator = FrankaSystem(config)
+        start = sample_initial_state(simulator, 8)
+        self.assertLess(simulator.tcp_position(start[:N])[1], -0.1)  # the pair is on the two sides of the wall
+        self.assertGreater(simulator.goal[1], 0.1)
+
+        path = OmplPlanner(simulator, ExpertConfig.from_mapping(config)).path(simulator.observe(start))
+
+        configurations = [path[:1]]
+        for a, b in zip(path[:-1], path[1:]):
+            steps = max(int(np.ceil(np.linalg.norm(b - a) / JOINT_STEP)), 1)
+            configurations.append(a + np.linspace(0.0, 1.0, steps + 1)[1:, None] * (b - a))
+        tcp = np.array([simulator.tcp_position(q) for q in np.concatenate(configurations)])
+        low = np.array([WORKSPACE_BOX[axis][0] for axis in "xyz"])
+        high = np.array([WORKSPACE_BOX[axis][1] for axis in "xyz"])
+        self.assertTrue(all(simulator.in_workspace(waypoint) for waypoint in path))
+        self.assertLess(np.maximum(low - tcp, tcp - high).max(), BETWEEN_CHECKS)
+        crossing = tcp[np.abs(tcp[:, 1]) < 0.02]
+        self.assertGreater(len(crossing), 0)
+        self.assertTrue(np.all((crossing[:, 2] > SLOT[0]) & (crossing[:, 2] < SLOT[1])))
 
 
 if __name__ == "__main__":

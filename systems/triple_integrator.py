@@ -221,6 +221,11 @@ class TripleIntegratorBase(SystemSimulator):
     def tcp_position(self, q: np.ndarray) -> np.ndarray:
         """The 3-D position the viewers draw for the configuration ``q``."""
 
+    def in_workspace(self, q: np.ndarray) -> bool:
+        """Whether the configuration ``q`` is in the region the path planners keep the system in. Every configuration is,
+        unless a system has such a region."""
+        return True
+
     @abstractmethod
     def goal_transform(self, goal: np.ndarray) -> np.ndarray:
         """The 4x4 homogeneous transform the viewers place the goal marker at."""
