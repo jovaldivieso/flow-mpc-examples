@@ -35,7 +35,6 @@ class ExpertAndProjectionKeysReachValidatedConfigTests(unittest.TestCase):
                 "projection_velocity_weight": 0.5,
                 "projection_acceleration_weight": 0.25,
                 "projection_jerk_weight": 0.125,
-                "fallback_terminal_velocity_tol": 0.007,
                 "max_consecutive_fallbacks": 3,
             }
         )
@@ -47,7 +46,6 @@ class ExpertAndProjectionKeysReachValidatedConfigTests(unittest.TestCase):
             (validated["projection_velocity_weight"], validated["projection_acceleration_weight"], validated["projection_jerk_weight"]),
             (0.5, 0.25, 0.125),
         )
-        self.assertEqual(validated["fallback_terminal_velocity_tol"], 0.007)
         self.assertEqual(validated["max_consecutive_fallbacks"], 3)
 
     def test_omitted_values_default_to_the_dataclass_defaults(self) -> None:
@@ -110,7 +108,6 @@ class ExpertAndProjectionKeysReachValidatedConfigTests(unittest.TestCase):
             ("projection_acceleration_weight", -1.0),
             ("projection_jerk_weight", 0.0),
             ("terminal_velocity_weight", 0.0),
-            ("fallback_terminal_velocity_tol", -0.01),
             ("max_consecutive_fallbacks", 0),
         ):
             with self.subTest(key=key, value=value):
@@ -153,8 +150,8 @@ class ProjectionConfigTests(unittest.TestCase):
 
         self.assertEqual((projection.velocity_weight, projection.acceleration_weight, projection.jerk_weight), (1e-3, 1e-3, 1e-4))
         self.assertEqual(
-            (projection.terminal_velocity_weight, projection.fallback_terminal_velocity_tol, projection.max_consecutive_fallbacks),
-            (10.0, 1e-2, 5),
+            (projection.terminal_velocity_weight, projection.max_consecutive_fallbacks),
+            (10.0, 5),
         )
 
     def test_the_yaml_keys_carry_the_projection_prefix_except_the_terminal_and_fallback_ones(self) -> None:
@@ -165,7 +162,6 @@ class ProjectionConfigTests(unittest.TestCase):
                 "projection_acceleration_weight",
                 "projection_jerk_weight",
                 "terminal_velocity_weight",
-                "fallback_terminal_velocity_tol",
                 "max_consecutive_fallbacks",
             },
         )
@@ -174,18 +170,17 @@ class ProjectionConfigTests(unittest.TestCase):
 
     def test_what_the_mapping_sets_is_read(self) -> None:
         projection = ProjectionConfig.from_mapping(
-            {"projection_velocity_weight": 2.0, "terminal_velocity_weight": 3.0, "fallback_terminal_velocity_tol": 0.5, "max_consecutive_fallbacks": 9}
+            {"projection_velocity_weight": 2.0, "terminal_velocity_weight": 3.0, "max_consecutive_fallbacks": 9}
         )
 
         self.assertEqual((projection.velocity_weight, projection.terminal_velocity_weight), (2.0, 3.0))
-        self.assertEqual((projection.fallback_terminal_velocity_tol, projection.max_consecutive_fallbacks), (0.5, 9))
+        self.assertEqual(projection.max_consecutive_fallbacks, 9)
 
     def test_wrong_types_and_values_are_rejected(self) -> None:
         for bad in (
             {"terminal_velocity_weight": -1.0},
             {"projection_jerk_weight": 0.0},
             {"projection_velocity_weight": "x"},
-            {"fallback_terminal_velocity_tol": -0.1},
             {"max_consecutive_fallbacks": 0},
             {"max_consecutive_fallbacks": 1.5},
         ):
@@ -228,7 +223,7 @@ class ExpertConfigValidationTests(unittest.TestCase):
                     validate_system_config(raw_config=raw_config)
 
     def test_tolerances_must_be_positive(self) -> None:
-        for key in ("pos_tol", "vel_tol"):
+        for key in ("pos_tol", "rot_tol", "vel_tol"):
             with self.subTest(key=key):
                 raw_config = _load_raw_config()
                 raw_config[key] = 0.0
@@ -237,8 +232,8 @@ class ExpertConfigValidationTests(unittest.TestCase):
 
     def test_tolerance_overrides_merge_like_the_dagger_trainer_applies_them(self) -> None:
         validated = load_and_validate_system_config(CONFIG_PATH)
-        merged = validate_system_config({**validated, "pos_tol": 0.05, "vel_tol": 0.2})
-        self.assertEqual((merged["pos_tol"], merged["vel_tol"]), (0.05, 0.2))
+        merged = validate_system_config({**validated, "pos_tol": 0.05, "rot_tol": 0.4, "vel_tol": 0.2})
+        self.assertEqual((merged["pos_tol"], merged["rot_tol"], merged["vel_tol"]), (0.05, 0.4, 0.2))
 
     def test_workspace_bounds_are_three_ordered_finite_pairs(self) -> None:
         bad_bounds = (

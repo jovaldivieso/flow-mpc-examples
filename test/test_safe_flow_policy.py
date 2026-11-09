@@ -29,6 +29,7 @@ CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yam
 # Behaviour tests pin the settings they depend on, so tuning scripts/config/franka_config.yaml cannot break them
 PINNED_EXPERT_SETTINGS = {
     "pos_tol": 0.002,
+    "rot_tol": 0.20,
     "vel_tol": 0.02,
 }
 HORIZON = 10
@@ -96,9 +97,8 @@ def _policy_spec(simulator, policy_type: str = "safeflow", **options) -> PolicyS
 
 
 def _build_safe_flow_policy(simulator, planner_config=None, *, guided=False, **policy_options) -> SafeFlowMPCPolicy:
-    # planner_config defaults to the validated expert config, as it does in the trainer. policy_options are the
-    # safeflow options (flow_init). The tests of the projection wiring run unguided: the flow's guidance
-    # (test_pose_guidance.py) would move what the projector is handed.
+    # planner_config defaults to the validated expert config, as it does in the trainer. The tests of the projection
+    # wiring run unguided: the flow's guidance (test_pose_guidance.py) would move what the projector is handed.
     policy = PolicyFactory.create(
         _policy_spec(simulator, **policy_options), simulator, _validated_config() if planner_config is None else planner_config
     )
@@ -223,15 +223,13 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
         self.assertEqual(steps_taken, 0)
         self.assertEqual(failure_reason, "solve_failure")
 
-    def _rollout_with_a_failing_projector(self, initial_state_edit=None):
+    def _rollout_with_a_failing_projector(self):
         from learning.dagger.evaluation import rollout_policy_with_action_fn
 
         simulator = _build_simulator()
         policy = _build_safe_flow_policy(simulator)
         policy.projector._graph._solve_once = lambda: (_ for _ in ()).throw(RuntimeError("forced failure"))
         initial_state = _rest_state(simulator)
-        if initial_state_edit is not None:
-            initial_state_edit(simulator, initial_state)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             result = rollout_policy_with_action_fn(
@@ -243,19 +241,6 @@ class PolicySolveFailureRecoveryTests(unittest.TestCase):
                 reset_fn=policy.reset,
             )
         return result, policy.projector.config.max_consecutive_fallbacks
-
-    def test_projector_cold_start_failure_in_motion_ends_the_episode_with_a_solve_failure(self) -> None:
-        # The same property through the real policy: with no previously solved safe trajectory to fall back on (holding
-        # still is not one in motion), a failing projector solve surfaces from select_action as a PlannerSolveError (see
-        # CasadiTrajectoryProjector.project), which the evaluation-side rollout turns into an episode-ending failure.
-        def in_motion(simulator, state):
-            state[simulator.n] = 0.5
-
-        (reached_goal, steps_taken, failure_reason), _ = self._rollout_with_a_failing_projector(in_motion)
-
-        self.assertFalse(reached_goal)
-        self.assertEqual(steps_taken, 0)
-        self.assertEqual(failure_reason, "solve_failure")
 
     def test_projector_failures_at_rest_hold_still_for_the_fallback_budget_and_then_end_the_episode(self) -> None:
         (reached_goal, steps_taken, failure_reason), budget = self._rollout_with_a_failing_projector()
@@ -348,14 +333,12 @@ class PolicyFactorySafeFlowTests(unittest.TestCase):
 
     def test_projector_reads_its_tuning_from_the_validated_expert_config(self) -> None:
         planner_config = _validated_config(
-            terminal_velocity_weight=42.0, projection_jerk_weight=0.5, fallback_terminal_velocity_tol=0.007,
-            max_consecutive_fallbacks=3,
+            terminal_velocity_weight=42.0, projection_jerk_weight=0.5, max_consecutive_fallbacks=3,
         )
         policy = _build_safe_flow_policy(_build_simulator(), planner_config=planner_config)
 
         self.assertEqual(policy.projector.config.terminal_velocity_weight, 42.0)
         self.assertEqual(policy.projector.config.jerk_weight, 0.5)
-        self.assertEqual(policy.projector.config.fallback_terminal_velocity_tol, 0.007)
         self.assertEqual(policy.projector.config.max_consecutive_fallbacks, 3)
 
 
@@ -379,27 +362,25 @@ class SelectActionProjectionTests(unittest.TestCase):
 
     def test_every_euler_step_projects_the_observed_state_and_the_proposed_chunk(self) -> None:
         simulator = _build_simulator()
-        policy = _build_safe_flow_policy(simulator, flow_init="gaussian")
+        policy = _build_safe_flow_policy(simulator)
         observation_dict = _rest_observation_dict(simulator)
-        # With a zero velocity the Euler iterate never leaves its initial noise draw x_0: the first reference
-        # must be exactly x_0 (in positions), and since each projection is the flow's next state, the second reference
-        # must be the positions of the first projection.
+        # With a zero velocity the Euler iterate never leaves its start, the projection of the coasting arm (the first
+        # call): the first flow reference must be exactly that, and since each projection is the flow's next state, the
+        # second reference must be the positions of the first flow projection.
         _zero_the_network(policy)
-        torch.manual_seed(7)
-        expected_x0 = torch.randn(1, HORIZON, simulator.n) * torch.tensor(simulator.position_scale, dtype=torch.float32)
         calls = self._recording_projector(policy)
 
-        torch.manual_seed(7)
         action = policy.select_action(observation_dict)
 
-        self.assertEqual(len(calls), policy.inner_policy.velocity_net.num_inference_steps)
+        steps = policy.inner_policy.velocity_net.num_inference_steps
+        self.assertEqual(len(calls), steps + 1)
         expected_state = _rest_state(simulator)  # the projector gets the state the policy saw
         for state, q_ref, _ in calls:
             self.assertEqual(state.shape, (simulator.nx,))
             np.testing.assert_allclose(state, expected_state, atol=1e-5)
             self.assertEqual(q_ref.shape, (HORIZON, simulator.n))
-        np.testing.assert_allclose(calls[0][1], expected_x0[0].numpy(), rtol=1e-5, atol=1e-4)
-        np.testing.assert_allclose(calls[1][1], calls[0][2].positions, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(calls[1][1], calls[0][2].positions, rtol=1e-5, atol=1e-4)
+        np.testing.assert_allclose(calls[2][1], calls[1][2].positions, rtol=1e-5, atol=1e-5)
         # The returned chunk is the jerks of the last projection, as (batch, horizon, nu), within the action limits
         last_projection = calls[-1][2]
         self.assertEqual(tuple(action.shape), (1, HORIZON, simulator.nu))
@@ -408,7 +389,7 @@ class SelectActionProjectionTests(unittest.TestCase):
 
     def test_the_projector_is_handed_the_guided_proposal(self) -> None:
         simulator = _build_simulator()
-        policy = _build_safe_flow_policy(simulator, guided=True, flow_init="gaussian")
+        policy = _build_safe_flow_policy(simulator, guided=True)
         _zero_the_network(policy)
         calls = self._recording_projector(policy)
         goal_ward = np.full((HORIZON, simulator.n), 0.25)
@@ -417,14 +398,16 @@ class SelectActionProjectionTests(unittest.TestCase):
             policy.select_action(_rest_observation_dict(simulator))
 
         self.assertEqual(guide.call_count, policy.inner_policy.velocity_net.num_inference_steps)
-        np.testing.assert_allclose(calls[0][1], goal_ward)
+        np.testing.assert_allclose(calls[1][1], goal_ward)  # the first call projects the start, the next the guided proposal
 
     def test_the_projected_positions_are_safe_whatever_the_proposal(self) -> None:
         simulator = _build_simulator()
-        policy = _build_safe_flow_policy(simulator, flow_init="gaussian")
+        policy = _build_safe_flow_policy(simulator)
         calls = self._recording_projector(policy)
+        noise = np.random.default_rng(0).normal(size=(HORIZON, simulator.n))
 
-        policy.select_action(_rest_observation_dict(simulator))
+        with mock.patch.object(policy, "_initial_chunk", return_value=noise):  # proposals far from anything safe
+            policy.select_action(_rest_observation_dict(simulator))
 
         lower, upper = simulator.state_lower_bounds[: simulator.n], simulator.state_upper_bounds[: simulator.n]
         for _, _, projection in calls:
@@ -484,27 +467,19 @@ class SelectActionProjectionTests(unittest.TestCase):
 
 
 class FlowInitializationTests(unittest.TestCase):
-    """With flow_init="previous_safe" the integration starts from the previous tick's safe positions (or, on the first
-    tick, from the safe positions nearest to the arm coasting) instead of from Gaussian noise."""
+    """The integration starts from the previous tick's safe positions (or, on the first tick, from the safe positions
+    nearest to the arm coasting) instead of from Gaussian noise."""
 
     STEPS = 2  # num_inference_steps of _build_safe_flow_policy
 
-    def _policy_and_calls(self, simulator, **options):
-        policy = _build_safe_flow_policy(simulator, **options)
+    def _policy_and_calls(self, simulator):
+        policy = _build_safe_flow_policy(simulator)
         _zero_the_network(policy)
         return policy, SelectActionProjectionTests._recording_projector(policy)
 
-    def test_gaussian_init_needs_no_extra_projection(self) -> None:
-        simulator = _build_simulator()
-        policy, calls = self._policy_and_calls(simulator, flow_init="gaussian")
-
-        policy.select_action(_rest_observation_dict(simulator))
-
-        self.assertEqual(len(calls), self.STEPS)
-
     def test_the_first_tick_starts_from_the_projection_of_the_coasting_arm(self) -> None:
         simulator = _build_simulator()
-        policy, calls = self._policy_and_calls(simulator, flow_init="previous_safe")
+        policy, calls = self._policy_and_calls(simulator)
         state = _rest_state(simulator)
 
         policy.select_action(_rest_observation_dict(simulator))
@@ -515,7 +490,7 @@ class FlowInitializationTests(unittest.TestCase):
 
     def test_a_moving_arm_starts_its_first_tick_from_safe_braking_positions(self) -> None:
         simulator = _build_simulator()
-        policy, calls = self._policy_and_calls(simulator, flow_init="previous_safe")
+        policy, calls = self._policy_and_calls(simulator)
         state = _rest_state(simulator)
         state[simulator.n : 2 * simulator.n] = 0.5 * simulator.state_upper_bounds[simulator.n : 2 * simulator.n]
 
@@ -531,7 +506,7 @@ class FlowInitializationTests(unittest.TestCase):
 
     def test_later_ticks_start_from_the_previous_safe_positions_one_execution_horizon_later(self) -> None:
         simulator = _build_simulator()
-        policy, calls = self._policy_and_calls(simulator, flow_init="previous_safe")
+        policy, calls = self._policy_and_calls(simulator)
         state = _rest_state(simulator)
         first_chunk = policy.select_action(_policy_input(simulator, state))[0].numpy()
         positions = calls[-1][2].positions
@@ -551,7 +526,7 @@ class FlowInitializationTests(unittest.TestCase):
 
     def test_reset_returns_to_the_coasting_start(self) -> None:
         simulator = _build_simulator()
-        policy, calls = self._policy_and_calls(simulator, flow_init="previous_safe")
+        policy, calls = self._policy_and_calls(simulator)
         state = _rest_state(simulator)
         policy.projector.project(state, _hold_chunk(state))
         policy.reset()
@@ -562,9 +537,6 @@ class FlowInitializationTests(unittest.TestCase):
         self.assertEqual(len(calls), self.STEPS + 1)
         np.testing.assert_allclose(calls[0][1], _hold_chunk(state), atol=1e-5)
 
-    def test_an_unknown_flow_init_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            _build_safe_flow_policy(_build_simulator(), flow_init="zeros")
 
 
 class StateDictInterchangeTests(unittest.TestCase):

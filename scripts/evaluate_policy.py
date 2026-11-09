@@ -360,7 +360,6 @@ def load_policy(
         unet_dim_mults=unet.dim_mults,
         num_inference_steps=int(flow_config["num_inference_steps"]),
         action_scale=tuple(flow_config["action_scale"]),
-        flow_init=flow_config["safeflow_init"],
     )
     policy = PolicyFactory.create(spec, simulator, planner_config)
     policy.load_network_state_dict(state_dict)
@@ -381,7 +380,7 @@ def run_evaluation(
     policy_type: str,
     config: Mapping[str, Any],
     model_dir: str,
-    num_steps: int = 125,
+    num_steps: int = 200,
     seeds: list[int] | None = None,
     initial_states: Any | None = None,
     goal_states: Any | None = None,
@@ -738,7 +737,7 @@ def main():
     parser.add_argument(
         "--num-steps",
         type=int,
-        default=125,
+        default=200,
         help="maximum steps per rollout (default: %(default)s)",
     )
     parser.add_argument(
@@ -766,7 +765,7 @@ def main():
         "--tolerance-overrides",
         type=str,
         default=None,
-        help="dict of pos_tol / vel_tol overriding the config's, e.g. '{\"pos_tol\": 0.02, \"vel_tol\": 0.1}'",
+        help="dict of pos_tol / rot_tol / vel_tol overriding the config's, e.g. '{\"pos_tol\": 0.02, \"rot_tol\": 0.30, \"vel_tol\": 0.1}'",
     )
     parser.add_argument(
         "--action-noise-std",

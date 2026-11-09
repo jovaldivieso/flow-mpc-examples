@@ -45,6 +45,7 @@ HISTORY_LENGTH = 3  # configurations of the history the policy observes
 # Behaviour tests pin the settings they depend on, so tuning scripts/config/franka_config.yaml cannot break them
 PINNED_EXPERT_SETTINGS = {
     "pos_tol": 0.002,
+    "rot_tol": 0.20,
     "vel_tol": 0.02,
 }
 
@@ -350,23 +351,54 @@ class DynamicsModelTests(unittest.TestCase):
         self.assertAlmostEqual(position_error, 0.0, places=9)
         self.assertAlmostEqual(rotation_error, 0.0, places=9)
         self.assertTrue(simulator.is_done(state))
+        self.assertTrue(simulator.at_goal_pose(state))
 
-        # only the position counts: a turned wrist at the goal position is done, and is reported as turned
-        turned = state.copy()
-        turned[6] += 0.5
+        # the orientation counts too: a wrist turned beyond rot_tol at the goal position is not done, one within it is
         simulator.set_goal(np.concatenate([simulator.tcp_position(state[: simulator.n]), simulator.goal[3:]]))
-        self.assertGreater(simulator.goal_errors(turned)[1], 0.1)
-        self.assertLess(simulator.goal_errors(turned)[0], simulator.pos_tol)
-        self.assertTrue(simulator.is_done(turned))
+        for turn, done in ((2.0 * simulator.rot_tol, False), (0.5 * simulator.rot_tol, True)):
+            turned = state.copy()
+            turned[6] += turn
+            self.assertLess(simulator.goal_errors(turned)[0], simulator.pos_tol)
+            self.assertEqual(simulator.goal_errors(turned)[1] < simulator.rot_tol, done)
+            self.assertEqual(simulator.is_done(turned), done)
         simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
 
         moving = state.copy()
         moving[simulator.n] = 10 * simulator.vel_tol
         self.assertFalse(simulator.is_done(moving))
+        self.assertTrue(simulator.at_goal_pose(moving))  # the goal set does not ask for rest
         displaced = state.copy()
         displaced[0] += 0.05
         self.assertFalse(simulator.is_done(displaced))
+        self.assertFalse(simulator.at_goal_pose(displaced))
         self.assertGreater(simulator.goal_errors(displaced)[0], simulator.pos_tol)
+
+    def test_the_goal_ratio_is_below_one_exactly_in_the_goal_set(self) -> None:
+        simulator = _build_simulator()
+        state = _rest_state(simulator)
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
+        self.assertAlmostEqual(simulator.goal_ratio(state), 0.0, places=9)
+
+        for joint, move in ((0, 0.005), (0, 0.05), (6, 0.5 * simulator.rot_tol), (6, 2.0 * simulator.rot_tol)):
+            displaced = state.copy()
+            displaced[joint] += move
+            position_error, rotation_error = simulator.goal_errors(displaced)
+            self.assertAlmostEqual(simulator.goal_ratio(displaced), max(position_error / simulator.pos_tol, rotation_error / simulator.rot_tol))
+            self.assertEqual(simulator.goal_ratio(displaced) < 1.0, simulator.at_goal_pose(displaced))
+
+    def test_the_goal_step_closes_the_pose_error_in_the_row_space_of_the_jacobian(self) -> None:
+        simulator = _build_simulator()
+        state = _rest_state(simulator)
+        simulator.set_goal(pose_goal(simulator, state[: simulator.n]))
+        q = state[: simulator.n] + 0.02 * np.random.default_rng(0).standard_normal(simulator.n)
+        error, jacobian, _ = simulator.goal_task_error(q, simulator.goal)
+
+        step = simulator.goal_step(error, jacobian)
+
+        self.assertLess(np.linalg.norm(simulator.goal_task_error(q + step, simulator.goal)[0]), 0.1 * np.linalg.norm(error))
+        self.assertLess(abs(np.linalg.svd(jacobian)[2][-1] @ step), 1e-9)
+        batched = simulator.goal_step(np.stack([error, 2 * error]), np.stack([jacobian, jacobian]))
+        np.testing.assert_allclose(batched, np.stack([step, 2 * step]), atol=1e-9)
 
 
 class CollisionModelTests(unittest.TestCase):
@@ -394,6 +426,15 @@ class CollisionModelTests(unittest.TestCase):
                 axis=0,
             )
             self.assertTrue(inside.all(), f"{geometry.name}: {(~inside).sum()} surface points outside the spheres")
+
+    def test_the_centers_along_a_trajectory_are_the_centers_of_the_spheres_along_it(self) -> None:
+        q_trajectory = Q_READY + 0.3 * np.random.default_rng(4).standard_normal((7, 7))
+
+        centers, radii = self.simulator.collision_centers_along(q_trajectory)
+
+        full_centers, _, full_radii = self.simulator.collision_spheres_along(q_trajectory)
+        np.testing.assert_allclose(centers, full_centers, atol=1e-12)
+        np.testing.assert_array_equal(radii, full_radii)
 
     def test_the_kinematics_export_the_spheres_with_their_jacobians(self) -> None:
         centers, jacobians, radii = self.simulator.collision_spheres(Q_READY)

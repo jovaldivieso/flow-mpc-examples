@@ -73,22 +73,19 @@ class ProjectionConfig:
     jerk_weight: float = 1e-4
     # Weight of the soft rest at the end of the chunk, which keeps the problem feasible from a high speed
     terminal_velocity_weight: float = 10.0
-    fallback_terminal_velocity_tol: float = 1e-2
     max_consecutive_fallbacks: int = 5
 
     def __post_init__(self) -> None:
         for name in ("velocity_weight", "acceleration_weight", "jerk_weight", "terminal_velocity_weight"):
             if getattr(self, name) <= 0:
                 raise ConfigurationError(f"'{name}' must be positive.")
-        if self.fallback_terminal_velocity_tol < 0:
-            raise ConfigurationError("'fallback_terminal_velocity_tol' must be non-negative.")
         if self.max_consecutive_fallbacks <= 0:
             raise ConfigurationError("'max_consecutive_fallbacks' must be positive.")
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any]) -> ProjectionConfig:
-        """The settings of a (raw) config, under the keys ``projection_<field>`` (``terminal_velocity_weight`` and the two
-        fallback fields under their own names); keys it omits keep their defaults."""
+        """The settings of a (raw) config, under the keys ``projection_<field>`` (``terminal_velocity_weight`` and the
+        fallback budget under their own names); keys it omits keep their defaults."""
         defaults = asdict(cls())
         values: dict[str, Any] = {}
         for name, default in defaults.items():
@@ -98,7 +95,7 @@ class ProjectionConfig:
 
     @staticmethod
     def key(name: str) -> str:
-        return name if name in ("terminal_velocity_weight", "fallback_terminal_velocity_tol", "max_consecutive_fallbacks") else f"projection_{name}"
+        return name if name in ("terminal_velocity_weight", "max_consecutive_fallbacks") else f"projection_{name}"
 
     @classmethod
     def keys(cls) -> set[str]:

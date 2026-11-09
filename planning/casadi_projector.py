@@ -145,8 +145,8 @@ class CasadiTrajectoryProjector:
         return states, np.zeros((self.sim.nu, self.N))
 
     def _revalidate_fallback(self, x0: np.ndarray, u_guess: np.ndarray) -> np.ndarray | None:
-        """The states of ``u_guess`` applied from the actual ``x0`` if they respect the limits and, with the safety filter, end
-        at rest and are clear of the obstacles, else None: the cached plan was only verified from the state it was solved from."""
+        """The states of ``u_guess`` applied from the actual ``x0`` if they respect the limits and, with the safety filter, are
+        clear of the obstacles, else None: the cached plan was only verified from the state it was solved from."""
         states = np.zeros((self.sim.nx, self.N + 1))
         states[:, 0] = x0
         for step in range(self.N):
@@ -157,9 +157,8 @@ class CasadiTrajectoryProjector:
         )
         if not self.safe:
             return states if within_limits else None
-        at_rest = np.all(np.abs(states[self.rest_idx, self.N]) <= self.config.fallback_terminal_velocity_tol)
         collision_free = self.sim.collision.trajectory_is_collision_free(states[: self.sim.n, 1:].T)
-        return states if within_limits and at_rest and collision_free else None
+        return states if within_limits and collision_free else None
 
     def _linearize(self, x0: np.ndarray, q_ref: np.ndarray) -> None:
         """Linearize the obstacles along the reference ``q_ref`` from ``x0``, which the graph already holds."""

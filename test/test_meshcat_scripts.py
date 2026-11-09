@@ -337,7 +337,7 @@ class LoadPolicyTests(unittest.TestCase):
             "execution_horizon": EXECUTION,
             "unet": {"dim": 8, "dim_mults": [1, 2]},
             "policy_type": "flow",
-            "flow_config": {"num_inference_steps": 2, "safeflow_init": "previous_safe", "action_scale": [1.0] * N},
+            "flow_config": {"num_inference_steps": 2, "action_scale": [1.0] * N},
             **overrides,
         }
 

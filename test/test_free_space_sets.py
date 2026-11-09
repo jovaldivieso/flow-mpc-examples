@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -97,6 +98,34 @@ class CollisionHalfspacesTests(unittest.TestCase):
     def setUp(self) -> None:
         self.simulator = FrankaSystem(pinned_config(obstacles=OBSTACLES))
         self.model = self.simulator.collision
+
+    def test_the_sets_and_their_linearization_come_from_one_evaluation_of_the_spheres(self) -> None:
+        q_trajectory = Q_MID + 0.1 * np.random.default_rng(1).standard_normal((6, 7))
+        expected_sets = self.model.sets_along(Q_MID, q_trajectory)
+        expected_A, expected_b = self.model.linearize(expected_sets, q_trajectory)
+
+        with mock.patch.object(self.model, "spheres_along", wraps=self.model.spheres_along) as spheres_along:
+            sets, A, b = self.model.linearized_sets(Q_MID, q_trajectory)
+
+        self.assertEqual(spheres_along.call_count, 1)
+        np.testing.assert_allclose(sets[0], expected_sets[0])
+        np.testing.assert_allclose(sets[1], expected_sets[1])
+        np.testing.assert_allclose(A, expected_A, atol=1e-12)
+        np.testing.assert_allclose(b, expected_b, atol=1e-12)
+
+    def test_without_obstacles_the_linearized_sets_are_empty(self) -> None:
+        free = FrankaSystem(pinned_config())
+
+        (normals, offsets), A, b = free.collision.linearized_sets(Q_MID, np.tile(Q_MID, (3, 1)))
+
+        self.assertEqual((normals.shape, offsets.shape, A.shape, b.shape), ((3, 0, 0, 3), (3, 0, 0), (3, 0, 7), (3, 0)))
+
+    def test_penetration_checks_do_not_evaluate_the_jacobians(self) -> None:
+        q_trajectory = Q_MID + 0.1 * np.random.default_rng(2).standard_normal((4, 7))
+
+        with mock.patch.object(self.model, "spheres_along", side_effect=AssertionError("Jacobians evaluated")):
+            self.model.trajectory_is_collision_free(q_trajectory)
+            self.model.free_prefix(q_trajectory)
 
     def test_the_rows_are_the_free_space_half_spaces_of_the_spheres_linearized_at_every_node(self) -> None:
         q_trajectory = Q_MID + 0.1 * np.random.default_rng(0).standard_normal((6, 7))

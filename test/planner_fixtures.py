@@ -30,6 +30,7 @@ PINNED_EXPERT_SETTINGS = {
     "totg_acceleration_scale": 0.5,
     "totg_max_deviation": 0.05,
     "pos_tol": 0.005,
+    "rot_tol": 0.20,
     "vel_tol": 0.05,
 }
 

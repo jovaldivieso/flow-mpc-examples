@@ -69,7 +69,8 @@ class FrankaKinematics:
     - ``fk(q) -> (p, R)``: TCP position ``p`` (3,) and rotation matrix ``R`` (3, 3) as a symbolic-friendly ``SX`` function.
     - ``collision_spheres(q) -> (centers, jacobians, radii)``: centers (S, 3), analytical position Jacobians
       ``J_s = dp_s/dq`` (S, 3, n), and radii (S,) of the bounding spheres of the links; ``collision_spheres_along`` does
-      the same for the rows of a trajectory in one call.
+      the same for the rows of a trajectory in one call, and ``collision_centers_along`` gives only the centers and the
+      radii (the Jacobians are most of the cost, and the collision checks do not need them).
     - ``inverse_kinematics(p_d, R_d, q_init) -> q``: solves the nonlinear program (NLP) below from ``q_init``.
 
     Problem (Inverse Kinematics NLP)
@@ -124,7 +125,9 @@ class FrankaKinematics:
         centers_mat = ca.vertcat(*[c.T for c in sphere_centers])
         jacobians_mat = ca.vertcat(*[ca.jacobian(c, q) for c in sphere_centers])
         self._spheres_fn = ca.Function("spheres", [q], [centers_mat, jacobians_mat])
+        self._centers_fn = ca.Function("centers", [q], [centers_mat])
         self._spheres_maps: dict[int, ca.Function] = {}  # by the number of configurations, built when first asked for
+        self._centers_maps: dict[int, ca.Function] = {}
 
         position_goal, rotation_goal = ca.SX.sym("p_d", 3), ca.SX.sym("R_d", 3, 3)
         position, rotation = self.fk(q)
@@ -161,6 +164,15 @@ class FrankaKinematics:
         centers = np.array(centers, dtype=float).reshape(s, horizon, 3).transpose(1, 0, 2)  # (S, 3H) holds node after node
         jacobians = np.array(jacobians, dtype=float).reshape(s, 3, horizon, self.n).transpose(2, 0, 1, 3)  # (3S, nH) likewise
         return centers, jacobians, self.sphere_radii
+
+    def collision_centers_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The centers (H, S, 3) and the radii (S,) of ``collision_spheres_along``, without the Jacobians."""
+        q_traj = np.asarray(q_trajectory, dtype=float)
+        horizon, s = len(q_traj), len(self.sphere_radii)
+        if horizon not in self._centers_maps:
+            self._centers_maps[horizon] = self._centers_fn.map(horizon)
+        centers = np.array(self._centers_maps[horizon](q_traj.T), dtype=float).reshape(s, horizon, 3).transpose(1, 0, 2)
+        return centers, self.sphere_radii
 
     def reaches_pose(self, q: np.ndarray, position: np.ndarray, rotation: np.ndarray) -> bool:
         """True if ``q`` already achieves the target TCP ``(position, rotation)`` within ``IK_TOLERANCE``."""

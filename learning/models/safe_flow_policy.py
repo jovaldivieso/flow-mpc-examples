@@ -10,7 +10,6 @@ from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy, observation_features
 from planning.casadi_projector import CasadiTrajectoryProjector
 
-FLOW_INITIALIZATIONS = ("previous_safe", "gaussian")
 
 
 class SafeFlowMPCPolicy(ActionPolicy):
@@ -21,10 +20,10 @@ class SafeFlowMPCPolicy(ActionPolicy):
     safe set by ``CasadiTrajectoryProjector``, and the projected positions are the flow's next state. The jerks of the
     last projection are what the system executes, the first of them now.
 
-    With ``flow_init="previous_safe"`` the integration does not start from Gaussian noise but from the previous
-    tick's safe positions (one control period later), or, on the first tick of an episode, from the safe positions nearest
-    to the arm coasting from the state (zero jerk), which keep it within its limits and clear of the obstacles: SafeFlowMPC
-    starts every tick on the safe set (Assumption 2 and Eq. 10).
+    The integration does not start from Gaussian noise but from the previous tick's safe positions (one control period
+    later), or, on the first tick of an episode, from the safe positions nearest to the arm coasting from the state (zero
+    jerk), which keep it within its limits and clear of the obstacles: SafeFlowMPC starts every tick on the safe set
+    (Assumption 2 and Eq. 10).
 
     The jerks of the last projection are what the system executes for the next ``execution_horizon`` control periods; the next
     tick starts from the plan that many periods later.
@@ -33,18 +32,10 @@ class SafeFlowMPCPolicy(ActionPolicy):
     the inner policy's behind the ``inner_policy.`` prefix, which ``load_network_state_dict`` maps checkpoint keys onto.
     """
 
-    def __init__(
-        self,
-        inner_policy: FlowPolicy,
-        projector: CasadiTrajectoryProjector,
-        flow_init: str = "previous_safe",
-    ) -> None:
+    def __init__(self, inner_policy: FlowPolicy, projector: CasadiTrajectoryProjector) -> None:
         super().__init__()
-        if flow_init not in FLOW_INITIALIZATIONS:
-            raise ValueError(f"'flow_init' must be one of {FLOW_INITIALIZATIONS}, got {flow_init!r}.")
         self.inner_policy = inner_policy
         self.projector = projector
-        self.flow_init = flow_init
 
     def reset(self) -> None:
         self.inner_policy.reset()
@@ -57,10 +48,8 @@ class SafeFlowMPCPolicy(ActionPolicy):
     ) -> torch.Tensor:
         return self.inner_policy.compute_loss(observation_dict, positions, paths)
 
-    def _initial_chunk(self, state: np.ndarray) -> np.ndarray | None:
-        """The safe positions the flow integration starts from, or None for Gaussian noise."""
-        if self.flow_init == "gaussian":
-            return None
+    def _initial_chunk(self, state: np.ndarray) -> np.ndarray:
+        """The safe positions the flow integration starts from."""
         chunk = self.projector.next_chunk_guess()
         if chunk is not None:
             return chunk

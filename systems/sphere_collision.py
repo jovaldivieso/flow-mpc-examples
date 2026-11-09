@@ -16,18 +16,27 @@ COLLISION_BUFFER = 0.005  # [m] safety margin of the free-space sets around the 
 SphereFunction = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
 # (H, n) configurations -> the same at every row: centers (H, S, d), Jacobians (H, S, d, n), and radii (S,)
 TrajectorySphereFunction = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray, np.ndarray]]
+# (H, n) configurations -> the centers (H, S, d) and the radii (S,) of the same, without the Jacobians
+TrajectoryCenterFunction = Callable[[np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 
 class SphereCollisionModel:
     """Static spherical obstacles ``(center, radius)`` and the bounding spheres of a system with ``n`` configuration
-    coordinates: ``spheres`` at one configuration and ``spheres_along`` at the rows of a trajectory in one call."""
+    coordinates: ``spheres`` at one configuration, ``spheres_along`` at the rows of a trajectory in one call and
+    ``centers_along`` the same without the Jacobians, which the checks that only look for penetration use."""
 
     def __init__(
-        self, obstacles: list[tuple[np.ndarray, float]], spheres: SphereFunction, spheres_along: TrajectorySphereFunction, n: int
+        self,
+        obstacles: list[tuple[np.ndarray, float]],
+        spheres: SphereFunction,
+        spheres_along: TrajectorySphereFunction,
+        centers_along: TrajectoryCenterFunction,
+        n: int,
     ) -> None:
         self.obstacles = obstacles
         self.spheres = spheres
         self.spheres_along = spheres_along
+        self.centers_along = centers_along
         self.n = int(n)
         self.free_space = FreeSpaceSets(obstacles, COLLISION_BUFFER)
 
@@ -43,7 +52,7 @@ class SphereCollisionModel:
         q_traj = np.asarray(q_trajectory, dtype=float)
         if not self.obstacles or len(q_traj) == 0:
             return True
-        centers, _, radii = self.spheres_along(q_traj[:, : self.n])
+        centers, radii = self.centers_along(q_traj[:, : self.n])
         return not self._penetrates(centers, radii)
 
     def free_prefix(self, q_trajectory: np.ndarray) -> int:
@@ -52,7 +61,7 @@ class SphereCollisionModel:
         q_traj = np.asarray(q_trajectory, dtype=float)
         if not self.obstacles or len(q_traj) == 0:
             return len(q_traj)
-        centers, _, radii = self.spheres_along(q_traj[:, : self.n])
+        centers, radii = self.centers_along(q_traj[:, : self.n])
         hit = self._penetrating_rows(centers, radii)
         return int(np.argmax(hit)) if hit.any() else len(q_traj)
 
@@ -85,13 +94,10 @@ class SphereCollisionModel:
         Returns the normals ``(H, S, K, 3)`` and offsets ``(H, S, K)`` of the half-spaces ``normal . center >= offset``.
         """
         q_traj = np.asarray(q_trajectory, dtype=float)
-        horizon = len(q_traj)
         if not self.obstacles:
-            return np.zeros((horizon, 0, 0, 3)), np.zeros((horizon, 0, 0))
-        centers, _, radii = self.spheres_along(np.vstack([np.asarray(q_current, dtype=float)[None, : self.n], q_traj]))
-        previous, centers = centers[:-1], centers[1:]  # the set of a node is around the motion from the previous one
-        normals, offsets = self.free_space.build(previous.reshape(-1, 3), centers.reshape(-1, 3), np.tile(radii, horizon))
-        return normals.reshape(horizon, len(radii), -1, 3), offsets.reshape(horizon, len(radii), -1)
+            return self._no_sets(len(q_traj))
+        centers, radii = self.centers_along(np.vstack([np.asarray(q_current, dtype=float)[None, : self.n], q_traj]))
+        return self._sets(centers, radii)
 
     def linearize(self, sets: tuple[np.ndarray, np.ndarray], q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """The half-spaces ``A @ q >= b`` that keep the bounding spheres in ``sets`` (``sets_along``), linearized in the
@@ -101,18 +107,47 @@ class SphereCollisionModel:
         Returns ``A`` of shape ``(H, P, n)`` and ``b`` of shape ``(H, P)``, where ``P = num_halfspaces`` and the row
         index is ``sphere * set_size + i``.
         """
-        normals, offsets = sets
         q_traj = np.asarray(q_trajectory, dtype=float)
-        horizon = len(q_traj)
-        if normals.shape[1] == 0:
-            return np.zeros((horizon, 0, self.n)), np.zeros((horizon, 0))
+        if sets[0].shape[1] == 0:
+            return np.zeros((len(q_traj), 0, self.n)), np.zeros((len(q_traj), 0))
         centers, jacobians, _ = self.spheres_along(q_traj)
+        return self._linearization(sets, centers, jacobians, q_traj)
+
+    def linearized_sets(
+        self, q_current: np.ndarray, q_trajectory: np.ndarray
+    ) -> tuple[tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]:
+        """The sets along ``q_trajectory`` (``sets_along``) and their half-spaces linearized along it (``linearize``),
+        from one evaluation of the spheres at ``q_current`` and the nodes: ``(sets, A, b)``."""
+        q_traj = np.asarray(q_trajectory, dtype=float)
+        if not self.obstacles:
+            sets = self._no_sets(len(q_traj))
+            return (sets, *self.linearize(sets, q_traj))
+        centers, jacobians, radii = self.spheres_along(np.vstack([np.asarray(q_current, dtype=float)[None, : self.n], q_traj]))
+        sets = self._sets(centers, radii)
+        return (sets, *self._linearization(sets, centers[1:], jacobians[1:], q_traj))
+
+    def halfspaces(self, q_current: np.ndarray, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The sets along ``q_trajectory`` linearized along it: ``linearize(sets_along(...), q_trajectory)``."""
+        return self.linearized_sets(q_current, q_trajectory)[1:]
+
+    @staticmethod
+    def _no_sets(horizon: int) -> tuple[np.ndarray, np.ndarray]:
+        return np.zeros((horizon, 0, 0, 3)), np.zeros((horizon, 0, 0))
+
+    def _sets(self, centers: np.ndarray, radii: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The sets of the nodes from the centers (H + 1, S, 3) at ``q_current`` and the nodes."""
+        horizon = len(centers) - 1
+        previous, centers = centers[:-1], centers[1:]  # the set of a node is around the motion from the previous one
+        normals, offsets = self.free_space.build(previous.reshape(-1, 3), centers.reshape(-1, 3), np.tile(radii, horizon))
+        return normals.reshape(horizon, len(radii), -1, 3), offsets.reshape(horizon, len(radii), -1)
+
+    def _linearization(
+        self, sets: tuple[np.ndarray, np.ndarray], centers: np.ndarray, jacobians: np.ndarray, q_traj: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """``A`` and ``b`` of ``linearize`` from the centers and Jacobians of the spheres at the nodes ``q_traj``."""
+        normals, offsets = sets
         # (H, S, K, n): the gradient of normal . center(q) in q, and its value at every node
         a_vec = np.einsum("hski,hsin->hskn", normals, jacobians)
         value = np.einsum("hski,hsi->hsk", normals, centers)
         b_vec = offsets - value + np.einsum("hskn,hn->hsk", a_vec, q_traj)
-        return a_vec.reshape(horizon, -1, self.n), b_vec.reshape(horizon, -1)
-
-    def halfspaces(self, q_current: np.ndarray, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """The sets along ``q_trajectory`` linearized along it: ``linearize(sets_along(...), q_trajectory)``."""
-        return self.linearize(self.sets_along(q_current, q_trajectory), q_trajectory)
+        return a_vec.reshape(len(q_traj), -1, self.n), b_vec.reshape(len(q_traj), -1)

@@ -186,8 +186,8 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "per-experiment override for the expert config's convergence tolerances, as a Python-literal "
-            "dict of the tolerance keys pos_tol and vel_tol, e.g. "
-            "'{\"pos_tol\": 0.01, \"vel_tol\": 0.05}'."
+            "dict of the tolerance keys pos_tol, rot_tol and vel_tol, e.g. "
+            "'{\"pos_tol\": 0.01, \"rot_tol\": 0.20, \"vel_tol\": 0.05}'."
         ),
     )
     p.add_argument(
@@ -284,12 +284,12 @@ def main() -> None:
     tolerance_overrides = _parse_dict_override(
         option("tolerance_overrides", None),
         "--tolerance-overrides",
-        '{"pos_tol": 0.01, "vel_tol": 0.05}',
+        '{"pos_tol": 0.01, "rot_tol": 0.20, "vel_tol": 0.05}',
     )
     eval_tolerance_overrides = _parse_dict_override(
         option("eval_tolerance_overrides", None),
         "--eval-tolerance-overrides",
-        '{"pos_tol": 0.02, "vel_tol": 0.05}',
+        '{"pos_tol": 0.02, "rot_tol": 0.30, "vel_tol": 0.05}',
     )
     if (args.repo_id is None) != (args.dataset_root is None):
         raise ValueError("Provide both --repo-id and --dataset-root together, or omit both.")

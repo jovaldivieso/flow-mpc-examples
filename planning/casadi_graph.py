@@ -231,11 +231,13 @@ class CasadiKinematicGraph:
         """The free-space sets along ``q_ref`` (N, n_joints), the set of each node being the one around the motion of the
         spheres from the previous node (the state of ``set_state`` for the first), linearized along it."""
         if self.num_halfspaces > 0:
-            self._sets = self.sim.collision.sets_along(self._q_current, q_ref)
-            self._linearize_sets(q_ref)
+            self._sets, A, b = self.sim.collision.linearized_sets(self._q_current, q_ref)
+            self._set_linearization(A, b)
 
     def _linearize_sets(self, q_ref: np.ndarray) -> None:
-        A, b = self.sim.collision.linearize(self._sets, q_ref)
+        self._set_linearization(*self.sim.collision.linearize(self._sets, q_ref))
+
+    def _set_linearization(self, A: np.ndarray, b: np.ndarray) -> None:
         self.set_value(self.A_coll, A.reshape(-1, self.n_joints))
         self.set_value(self.b_coll, b.reshape(-1))
 

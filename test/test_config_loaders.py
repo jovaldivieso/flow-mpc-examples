@@ -176,12 +176,6 @@ class LoadModelSectionTests(unittest.TestCase):
         path = self._write("flow:", "  num_inference_steps: 5")
         self.assertEqual(load_flow_config(path), FlowConfig(num_inference_steps=5))
         self.assertEqual(load_flow_config(None), FlowConfig())
-        self.assertEqual(FlowConfig().safeflow_init, "previous_safe")
-
-    def test_safeflow_options_are_read(self) -> None:
-        path = self._write("safeflow:", "  init: gaussian")
-        config = load_flow_config(path)
-        self.assertEqual(config.safeflow_init, "gaussian")
 
     def test_the_history_length_is_read_and_defaults_to_ten(self) -> None:
         self.assertEqual(FlowConfig().history_length, 10)
@@ -206,11 +200,6 @@ class LoadModelSectionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 load_execution_horizon(self._write(f"execution_horizon: {value}"), 10)
 
-    def test_invalid_safeflow_options_are_rejected(self) -> None:
-        for lines in (("safeflow:", "  init: zeros"), ("safeflow: 3",)):
-            with self.subTest(lines=lines):
-                with self.assertRaises(ValueError):
-                    load_flow_config(self._write(*lines))
 
 
 class DefaultPathHelperTests(unittest.TestCase):

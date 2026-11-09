@@ -6,10 +6,6 @@ model:
     num_inference_steps: 7      # Euler integration steps for ODE sampling
     history_length: 10          # last positions of the arm (the current one last) the policy is conditioned on
 
-  # Only used by the safeflow policy
-  safeflow:
-    init: previous_safe         # where the flow integration starts: previous_safe (last safe actions, shifted) or gaussian
-
   # The policy predicts a chunk of prediction_horizon joint positions per state (DAgger labels it with the expert's plan)
   prediction_horizon: 16
   execution_horizon: 8          # control periods the first jerks of the chunk are executed for before the policy is asked again
@@ -22,6 +18,7 @@ training:
   dagger_iterations: 4
   trajectories_per_iteration: [1000, 1000, 1000, 1000]
   steps_per_trajectory: 100
+  eval_steps: 200               # the evaluation rollouts run longer than the collection ones: slow arrivals count
   target_epochs_per_round: [150, 150, 150, 150]
   learning_rate: 1.0e-4         # AdamW; every round decays it by a cosine over twice the round's steps (to 1e-7), and the next round starts afresh
   action_noise_std: 0.0         # rad/s^3, Gaussian noise on the executed jerk
@@ -29,10 +26,12 @@ training:
   eval_episodes: 100
   tolerance_overrides:
     pos_tol: 0.03
+    rot_tol: 0.30
     vel_tol: 0.01
   # Deliberately more relaxed than tolerance_overrides above, falls back to tolerance_overrides if omitted.
   eval_tolerance_overrides:
     pos_tol: 0.05
+    rot_tol: 0.50
     vel_tol: 0.03
   num_workers: 4
 

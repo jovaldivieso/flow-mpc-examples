@@ -12,6 +12,7 @@ SYSTEM_CONFIG_KEYS = {
     "max_jerk",
     "min_start_goal_distance",
     "pos_tol",
+    "rot_tol",
     "vel_tol",
     "obstacles",
 }
@@ -96,8 +97,13 @@ def read_limits(raw_config: Mapping[str, Any], key: str, default: tuple[float, .
     return read_positive_vector(raw, key, size)
 
 
-def read_tolerances(raw_config: Mapping[str, Any], pos_tol: float, vel_tol: float) -> dict[str, float]:
-    tolerances = {"pos_tol": read_float(raw_config, "pos_tol", pos_tol), "vel_tol": read_float(raw_config, "vel_tol", vel_tol)}
+def read_tolerances(raw_config: Mapping[str, Any], pos_tol: float, rot_tol: float, vel_tol: float) -> dict[str, float]:
+    """The tolerances of "reached the goal and at rest": position [m], orientation [rad] and velocity [rad/s or m/s]."""
+    tolerances = {
+        "pos_tol": read_float(raw_config, "pos_tol", pos_tol),
+        "rot_tol": read_float(raw_config, "rot_tol", rot_tol),
+        "vel_tol": read_float(raw_config, "vel_tol", vel_tol),
+    }
     for key, value in tolerances.items():
         if value <= 0:
             raise ConfigurationError(f"'{key}' must be positive.")

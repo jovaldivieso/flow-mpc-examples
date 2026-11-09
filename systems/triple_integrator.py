@@ -20,6 +20,7 @@ from .sphere_collision import SphereCollisionModel
 from .system import SystemSimulator
 
 SAMPLING_ATTEMPTS = 256
+JACOBIAN_DAMPING = 1e-3  # of the damped pseudo-inverse of the task Jacobian (``goal_step``)
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,12 @@ class TripleIntegratorBase(SystemSimulator):
         self._randomize_goal = bool(fields["randomize_goal"])
         self.min_start_goal_distance = float(fields["min_start_goal_distance"])
         self.pos_tol = float(fields["pos_tol"])
+        self.rot_tol = float(fields["rot_tol"])
         self.vel_tol = float(fields["vel_tol"])
         obstacles = [(np.asarray(obs["position"], dtype=float).copy(), float(obs["radius"])) for obs in fields["obstacles"]]
-        self.collision = SphereCollisionModel(obstacles, self.collision_spheres, self.collision_spheres_along, n)
+        self.collision = SphereCollisionModel(
+            obstacles, self.collision_spheres, self.collision_spheres_along, self.collision_centers_along, n
+        )
         self._free_rollouts: dict[int, tuple[np.ndarray, np.ndarray]] = {}  # by the number of actions, built when first asked for
 
     # --- the properties the base class declares ---------------------------------
@@ -206,6 +210,12 @@ class TripleIntegratorBase(SystemSimulator):
         """``collision_spheres`` at every row of ``q_trajectory`` (H, n) in one call: centers (H, S, d), position
         Jacobians (H, S, d, n), and radii (S,)."""
 
+    def collision_centers_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The centers (H, S, d) and the radii (S,) of ``collision_spheres_along``, which a system whose Jacobians cost
+        more than its centers computes without them."""
+        centers, _, radii = self.collision_spheres_along(q_trajectory)
+        return centers, radii
+
     @abstractmethod
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray) -> np.ndarray:
         """The configuration the planners drive to for ``goal``, the nearest one to ``q_reference`` if there are several.
@@ -243,12 +253,31 @@ class TripleIntegratorBase(SystemSimulator):
     def _sample_goal(self, rng: np.random.Generator) -> np.ndarray:
         """A random reachable goal."""
 
+    def goal_ratio(self, state: np.ndarray) -> float:
+        """The pose error of ``state`` in units of the goal set: the larger of the position error over ``pos_tol`` and the
+        orientation error over ``rot_tol``, below 1 in the goal set."""
+        position_error, rotation_error = self.goal_errors(np.asarray(state, dtype=float))
+        return float(max(position_error / self.pos_tol, rotation_error / self.rot_tol))
+
+    def at_goal_pose(self, state: np.ndarray) -> bool:
+        """In the goal set: the position within ``pos_tol`` of the goal position and the orientation within ``rot_tol`` of the
+        goal orientation (``goal_ratio`` below 1), whatever the configuration and the velocity."""
+        return self.goal_ratio(state) < 1.0
+
+    @staticmethod
+    def goal_step(errors: np.ndarray, jacobians: np.ndarray) -> np.ndarray:
+        """The damped Gauss-Newton step dq = (J^T J + a I)^-1 J^T e of the task errors ``e`` (..., m) with the Jacobians
+        ``J`` (..., m, n) of ``goal_task_error``: the move of the joints that closes the pose error to first order, with no
+        part in the nullspace of the pose."""
+        jacobians = np.asarray(jacobians, dtype=float)
+        transposed = np.swapaxes(jacobians, -1, -2)
+        damped = transposed @ jacobians + JACOBIAN_DAMPING * np.eye(jacobians.shape[-1])
+        return np.linalg.solve(damped, transposed @ np.asarray(errors, dtype=float)[..., None])[..., 0]
+
     def is_done(self, state: np.ndarray) -> bool:
-        """At the goal (within ``pos_tol``) and at rest (every velocity within ``vel_tol``)."""
+        """At the goal pose (``at_goal_pose``) and at rest (every velocity within ``vel_tol``)."""
         state_array = np.asarray(state, dtype=float)
-        return bool(
-            self.goal_errors(state_array)[0] < self.pos_tol and np.abs(state_array[self.n : 2 * self.n]).max() < self.vel_tol
-        )
+        return self.at_goal_pose(state_array) and bool(np.abs(state_array[self.n : 2 * self.n]).max() < self.vel_tol)
 
     @property
     def action_names(self) -> list[str]:

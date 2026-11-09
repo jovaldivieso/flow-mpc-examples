@@ -340,7 +340,6 @@ class DaggerTrainer:
             unet_dim_mults=tuple(self.cfg.unet.dim_mults),
             num_inference_steps=self.cfg.flow_config.num_inference_steps,
             action_scale=tuple(self.simulator.position_scale.tolist()),
-            flow_init=self.cfg.flow_config.safeflow_init,
         )
 
     def _build_policy(
@@ -511,7 +510,6 @@ class DaggerTrainer:
         }
         data["flow_config"] = {
             "num_inference_steps": self.cfg.flow_config.num_inference_steps,
-            "safeflow_init": self.cfg.flow_config.safeflow_init,
             # Saved explicitly so a checkpoint's normalized action space stays what trained it -- see FlowPolicy's own
             # docstring for why training and inference must agree on this exactly.
             "action_scale": self.simulator.position_scale.tolist(),

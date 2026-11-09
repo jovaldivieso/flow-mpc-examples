@@ -64,7 +64,7 @@ class PointMassSystem(TripleIntegratorBase):
             "max_acceleration": list(read_limits(raw_config, "max_acceleration", DEFAULT_MAX_ACCELERATION, dimension)),
             "max_jerk": list(read_limits(raw_config, "max_jerk", DEFAULT_MAX_JERK, dimension)),
             "obstacles": read_obstacles(raw_config, dimension),
-            **read_tolerances(raw_config, 0.02, 0.02),
+            **read_tolerances(raw_config, 0.02, 0.30, 0.02),  # the point mass has no orientation: any rot_tol holds
         }
         if "goal" in raw_config:
             fields["goal"] = list(read_vector(raw_config, "goal", dimension, ()))

@@ -97,13 +97,14 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         self.assertIsNotNone(self.projector._prev_U_sol)  # the next tick shifts the plan that was held
 
     def test_a_cold_start_failure_raises_when_holding_still_is_not_safe(self) -> None:
-        # In motion, holding still (zero jerk) does not come to rest within the horizon: no safe plan
-        moving = self.state0.copy()
-        moving[self.simulator.n] = 0.5
-        self.projector.reset()
-        self.projector._graph._solve_once = _forced_failure
+        # Holding still inside an obstacle is no safe plan
+        simulator = FrankaSystem(
+            pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
+        )
+        projector = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
+        projector._graph._solve_once = _forced_failure
         with self.assertRaises(PlannerSolveError):
-            self.projector.project(moving, self.q_ref)
+            projector.project(self.state0, self.q_ref)
 
     def test_a_cold_start_failure_is_not_solved_a_second_time_from_the_same_guess(self) -> None:
         self.projector.reset()
@@ -130,12 +131,12 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
             for i in range(1, 6):
                 self.projector.project(self._perturbed_state(0.001 * i), self.q_ref)
         terminal_velocity = self.projector._prev_X_sol[self.projector.rest_idx, self.projector.N]
-        # the terminal rest is a soft cost: a plan settles close to rest, within the bound the revalidation enforces
-        np.testing.assert_allclose(terminal_velocity, 0.0, atol=self.projector.config.fallback_terminal_velocity_tol)
+        # the terminal rest is a soft cost: a plan settles close to rest
+        np.testing.assert_allclose(terminal_velocity, 0.0, atol=1e-2)
 
     def test_exceeding_max_consecutive_fallbacks_raises_instead_of_coasting_indefinitely(self) -> None:
-        # A fallback accepted within fallback_terminal_velocity_tol coasts at a small residual velocity; an unbroken run of
-        # them would let that accumulate, so one more than max_consecutive_fallbacks raises
+        # A reused plan does not have to end at rest; an unbroken run of them would let the arm coast on stale plans, so one
+        # more than max_consecutive_fallbacks raises
         self.assertEqual(self.projector.config.max_consecutive_fallbacks, 5)
         self.projector.project(self.state0, self.q_ref)
         self.projector._graph._solve_once = _forced_failure
@@ -233,11 +234,6 @@ class FallbackRevalidationTests(unittest.TestCase):
         self.assertIsNotNone(trajectory)
         self.assertEqual(trajectory.shape, (self.simulator.nx, HORIZON + 1))
 
-    def test_rejects_a_plan_that_does_not_end_at_rest(self) -> None:
-        moving = self.u_rest.copy()
-        moving[0, :] = 5.0
-        self.assertIsNone(self.projector._revalidate_fallback(self.state0, moving))
-
     def test_rejects_a_plan_that_penetrates_an_obstacle(self) -> None:
         simulator = FrankaSystem(
             pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
@@ -247,13 +243,12 @@ class FallbackRevalidationTests(unittest.TestCase):
         self.assertFalse(simulator.collision.is_collision_free(self.state0[:7]))
         self.assertIsNone(projector._revalidate_fallback(self.state0, self.u_rest))
 
-    def test_without_the_safety_filter_a_plan_need_not_end_at_rest(self) -> None:
-        no_rest = CasadiTrajectoryProjector(self.simulator, ProjectionConfig(), horizon=HORIZON, safe=False)
+    def test_a_plan_that_ends_in_motion_is_accepted_if_it_is_within_the_limits_and_clear(self) -> None:
         moving = self.u_rest.copy()
         moving[0, :3] = 5.0  # ends in motion
 
-        self.assertIsNotNone(no_rest._revalidate_fallback(self.state0, moving))
-        self.assertIsNone(self.projector._revalidate_fallback(self.state0, moving))
+        self.assertIsNotNone(self.projector._revalidate_fallback(self.state0, moving))
+
 
     def test_without_the_safety_filter_a_plan_through_an_obstacle_is_accepted(self) -> None:
         simulator = FrankaSystem(
@@ -517,9 +512,9 @@ class ObstacleProjectionTests(unittest.TestCase):
         self.assertFalse(self.simulator.collision.trajectory_is_collision_free(plan.positions))
 
     def test_the_obstacles_are_linearized_at_every_step(self) -> None:
-        real_sets_along = self.simulator.collision.sets_along
+        real_linearized_sets = self.simulator.collision.linearized_sets
         calls: list[int] = []
-        self.simulator.collision.sets_along = lambda q_current, q: calls.append(len(q)) or real_sets_along(q_current, q)
+        self.simulator.collision.linearized_sets = lambda q_current, q: calls.append(len(q)) or real_linearized_sets(q_current, q)
 
         for _ in range(3):  # the Euler steps of one tick
             self.projector.project(self.state, self.reference)

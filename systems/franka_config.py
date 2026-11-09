@@ -35,7 +35,7 @@ def validate_franka_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "max_acceleration": list(read_limits(raw_config, "max_acceleration", FRANKA_DEFAULT_MAX_ACCELERATION, FRANKA_NUM_JOINTS)),
         "max_jerk": list(read_limits(raw_config, "max_jerk", FRANKA_DEFAULT_MAX_JERK, FRANKA_NUM_JOINTS)),
         "obstacles": read_obstacles(raw_config, 3),
-        **read_tolerances(raw_config, 0.03, 0.05),
+        **read_tolerances(raw_config, 0.03, 0.30, 0.05),
     }
     if "goal" in raw_config:
         goal = read_vector(raw_config, "goal", POSE_DIM, ())

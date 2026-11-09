@@ -24,8 +24,9 @@ totg_velocity_scale: 0.8        # fractions of the velocity and acceleration lim
 totg_acceleration_scale: 0.5
 totg_max_deviation: 0.05        # rad the timed path may cut the corner of a waypoint
 
-# Success: the TCP within pos_tol [m] of the goal position and at rest (vel_tol [rad/s]); the orientation is not tested
+# Success: the TCP within pos_tol [m] of the goal position, its orientation within rot_tol [rad] of the goal orientation, and at rest (vel_tol [rad/s])
 pos_tol: 0.03
+rot_tol: 0.30
 vel_tol: 0.01
 
 # The projection that tracks the positions (the expert's, and the safeflow policy's): the weights of the derivatives of the

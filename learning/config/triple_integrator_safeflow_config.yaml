@@ -6,10 +6,6 @@ model:
     num_inference_steps: 3      # Euler integration steps for ODE sampling
     history_length: 10          # last positions of the arm (the current one last) the policy is conditioned on, as in SafeFlowMPC
 
-  # Only used by the safeflow policy
-  safeflow:
-    init: previous_safe         # where the flow integration starts: previous_safe (last safe actions, shifted) or gaussian
-
   prediction_horizon: 16
   unet:
     dim: 32                     # base channel count (a multiple of 8)

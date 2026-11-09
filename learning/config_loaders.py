@@ -48,8 +48,6 @@ class UnetConfig:
 @dataclass(frozen=True)
 class FlowConfig:
     num_inference_steps: int = 10
-    # Only used by the safeflow policy: where the flow integration starts ("previous_safe" or "gaussian")
-    safeflow_init: str = "previous_safe"
     # How many configurations (the current one last) of the arm's last positions the policy is conditioned on (SafeFlowMPC: 10)
     history_length: int = 10
 
@@ -145,10 +143,6 @@ def load_flow_config(policy_config_path: Path | None) -> FlowConfig:
 
     _, model_section = _model_section(policy_config_path)
     flow_section = _mapping_section(model_section, "flow", "Model config 'model.flow'")
-    safeflow_section = _mapping_section(model_section, "safeflow", "Model config 'model.safeflow'")
-    safeflow_init = str(safeflow_section.get("init", FlowConfig.safeflow_init))
-    if safeflow_init not in {"previous_safe", "gaussian"}:
-        raise ValueError("'model.safeflow.init' must be one of {'previous_safe', 'gaussian'}.")
 
     history_length = flow_section.get("history_length", FlowConfig.history_length)
     if isinstance(history_length, bool) or not isinstance(history_length, int) or history_length < 1:
@@ -156,7 +150,6 @@ def load_flow_config(policy_config_path: Path | None) -> FlowConfig:
 
     return FlowConfig(
         num_inference_steps=int(flow_section.get("num_inference_steps", 10)),
-        safeflow_init=safeflow_init,
         history_length=history_length,
     )
 

@@ -1,7 +1,7 @@
 """Check the CasADi MPC expert before running DAgger: random start/goal rollouts, statistics, Meshcat playback.
 
     venv/bin/python -m scripts.meshcat_expert --num-traj 10
-    venv/bin/python -m scripts.meshcat_expert --seeds "[0, 3, 7]" --tolerance-overrides '{"pos_tol": 0.01, "vel_tol": 0.05}'
+    venv/bin/python -m scripts.meshcat_expert --seeds "[0, 3, 7]" --tolerance-overrides '{"pos_tol": 0.01, "rot_tol": 0.20, "vel_tol": 0.05}'
 
 Every rollout samples its start and goal from the expert config exactly like the DAgger collection and the evaluation do
 (seeded), runs the expert for --num-steps and prints per trajectory: reached the goal, final error,
@@ -93,7 +93,7 @@ def main() -> None:
     parser.add_argument("--num-traj", type=int, default=10, help="number of random rollouts, seeds 0..N-1 (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default=None, help="explicit seeds instead of 0..N-1, e.g. '[0, 3, 7]'")
     parser.add_argument("--num-steps", type=int, default=250, help="maximum steps per rollout (default: %(default)s)")
-    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / vel_tol overriding the config's")
+    parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / rot_tol / vel_tol overriding the config's")
     parser.add_argument("--action-noise-std", type=float, default=0.0, help="execution noise on the expert's action [rad/s^3], like DAgger collection (default: %(default)s)")
     parser.add_argument("--show-collision-geometry", action="store_true", help="draw the bounding spheres the planners keep clear of the obstacles, on the robot")
     parser.add_argument("--show-workspace", action="store_true", help="draw the box of TCP positions the starts and goals are sampled in")
@@ -109,7 +109,7 @@ def main() -> None:
     dyn = FrankaSystem(config)
     planner = PlannerFactory.create(config["expert"], dyn, config)
     noise_seed = default_action_noise_seed_for_config(config)
-    print(f"expert: horizon={config['horizon']} dt={config['dt']} | tolerances pos={config['pos_tol']} vel={config['vel_tol']}")
+    print(f"expert: horizon={config['horizon']} dt={config['dt']} | tolerances pos={config['pos_tol']} rot={config['rot_tol']} vel={config['vel_tol']}")
 
     baseline_goal = dyn.goal.copy()
     results = []

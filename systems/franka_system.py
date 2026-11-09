@@ -19,8 +19,8 @@ follow the motion.
 The model comes from the franka_description xacro via Pinocchio, the finger joints locked open. A start (at rest) and
 a goal are drawn in the workspace in front of the arm (``franka_sampling``): the start is a configuration, the goal a pose,
 both of TCP positions and hand directions that inverse kinematics reaches well inside the joint limits and free of
-spherical obstacles. The goal is reached when the TCP is within ``pos_tol`` of the goal position and the arm is at rest: the orientation is
-not tested (``goal_errors`` reports it).
+spherical obstacles. The goal is reached when the TCP is within ``pos_tol`` of the goal position, its orientation within ``rot_tol`` of the goal
+orientation and the arm is at rest (``goal_errors`` reports both errors).
 """
 
 from typing import Any, Mapping
@@ -207,6 +207,10 @@ class FrankaSystem(TripleIntegratorBase):
     def collision_spheres_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Bounding sphere centers (H, S, 3), position Jacobians (H, S, 3, n), and radii (S,) at every row of ``q_trajectory``."""
         return self.kinematics.collision_spheres_along(np.asarray(q_trajectory, dtype=float)[:, : self.n])
+
+    def collision_centers_along(self, q_trajectory: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Bounding sphere centers (H, S, 3) and radii (S,) at every row of ``q_trajectory``."""
+        return self.kinematics.collision_centers_along(np.asarray(q_trajectory, dtype=float)[:, : self.n])
 
     def goal_configuration(self, goal: np.ndarray, q_reference: np.ndarray = Q_READY) -> np.ndarray:
         """The collision-free joint configuration of the ``goal`` pose (cached per goal)."""

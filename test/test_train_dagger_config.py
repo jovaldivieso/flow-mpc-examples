@@ -834,7 +834,6 @@ class DaggerTrainerSetupAndCheckpointTests(unittest.TestCase):
                     checkpoint["flow_config"],
                     {
                         "num_inference_steps": self.NUM_INFERENCE_STEPS,
-                        "safeflow_init": "previous_safe",
                         "action_scale": trainer.simulator.position_scale.tolist(),
                     },
                 )

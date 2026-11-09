@@ -27,7 +27,6 @@ class PolicySpec:
     unet_dim_mults: tuple[int, ...]
     num_inference_steps: int
     action_scale: tuple[float, ...]  # the positions are scaled by half the range of their joint, to the order of the unit-scale noise prior
-    flow_init: str = "previous_safe"  # of a safe flow policy
 
 
 PolicyBuilder = Callable[[PolicySpec, TripleIntegratorBase, Mapping[str, Any] | None], ActionPolicy]
@@ -77,7 +76,7 @@ def build_safe_flow_policy(
     projector = CasadiTrajectoryProjector(
         simulator, _projection_config(planner_config, spec.policy_type), horizon=spec.prediction_horizon, tick_steps=spec.execution_horizon
     )
-    return SafeFlowMPCPolicy(_flow_policy(spec, simulator, None), projector, flow_init=spec.flow_init)
+    return SafeFlowMPCPolicy(_flow_policy(spec, simulator, None), projector)
 
 
 # The policies the config can choose (``model.policy_type``)

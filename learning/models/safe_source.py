@@ -27,7 +27,7 @@ class SafeSource:
 
     A source is drawn from the index of its frame alone, so the paths of a dataset do not depend on how they are computed. A
     path whose source, target or a point has no safe plan (no plan within the limits that is clear of the obstacles and comes
-    to rest) is left out: its row is trained from Gaussian noise towards the expert's label.
+    to rest) is left out: the frame is not trained on.
     """
 
     def __init__(self, simulator: TripleIntegratorBase, projection: ProjectionConfig, horizon: int, seed: int) -> None:

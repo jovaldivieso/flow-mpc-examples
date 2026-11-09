@@ -4,6 +4,7 @@ import os
 import sys
 import unittest
 import warnings
+from unittest import mock
 
 import numpy as np
 import yaml
@@ -13,7 +14,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from learning.dagger.utils import sample_initial_state
 from planning.config import validate_system_config
-from planning.ompl_casadi_planner import OmplCasadiPlanner
+from planning.ompl_casadi_planner import GOAL_BLEND_OUTER, OmplCasadiPlanner, path_weight
 from planning.planner import Plan, Planner, PlannerSolveError
 from planning.planner_config import ExpertConfig, ProjectionConfig
 from planning.planner_factory import PlannerFactory
@@ -27,7 +28,7 @@ OBSTACLES = [
     {"position": [0.45, -0.12, 0.40], "radius": 0.08},
     {"position": [0.45, 0.15, 0.48], "radius": 0.08},
 ]
-STATISTICS = ("ompl_paths", "ompl_replans", "ompl_path_failures", "trimmed_labels")
+STATISTICS = ("ompl_paths", "ompl_replans", "ompl_path_failures", "blocked_replans", "trimmed_labels", "goal_labels")
 
 
 def _far_goal_configuration() -> np.ndarray:
@@ -150,6 +151,156 @@ class ExpertLabelTests(unittest.TestCase):
 
         np.testing.assert_allclose(plan.positions, np.tile(q_goal, (HORIZON, 1)), atol=1e-6)
         np.testing.assert_allclose(plan.actions, 0.0, atol=1e-2)
+
+
+class PathWeightTests(unittest.TestCase):
+    def test_the_path_has_no_weight_in_the_goal_set_and_all_of_it_from_the_blend_outer(self) -> None:
+        self.assertEqual(path_weight(0.0), 0.0)
+        self.assertEqual(path_weight(1.0), 0.0)
+        self.assertEqual(path_weight(GOAL_BLEND_OUTER), 1.0)
+        self.assertEqual(path_weight(10.0 * GOAL_BLEND_OUTER), 1.0)
+        self.assertAlmostEqual(path_weight(0.5 * (1.0 + GOAL_BLEND_OUTER)), 0.5)
+
+    def test_it_rises_monotonically_with_no_slope_at_either_end(self) -> None:
+        ratios = np.linspace(1.0, GOAL_BLEND_OUTER, 101)
+        weights = np.array([path_weight(ratio) for ratio in ratios])
+
+        self.assertTrue(np.all(np.diff(weights) > 0))
+        step = 1e-4
+        self.assertLess((path_weight(1.0 + step) - path_weight(1.0)) / step, 1e-2)
+        self.assertLess((path_weight(GOAL_BLEND_OUTER) - path_weight(GOAL_BLEND_OUTER - step)) / step, 1e-2)
+
+
+class ExpertGoalSetTests(unittest.TestCase):
+    """The goal is a pose: the label is the path blended into the nearest configuration of the goal pose, the more the
+    closer the pose is, wherever in the nullspace of the pose the arm is."""
+
+    NULLSPACE_MOVE = 0.2  # rad of the joints that leaves the pose within the tolerances of the pinned settings
+
+    def setUp(self) -> None:
+        self.config = pinned_config()
+        self.simulator = FrankaSystem(self.config)
+        q = rest_state(self.simulator)[:N]
+        self.simulator.set_goal(pose_goal(self.simulator, q))
+        jacobian = self.simulator.goal_task_error(q, self.simulator.goal)[1]
+        self.in_goal_set = np.concatenate([q + self.NULLSPACE_MOVE * np.linalg.svd(jacobian)[2][-1], np.zeros(2 * N)])
+        self.expert = _expert(self.simulator, self.config)
+
+    def _pose_error_of(self, ratio: float) -> np.ndarray:
+        """A state of the goal set's configuration with the pose error moved to ``ratio`` goal sets, by moving the joints in the
+        pose error alone."""
+        q = self.in_goal_set[:N]
+        jacobian = self.simulator.goal_task_error(q, self.simulator.goal)[1]
+        direction = np.linalg.pinv(jacobian)[:, 0]
+        scale = 0.01
+        for _ in range(12):
+            state = np.concatenate([q - scale * direction, np.zeros(2 * N)])
+            scale *= ratio / self.simulator.goal_ratio(state)
+        state = np.concatenate([q - scale * direction, np.zeros(2 * N)])
+        self.assertAlmostEqual(self.simulator.goal_ratio(state), ratio, delta=0.05)
+        return state
+
+    def test_the_state_is_in_the_goal_set_in_another_configuration_than_the_one_the_goal_is_solved_in(self) -> None:
+        q_goal = self.simulator.goal_configuration(self.simulator.goal, self.in_goal_set[:N])
+
+        self.assertTrue(self.simulator.at_goal_pose(self.in_goal_set))
+        self.assertGreater(np.linalg.norm(q_goal - self.in_goal_set[:N]), 0.5 * self.NULLSPACE_MOVE)
+
+    def test_a_state_in_the_goal_set_is_labelled_with_the_nearest_configuration_of_the_goal_pose_and_plans_no_path(self) -> None:
+        state = self._pose_error_of(0.8)
+        q = state[:N]
+        error, jacobian, _ = self.simulator.goal_task_error(q, self.simulator.goal)
+
+        plan = self.expert.plan(self.simulator.observe(state))
+
+        np.testing.assert_allclose(plan.positions, np.tile(q + self.simulator.goal_step(error, jacobian), (HORIZON, 1)), atol=1e-9)
+        self.assertEqual((self.expert.statistics["goal_labels"], self.expert.statistics["ompl_paths"]), (1, 0))
+
+    def test_the_label_in_the_goal_set_moves_the_arm_in_the_pose_error_alone_and_closes_it(self) -> None:
+        state = self._pose_error_of(0.8)
+        q = state[:N]
+        jacobian = self.simulator.goal_task_error(q, self.simulator.goal)[1]
+
+        move = self.expert.plan(self.simulator.observe(state)).positions[0] - q
+
+        self.assertLess(abs(np.linalg.svd(jacobian)[2][-1] @ move), 1e-9)
+        self.assertLess(self.simulator.goal_ratio(np.concatenate([q + move, np.zeros(2 * N)])), 0.1 * self.simulator.goal_ratio(state))
+
+    def test_a_moving_arm_in_the_goal_set_is_labelled_alike(self) -> None:
+        state = self._pose_error_of(0.8)
+        moving = state.copy()
+        moving[N : 2 * N] = 0.1
+
+        at_rest = self.expert.plan(self.simulator.observe(state)).positions
+        in_motion = self.expert.plan(self.simulator.observe(moving)).positions
+
+        np.testing.assert_allclose(in_motion, at_rest, atol=1e-9)
+
+    def test_a_state_beyond_the_blend_is_labelled_with_the_path_alone(self) -> None:
+        state = self._pose_error_of(GOAL_BLEND_OUTER + 1.0)
+
+        plan = self.expert.plan(self.simulator.observe(state))
+
+        self.assertEqual((self.expert.statistics["goal_labels"], self.expert.statistics["ompl_paths"]), (0, 1))
+        np.testing.assert_allclose(plan.positions, self.expert._progress.reference(state[:N], HORIZON, self.simulator.dt), atol=1e-9)
+
+    def test_a_state_in_the_blend_is_labelled_with_the_weighted_mean_of_the_path_and_the_goal_pose_configuration(self) -> None:
+        state = self._pose_error_of(0.5 * (1.0 + GOAL_BLEND_OUTER))
+        q = state[:N]
+
+        plan = self.expert.plan(self.simulator.observe(state))
+
+        path = self.expert._progress.reference(q, HORIZON, self.simulator.dt)
+        weight = path_weight(self.simulator.goal_ratio(state))
+        self.assertGreater(weight, 0.0)
+        self.assertLess(weight, 1.0)
+        np.testing.assert_allclose(plan.positions, weight * path + (1.0 - weight) * self.expert._goal_pose_configuration(q), atol=1e-9)
+        self.assertEqual((self.expert.statistics["goal_labels"], self.expert.statistics["ompl_paths"]), (1, 1))
+
+    def test_the_label_is_continuous_across_the_edge_of_the_goal_set(self) -> None:
+        inside, outside = self._pose_error_of(0.99), self._pose_error_of(1.01)
+
+        label_inside = self.expert.plan(self.simulator.observe(inside)).positions
+        label_outside = self.expert.plan(self.simulator.observe(outside)).positions
+
+        self.assertLess(np.abs(label_outside - label_inside).max(), 0.05)
+
+
+class ExpertBlockedPathTests(unittest.TestCase):
+    """A path whose first row is inside an obstacle holds the arm still: it is planned again from where the arm is."""
+
+    def setUp(self) -> None:
+        self.config = pinned_config()
+        self.simulator = FrankaSystem(self.config)
+        q = rest_state(self.simulator)[:N]
+        self.simulator.set_goal(pose_goal(self.simulator, q))
+        self.state = np.concatenate([q + 0.5, np.zeros(2 * N)])
+        self.expert = _expert(self.simulator, self.config)
+        self.expert.plan(self.simulator.observe(self.state))
+
+    def _plan_with_the_first_row_blocked(self) -> Plan:
+        real = self.simulator.collision.free_prefix
+        outcomes = [0]
+        with mock.patch.object(self.simulator.collision, "free_prefix", lambda rows: outcomes.pop() if outcomes else real(rows)):
+            return self.expert.plan(self.simulator.observe(self.state))
+
+    def test_a_blocked_first_row_plans_a_new_path(self) -> None:
+        self._plan_with_the_first_row_blocked()
+
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["blocked_replans"]), (2, 1))
+
+    def test_the_old_path_is_kept_if_there_is_no_new_one(self) -> None:
+        old = self.expert._progress
+        with mock.patch.object(self.expert._ompl, "path", side_effect=PlannerSolveError("no path")):
+            self._plan_with_the_first_row_blocked()
+
+        self.assertIs(self.expert._progress, old)
+        self.assertEqual((self.expert.statistics["ompl_path_failures"], self.expert.statistics["blocked_replans"]), (1, 0))
+
+    def test_a_free_first_row_keeps_the_path(self) -> None:
+        self.expert.plan(self.simulator.observe(self.state))
+
+        self.assertEqual((self.expert.statistics["ompl_paths"], self.expert.statistics["blocked_replans"]), (1, 0))
 
 
 class ExpertAmongObstaclesTests(unittest.TestCase):
