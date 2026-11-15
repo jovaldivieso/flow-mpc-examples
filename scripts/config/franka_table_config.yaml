@@ -12,7 +12,7 @@ max_jerk: 15.0
 expert: ompl_casadi
 # Rows of positions the expert plans per state. DAgger labels a state with the first prediction_horizon (the policy config's
 # chunk length, at most this) of them.
-horizon: 20
+horizon: 16
 
 # Settings of the OMPL path and its timing
 ompl_timeout: 5.0               # s per RRT-Connect solve
@@ -42,45 +42,45 @@ min_start_goal_distance: 0.3
 # Starts and goals are drawn anywhere in front of the arm (a TCP box x 0.2-0.8, y +-0.6, z 0.1-0.8 m, the hand between
 # pointing forward and pointing down), each a valid configuration or pose clear of the table.
 
-# The table: a 2 x 9 grid of spheres (0.14 m apart, at most sqrt(2) radii, so the four spheres of a cell leave no hole), a slab
-# 0.2 m thick at z = 0.4 .. 0.6 m, x = 0.30 .. 0.64 m, y = -0.66 .. 0.66 m, its front edge 0.3 m from the base. It is wide
-# enough that the arm cannot go down at its sides, only in front of it.
+# The table: a 2 x 9 grid of spheres (0.14 m apart in x, 0.125 m in y, at most sqrt(2) radii, so the four spheres of a
+# cell leave no hole), a slab 0.2 m thick at z = 0.4 .. 0.6 m, x = 0.30 .. 0.64 m, y = -0.6 .. 0.6 m, its front edge 0.3 m
+# from the base. It is as wide as the workspace box, which the TCP never leaves, so the TCP cannot pass beside it.
 obstacles:
-  - position: [0.40, -0.56, 0.50]
+  - position: [0.40, -0.500, 0.50]
     radius: 0.10
-  - position: [0.40, -0.42, 0.50]
+  - position: [0.40, -0.375, 0.50]
     radius: 0.10
-  - position: [0.40, -0.28, 0.50]
+  - position: [0.40, -0.250, 0.50]
     radius: 0.10
-  - position: [0.40, -0.14, 0.50]
+  - position: [0.40, -0.125, 0.50]
     radius: 0.10
-  - position: [0.40, 0.00, 0.50]
+  - position: [0.40, 0.000, 0.50]
     radius: 0.10
-  - position: [0.40, 0.14, 0.50]
+  - position: [0.40, 0.125, 0.50]
     radius: 0.10
-  - position: [0.40, 0.28, 0.50]
+  - position: [0.40, 0.250, 0.50]
     radius: 0.10
-  - position: [0.40, 0.42, 0.50]
+  - position: [0.40, 0.375, 0.50]
     radius: 0.10
-  - position: [0.40, 0.56, 0.50]
+  - position: [0.40, 0.500, 0.50]
     radius: 0.10
-  - position: [0.54, -0.56, 0.50]
+  - position: [0.54, -0.500, 0.50]
     radius: 0.10
-  - position: [0.54, -0.42, 0.50]
+  - position: [0.54, -0.375, 0.50]
     radius: 0.10
-  - position: [0.54, -0.28, 0.50]
+  - position: [0.54, -0.250, 0.50]
     radius: 0.10
-  - position: [0.54, -0.14, 0.50]
+  - position: [0.54, -0.125, 0.50]
     radius: 0.10
-  - position: [0.54, 0.00, 0.50]
+  - position: [0.54, 0.000, 0.50]
     radius: 0.10
-  - position: [0.54, 0.14, 0.50]
+  - position: [0.54, 0.125, 0.50]
     radius: 0.10
-  - position: [0.54, 0.28, 0.50]
+  - position: [0.54, 0.250, 0.50]
     radius: 0.10
-  - position: [0.54, 0.42, 0.50]
+  - position: [0.54, 0.375, 0.50]
     radius: 0.10
-  - position: [0.54, 0.56, 0.50]
+  - position: [0.54, 0.500, 0.50]
     radius: 0.10
 
 initial_state_seed: 0
