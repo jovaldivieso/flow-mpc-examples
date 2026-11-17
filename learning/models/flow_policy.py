@@ -9,7 +9,7 @@ from torch import nn
 from learning.models.flow_velocity_net import FlowVelocityNet
 from learning.models.policy import ActionPolicy, observation_features
 from learning.models.pose_guidance import PoseGuidance
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.trajectory_projector import TrajectoryProjector
 
 
 class FlowPolicy(ActionPolicy):
@@ -34,7 +34,7 @@ class FlowPolicy(ActionPolicy):
         history_length: int,
         execution_horizon: int,
         guidance: PoseGuidance,
-        tracker: CasadiTrajectoryProjector | None,
+        tracker: TrajectoryProjector | None,
         prediction_horizon: int = 16,
         unet_dim: int = 32,
         unet_dim_mults: tuple[int, ...] = (1, 2, 4, 8),

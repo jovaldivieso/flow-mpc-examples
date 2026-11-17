@@ -10,8 +10,8 @@ import numpy as np
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
-from planning.casadi_graph import GraphSolution
-from planning.casadi_projector import CasadiTrajectoryProjector, Projection
+from planning.acados_graph import GraphSolution
+from planning.trajectory_projector import TrajectoryProjector, Projection
 from planning.planner import PlannerSolveError
 from planning.planner_config import ProjectionConfig
 from systems.franka_system import FrankaSystem
@@ -55,7 +55,7 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         # these tests need a genuinely resting cached plan to fall back on
         config = pinned_config(terminal_velocity_weight=500.0)
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
+        self.projector = TrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
         self.state0 = rest_state(self.simulator)
         self.q_ref = _hold_reference(self.state0)
 
@@ -101,25 +101,10 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
         simulator = FrankaSystem(
             pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
         )
-        projector = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
+        projector = TrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
         projector._graph._solve_once = _forced_failure
         with self.assertRaises(PlannerSolveError):
             projector.project(self.state0, self.q_ref)
-
-    def test_a_cold_start_failure_is_not_solved_a_second_time_from_the_same_guess(self) -> None:
-        self.projector.reset()
-        solves = []
-
-        def failing_solve():
-            solves.append(1)
-            raise RuntimeError("forced failure")
-
-        self.projector._graph._solve_once = failing_solve
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.projector.project(self.state0, self.q_ref)
-
-        self.assertEqual(len(solves), 1)
 
     def test_consecutive_fallbacks_stay_at_rest_instead_of_drifting_away(self) -> None:
         # Across ticks with a new x0 each time, every fallback pads its plan with zero jerk, so the terminal velocity
@@ -183,8 +168,8 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
                 self.projector.project(self.state0, self.q_ref)
         self.assertEqual(self.projector._consecutive_fallback_count, 1)
 
-    def test_a_tick_that_starts_from_the_hold_still_plan_is_not_solved_a_second_time_from_it(self) -> None:
-        self.projector.reset()
+    def test_a_failed_solve_is_not_repeated_and_the_last_safe_plan_is_the_fallback(self) -> None:
+        self.projector.project(self.state0, _moving_reference(self.simulator, self.state0))  # a plan that moves
         solves = []
 
         def failing_solve():
@@ -192,31 +177,13 @@ class ProjectorFailClosedFallbackTests(unittest.TestCase):
             raise RuntimeError("forced failure")
 
         self.projector._graph._solve_once = failing_solve
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self.projector.project(self.state0, self.q_ref)  # the cold start holds still, and falls back to it
-            solves.clear()
-            self.projector.begin_tick()
-            self.projector.project(self.state0, self.q_ref)  # the warm guess now is the hold-still plan
+        self.projector.begin_tick()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.projector.project(self._perturbed_state(0.001), self.q_ref)
 
         self.assertEqual(len(solves), 1)
-
-    def test_a_warm_start_that_is_not_the_hold_still_plan_gets_a_cold_restart(self) -> None:
-        self.projector.project(self.state0, _moving_reference(self.simulator, self.state0))  # a plan that moves
-        solves = []
-        real_solve = self.projector._graph._solve_once
-
-        def failing_then_real():
-            solves.append(1)
-            if len(solves) == 1:
-                raise RuntimeError("the warm start fails")
-            return real_solve()
-
-        self.projector._graph._solve_once = failing_then_real
-        self.projector.begin_tick()
-        self.projector.project(self._perturbed_state(0.001), self.q_ref)
-
-        self.assertEqual(len(solves), 2)
+        self.assertTrue(any("last known-safe" in str(w.message) for w in caught))
 
 
 class FallbackRevalidationTests(unittest.TestCase):
@@ -225,7 +192,7 @@ class FallbackRevalidationTests(unittest.TestCase):
     def setUp(self) -> None:
         config = pinned_config(terminal_velocity_weight=500.0)
         self.simulator = FrankaSystem(config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
+        self.projector = TrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(config), horizon=HORIZON)
         self.state0 = rest_state(self.simulator)
         self.u_rest = np.zeros((self.simulator.nu, HORIZON))
 
@@ -238,7 +205,7 @@ class FallbackRevalidationTests(unittest.TestCase):
         simulator = FrankaSystem(
             pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
         )
-        projector = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
+        projector = TrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON)
 
         self.assertFalse(simulator.collision.is_collision_free(self.state0[:7]))
         self.assertIsNone(projector._revalidate_fallback(self.state0, self.u_rest))
@@ -254,7 +221,7 @@ class FallbackRevalidationTests(unittest.TestCase):
         simulator = FrankaSystem(
             pinned_config(obstacles=[{"position": self.simulator.tcp_position(self.state0[:7]).tolist(), "radius": 0.05}])
         )
-        no_obstacles = CasadiTrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON, safe=False)
+        no_obstacles = TrajectoryProjector(simulator, ProjectionConfig(), horizon=HORIZON, safe=False)
 
         self.assertIsNotNone(no_obstacles._revalidate_fallback(self.state0, self.u_rest))
 
@@ -265,7 +232,7 @@ class ProjectionTests(unittest.TestCase):
         cls.config = pinned_config()
         cls.projection_config = ProjectionConfig.from_mapping(cls.config)
         cls.simulator = FrankaSystem(cls.config)
-        cls.projector = CasadiTrajectoryProjector(cls.simulator, cls.projection_config, horizon=HORIZON)
+        cls.projector = TrajectoryProjector(cls.simulator, cls.projection_config, horizon=HORIZON)
 
     def setUp(self) -> None:
         self.projector.reset()
@@ -359,7 +326,7 @@ class ProjectionTests(unittest.TestCase):
         state = rest_state(self.simulator)
         reference = _hold_reference(state)
         reference[:, 0] += 0.15 * np.arange(1, HORIZON + 1)  # keeps moving: 1.5 rad/s
-        no_rest = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, safe=False)
+        no_rest = TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, safe=False)
 
         rest_plan = self.projector.project(state, reference)
         free_plan = no_rest.project(state, reference)
@@ -372,7 +339,7 @@ class ProjectionTests(unittest.TestCase):
 
     def test_without_the_safety_filter_the_limits_are_the_only_constraints(self) -> None:
         simulator, tolerance = self.simulator, 1e-5
-        limits_only = CasadiTrajectoryProjector(simulator, self.projection_config, horizon=HORIZON, safe=False)
+        limits_only = TrajectoryProjector(simulator, self.projection_config, horizon=HORIZON, safe=False)
         state = rest_state(simulator)
 
         plan = limits_only.project(state, _moving_reference(simulator, state))
@@ -382,7 +349,7 @@ class ProjectionTests(unittest.TestCase):
         np.testing.assert_allclose(plan.positions, simulator.rollout_positions(state, plan.actions)[1:], atol=1e-5)
 
     def test_the_next_chunk_guess_is_the_positions_one_control_period_later(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON)
+        projector = TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON)
         self.assertIsNone(projector.next_chunk_guess())
         state = rest_state(self.simulator)
 
@@ -397,7 +364,7 @@ class ProjectionTests(unittest.TestCase):
 
     def test_the_next_chunk_guess_is_shifted_by_the_tick_steps(self) -> None:
         tick_steps = 3
-        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        projector = TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
         state = rest_state(self.simulator)
 
         projection = projector.project(state, _rest_to_rest_reference(state))
@@ -410,12 +377,12 @@ class ProjectionTests(unittest.TestCase):
     def test_the_tick_steps_are_between_one_and_the_horizon(self) -> None:
         for tick_steps in (0, -1, HORIZON + 1):
             with self.subTest(tick_steps=tick_steps), self.assertRaises(ValueError):
-                CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
-        self.assertEqual(CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=HORIZON).tick_steps, HORIZON)
+                TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        self.assertEqual(TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=HORIZON).tick_steps, HORIZON)
 
     def test_the_warm_start_of_a_new_tick_is_shifted_by_the_tick_steps(self) -> None:
         tick_steps = 3
-        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
+        projector = TrajectoryProjector(self.simulator, self.projection_config, horizon=HORIZON, tick_steps=tick_steps)
         state = rest_state(self.simulator)
         reference = _rest_to_rest_reference(state)
         projector.project(state, reference)
@@ -441,7 +408,7 @@ class ProjectionTests(unittest.TestCase):
             self.projector.project(state[:7], _hold_reference(state))
 
     def test_short_horizon_constructs_and_solves(self) -> None:
-        projector = CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=2)
+        projector = TrajectoryProjector(self.simulator, self.projection_config, horizon=2)
         state = rest_state(self.simulator)
 
         projection = projector.project(state, _hold_reference(state, 2))
@@ -452,7 +419,7 @@ class ProjectionTests(unittest.TestCase):
         # No projector cost or constraint reads the goal, so whatever goal the simulator holds must not change the plan
         other = FrankaSystem(self.config)
         other.set_goal(np.zeros_like(other.goal))
-        projector = CasadiTrajectoryProjector(other, self.projection_config, horizon=HORIZON)
+        projector = TrajectoryProjector(other, self.projection_config, horizon=HORIZON)
         state = rest_state(self.simulator)
         reference = state[:7] + np.random.default_rng(5).normal(0.0, 0.1, (HORIZON, 7))
 
@@ -463,12 +430,12 @@ class ProjectionTests(unittest.TestCase):
     def test_a_projector_needs_a_horizon(self) -> None:
         # Its scalar settings are validated when the config is built (test_planner_config)
         with self.assertRaises(ValueError):
-            CasadiTrajectoryProjector(self.simulator, self.projection_config, horizon=0)
+            TrajectoryProjector(self.simulator, self.projection_config, horizon=0)
 
     def test_the_weights_of_the_config_shape_the_plan(self) -> None:
         state = rest_state(self.simulator)
         reference = _rest_to_rest_reference(state, amplitude=1.0)
-        heavy = CasadiTrajectoryProjector(
+        heavy = TrajectoryProjector(
             self.simulator, ProjectionConfig(jerk_weight=1.0, velocity_weight=1.0, acceleration_weight=1.0), horizon=HORIZON
         )
 
@@ -490,7 +457,7 @@ class ObstacleProjectionTests(unittest.TestCase):
             terminal_velocity_weight=500.0, obstacles=[{"position": free.tcp_position(reference[-1]).tolist(), "radius": 0.05}]
         )
         self.simulator = FrankaSystem(self.config)
-        self.projector = CasadiTrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(self.config), horizon=HORIZON)
+        self.projector = TrajectoryProjector(self.simulator, ProjectionConfig.from_mapping(self.config), horizon=HORIZON)
 
     def test_the_reference_runs_into_the_obstacle_and_the_plan_does_not(self) -> None:
         self.assertTrue(self.simulator.collision.is_collision_free(self.state[:7]))
@@ -503,7 +470,7 @@ class ObstacleProjectionTests(unittest.TestCase):
             self.assertTrue(self.simulator.collision.is_collision_free(q))
 
     def test_without_the_safety_filter_the_obstacles_are_ignored(self) -> None:
-        no_obstacles = CasadiTrajectoryProjector(
+        no_obstacles = TrajectoryProjector(
             self.simulator, ProjectionConfig.from_mapping(self.config), horizon=HORIZON, safe=False
         )
 

@@ -1,10 +1,9 @@
 import warnings
 from typing import NamedTuple
 
-import casadi as ca
 import numpy as np
 
-from planning.casadi_graph import CasadiKinematicGraph, GraphSolution
+from planning.acados_graph import AcadosKinematicGraph, GraphSolution, TrackingCost
 from planning.planner import PlannerSolveError
 from planning.planner_config import ProjectionConfig
 from systems.triple_integrator import TripleIntegratorBase
@@ -18,9 +17,9 @@ class Projection(NamedTuple):
     actions: np.ndarray
 
 
-class CasadiTrajectoryProjector:
+class TrajectoryProjector:
     """
-    CasADi (FATROP) projection of a reference chunk of joint positions onto the safe set (SafeFlowMPC, Oelerich et al.,
+    acados projection of a reference chunk of joint positions onto the safe set (SafeFlowMPC, Oelerich et al.,
     2026): the safety filter that tracks the flow's proposal and returns the jerks that execute it.
 
     ``project`` takes the current state and a
@@ -59,17 +58,16 @@ class CasadiTrajectoryProjector:
     The task goal is not part of the problem: the projector never reads the goal of its ``simulator`` (only the dynamics,
     the limits and the obstacles), so it can share the simulator of the rollout instead of holding a copy of its own.
 
-    Solver Choice (``Opti`` + ``fatrop``)
-    -------------------------------------
+    Solver Choice (acados, SQP-RTI with HPIPM)
+    ------------------------------------------
     During flow ODE integration, ``project`` is called at every Euler step, so solver latency dominates inference time.
     The triple-integrator dynamics, state/action box limits, and linearized free-space half-spaces are affine and the
     tracking + terminal-rest objective is strictly convex quadratic, so the projection is a convex QP with the stage
-    structure of an optimal control problem, solved in a few ms by **FATROP** (see ``CasadiKinematicGraph``) started from
-    the previous solution across adjacent Euler steps and control ticks.
+    structure of an optimal control problem, solved by acados with **HPIPM** (see ``AcadosKinematicGraph``).
 
     Every Euler step of a tick is one such solve to convergence, linearized along its own reference. The half-spaces are
     first-order, so a solution that still penetrates an obstacle or has a slack above the tolerance is linearized again
-    around itself and solved once more (``CasadiKinematicGraph.solve``); if it is still rejected, the projection has
+    around itself and solved once more (``AcadosKinematicGraph.solve``); if it is still rejected, the projection has
     failed, as it does in SafeFlowMPC when the slack of its filter exceeds a tolerance (see above for what a failed
     projection does).
 
@@ -79,8 +77,8 @@ class CasadiTrajectoryProjector:
     the reference is, which a guess following a far-off reference, such as the flow's initial noise, is not). Within a
     control tick (the same ``x_init``; only the reference is refined between flow steps) the last solution is reused as it
     is; at a new tick it is the previous solution shifted by ``tick_steps`` steps (the control periods between two ticks) with zero jerk appended (the rest state it ends in
-    is a fixed point). A solve that fails is restarted cold from the state held still; if that fails too, the previous
-    safe solution is the fallback (see above).
+    is a fixed point). A solve that fails is not repeated: the previous safe solution is the fallback (see above), as in
+    SafeFlowMPC, whose filter keeps its last trajectory when the solve fails.
     """
 
     def __init__(self, simulator: TripleIntegratorBase, config: ProjectionConfig, *, horizon: int, safe: bool = True, tick_steps: int = 1):
@@ -94,24 +92,18 @@ class CasadiTrajectoryProjector:
         self.sim = simulator
         self.tracked_horizon = self.N = int(horizon)
         self.rest_idx = list(self.sim.rest_state_indices)
-        self._graph, self.q_ref_param = self._problem()
+        self._graph = self._problem()
         self.reset()
 
-    def _problem(self) -> tuple[CasadiKinematicGraph, ca.MX]:
-        """The projection problem and its reference parameter."""
-        graph = CasadiKinematicGraph(self.sim, self.N, with_obstacles=self.safe)
-        n, N, config = self.sim.n, self.N, self.config
-        q_ref = graph.parameter(n, N)
-        cost = (
-            ca.sumsqr(graph.X[:n, 1:] - q_ref)
-            + config.velocity_weight * ca.sumsqr(graph.X[n : 2 * n, 1:])
-            + config.acceleration_weight * ca.sumsqr(graph.X[2 * n :, 1:])
-            + config.jerk_weight * ca.sumsqr(graph.U)
+    def _problem(self) -> AcadosKinematicGraph:
+        """The projection problem: the tracking cost of the config, with the rest at the end of the horizon and the
+        obstacles when safe."""
+        config = self.config
+        cost = TrackingCost(
+            config.velocity_weight, config.acceleration_weight, config.jerk_weight,
+            config.terminal_velocity_weight if self.safe else 0.0,
         )
-        if self.safe:
-            cost += config.terminal_velocity_weight * ca.sumsqr(graph.X[self.rest_idx, N])
-        graph.minimize(cost)
-        return graph, q_ref
+        return AcadosKinematicGraph(self.sim, self.N, cost, with_obstacles=self.safe)
 
     def reset(self) -> None:
         """Signals the start of a new episode: nothing of the last one is reused."""
@@ -172,11 +164,9 @@ class CasadiTrajectoryProjector:
         return solution
 
     @staticmethod
-    def _set_problem(
-        graph: CasadiKinematicGraph, q_ref_param: ca.MX, x0: np.ndarray, q_ref: np.ndarray, states: np.ndarray, actions: np.ndarray
-    ) -> None:
+    def _set_problem(graph: AcadosKinematicGraph, x0: np.ndarray, q_ref: np.ndarray, states: np.ndarray, actions: np.ndarray) -> None:
         graph.set_state(x0)
-        graph.set_value(q_ref_param, q_ref.T)
+        graph.set_reference(q_ref)
         graph.set_initial(states, actions)
 
     def project(self, state: np.ndarray, q_ref: np.ndarray) -> Projection:
@@ -202,19 +192,9 @@ class CasadiTrajectoryProjector:
             u_guess = np.hstack([self._prev_U_sol[:, k:], np.zeros((self.sim.nu, k))])
 
         try:
-            try:
-                self._set_problem(self._graph, self.q_ref_param, x0, q_ref, state_guess, u_guess)
-                self._linearize(x0, q_ref)
-                sol = self._solve()
-            except RuntimeError:
-                # A warm start can leave the solver stuck at a locally infeasible point once the state has drifted from the
-                # prediction: a cold restart resolves most of those, unless the attempt already started from holding still
-                cold_states, cold_actions = self._hold_still_guess(x0)
-                if np.allclose(state_guess, cold_states, rtol=0.0, atol=1e-9) and np.allclose(u_guess, cold_actions, rtol=0.0, atol=1e-9):
-                    raise
-                self._set_problem(self._graph, self.q_ref_param, x0, q_ref, cold_states, cold_actions)
-                self._linearize(x0, q_ref)
-                sol = self._solve()
+            self._set_problem(self._graph, x0, q_ref, state_guess, u_guess)
+            self._linearize(x0, q_ref)
+            sol = self._solve()
             self._prev_X_sol = sol.states
             self._prev_U_sol = sol.actions
             self._prev_x0 = x0
@@ -226,7 +206,7 @@ class CasadiTrajectoryProjector:
                 revalidated = self._revalidate_fallback(x0, u_guess)
                 if revalidated is not None:
                     warnings.warn(
-                        f"CasadiTrajectoryProjector solve failed, falling back to the last known-safe trajectory: {exc}",
+                        f"TrajectoryProjector solve failed, falling back to the last known-safe trajectory: {exc}",
                         stacklevel=2,
                     )
                     self._prev_X_sol, self._prev_U_sol, self._prev_x0 = revalidated, u_guess, x0
@@ -234,5 +214,5 @@ class CasadiTrajectoryProjector:
                     return Projection(revalidated[: self.sim.n, 1:].T.copy(), u_guess.T.copy())
                 self.reset()  # the cached plan no longer holds
             raise PlannerSolveError(
-                f"CasadiTrajectoryProjector solve failed with no revalidated safe trajectory to fall back on: {exc}"
+                f"TrajectoryProjector solve failed with no revalidated safe trajectory to fall back on: {exc}"
             ) from exc

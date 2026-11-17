@@ -3,3 +3,7 @@ venv/
 __pycache__/
 data/
 outputs/
+c_generated_code/
+codegen_*/
+acados_ocp*.json
+.acados_cache/

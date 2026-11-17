@@ -21,7 +21,7 @@ from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
 from planning.planner import PlannerSolveError
 from planning.planner_config import ProjectionConfig
-from planning.casadi_projector import CasadiTrajectoryProjector, Projection
+from planning.trajectory_projector import TrajectoryProjector, Projection
 from test.planner_fixtures import pose_goal
 
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml")
@@ -147,7 +147,7 @@ class SharedSimulatorTests(unittest.TestCase):
 
     def test_select_action_is_invariant_to_which_goal_the_simulator_holds(self) -> None:
         # The actual mathematical property the whole redesign relies on,
-        # checked end to end (test_casadi_projector.py checks it at the
+        # checked end to end (test_trajectory_projector.py checks it at the
         # projector level): invert_obs drops the goal, so the projection
         # must not depend on it -- policies with the same weights, built
         # from simulators holding different goals, must act identically on
@@ -179,7 +179,7 @@ class TerminalConditionSupportTests(unittest.TestCase):
         # always solvable, just weakly enforced from far-from-rest states.
         horizon = 2
         simulator = _build_simulator()
-        projector = CasadiTrajectoryProjector(simulator, ProjectionConfig.from_mapping(_validated_config()), horizon=horizon)
+        projector = TrajectoryProjector(simulator, ProjectionConfig.from_mapping(_validated_config()), horizon=horizon)
         state0 = _rest_state(simulator)
         state0[simulator.n] = 2.0
         state0[simulator.n + 4] = 3.0
@@ -309,7 +309,7 @@ class SelectActionBatchSizeGuardTests(unittest.TestCase):
 
 
 class PolicyFactorySafeFlowTests(unittest.TestCase):
-    """PolicyFactory.create(a safeflow spec, ...) wires an inner FlowPolicy and a CasadiTrajectoryProjector into one
+    """PolicyFactory.create(a safeflow spec, ...) wires an inner FlowPolicy and a TrajectoryProjector into one
     single-arm SafeFlowMPCPolicy.
     """
 

@@ -69,8 +69,9 @@ class SphereCollisionModel:
         """For each of the H rows of ``centers`` (H, S, d), whether a sphere of ``radii`` (S,) penetrates an obstacle."""
         positions = np.array([position for position, _ in self.obstacles], dtype=float)
         obstacle_radii = np.array([radius for _, radius in self.obstacles], dtype=float)
-        distances = np.linalg.norm(centers[:, :, None, :] - positions, axis=-1)  # (H, S, obstacles)
-        return np.any(distances < radii[None, :, None] + obstacle_radii, axis=(1, 2))
+        offsets = centers[:, :, None, :] - positions  # (H, S, obstacles, d)
+        squared_distances = np.einsum("hsod,hsod->hso", offsets, offsets)
+        return np.any(squared_distances < (radii[None, :, None] + obstacle_radii) ** 2, axis=(1, 2))
 
     def _penetrates(self, centers: np.ndarray, radii: np.ndarray) -> bool:
         """Whether a sphere of ``centers`` (H, S, d) and ``radii`` (S,) penetrates an obstacle, at any of the H rows."""

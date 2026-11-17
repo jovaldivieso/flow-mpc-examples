@@ -4,7 +4,7 @@ import warnings
 
 import numpy as np
 
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.trajectory_projector import TrajectoryProjector
 from planning.planner import PlannerSolveError
 from planning.planner_config import ProjectionConfig
 from systems.triple_integrator import TripleIntegratorBase
@@ -34,7 +34,7 @@ class SafeSource:
         self._sim = simulator
         self._horizon = int(horizon)
         self._seed = int(seed)
-        self._filter = CasadiTrajectoryProjector(simulator, projection, horizon=self._horizon)
+        self._filter = TrajectoryProjector(simulator, projection, horizon=self._horizon)
 
     def path(self, state: np.ndarray, label: np.ndarray, index: int) -> np.ndarray | None:
         """The projected path (PATH_SEGMENTS + 1, H, n) of the frame ``index`` at ``state`` with the expert's ``label`` (H, n),

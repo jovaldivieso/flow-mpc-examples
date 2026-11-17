@@ -65,7 +65,7 @@ class ExpertConfig:
 
 @dataclass(frozen=True)
 class ProjectionConfig:
-    """The cost of ``CasadiTrajectoryProjector`` (the tracking of a chunk of positions, after SafeFlowMPC's safety filter,
+    """The cost of ``TrajectoryProjector`` (the tracking of a chunk of positions, after SafeFlowMPC's safety filter,
     which weights the positions 1, the velocities and accelerations 1e-3 and the jerks 1e-4) and its fallback."""
 
     velocity_weight: float = 1e-3

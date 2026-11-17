@@ -7,7 +7,7 @@ from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy
 from learning.models.pose_guidance import PoseGuidance
 from learning.models.safe_flow_policy import SafeFlowMPCPolicy
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.trajectory_projector import TrajectoryProjector
 from planning.planner_config import ProjectionConfig
 from systems.triple_integrator import TripleIntegratorBase
 
@@ -34,11 +34,11 @@ PolicyBuilder = Callable[[PolicySpec, TripleIntegratorBase, Mapping[str, Any] | 
 
 def _projection_config(planner_config: Mapping[str, Any] | None, policy_type: str) -> ProjectionConfig:
     if planner_config is None:
-        raise ValueError(f"policy_type '{policy_type}' requires a planner config to build its CasadiTrajectoryProjector.")
+        raise ValueError(f"policy_type '{policy_type}' requires a planner config to build its TrajectoryProjector.")
     return ProjectionConfig.from_mapping(planner_config)
 
 
-def _flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, tracker: CasadiTrajectoryProjector | None) -> FlowPolicy:
+def _flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, tracker: TrajectoryProjector | None) -> FlowPolicy:
     return FlowPolicy(
         action_dim=spec.action_dim,
         cond_dim=spec.cond_dim,
@@ -57,7 +57,7 @@ def _flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, tracker: Cas
 def build_flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, planner_config: Mapping[str, Any] | None) -> FlowPolicy:
     """A flow policy whose flow is guided toward the goal pose of ``simulator``, executed by the tracking within the plant's
     limits."""
-    tracker = CasadiTrajectoryProjector(
+    tracker = TrajectoryProjector(
         simulator,
         _projection_config(planner_config, spec.policy_type),
         horizon=spec.prediction_horizon,
@@ -70,10 +70,10 @@ def build_flow_policy(spec: PolicySpec, simulator: TripleIntegratorBase, planner
 def build_safe_flow_policy(
     spec: PolicySpec, simulator: TripleIntegratorBase, planner_config: Mapping[str, Any] | None
 ) -> SafeFlowMPCPolicy:
-    """A flow policy with the projection of ``CasadiTrajectoryProjector``, built from the validated expert config
+    """A flow policy with the projection of ``TrajectoryProjector``, built from the validated expert config
     ``planner_config``. The projector reads no goal of the simulator (its dynamics, limits and obstacles come from the
     system), so the simulator is shared with it and not copied."""
-    projector = CasadiTrajectoryProjector(
+    projector = TrajectoryProjector(
         simulator, _projection_config(planner_config, spec.policy_type), horizon=spec.prediction_horizon, tick_steps=spec.execution_horizon
     )
     return SafeFlowMPCPolicy(_flow_policy(spec, simulator, None), projector)

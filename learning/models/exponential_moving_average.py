@@ -14,7 +14,7 @@ class ExponentialMovingAverage:
     The averaged weights are less noisy than the weights of the last optimizer step, and are what the policy
     is run with (SafeFlowMPC trains and evaluates its flow network this way, decay 0.995). Keeps plain tensors
     instead of a second module so it also works for policies that wrap non-copyable parts (the safe flow policy
-    carries a CasADi projector): the rollouts load the average into their own policy.
+    carries a projector): the rollouts load the average into their own policy.
     """
 
     def __init__(self, module: nn.Module, decay: float = DEFAULT_EMA_DECAY) -> None:

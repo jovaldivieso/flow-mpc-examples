@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.trajectory_projector import TrajectoryProjector
 from planning.ompl_planner import OmplPlanner
 from planning.planner import Plan, Planner, PlannerSolveError
 from planning.planner_config import ExpertConfig, ProjectionConfig
@@ -70,7 +70,7 @@ class OmplCasadiPlanner(Planner):
     arm are the plan, tracked directly: there is no rest at a lookahead point to head for, the arm follows the timed path.
 
     A state is labelled with the positions of the next ``horizon`` control periods along the timed path from the point of it
-    nearest to the arm (``_Progress``), and the plan executes them with the jerks of ``CasadiTrajectoryProjector``, which
+    nearest to the arm (``_Progress``), and the plan executes them with the jerks of ``TrajectoryProjector``, which
     keep the arm within its limits and clear of the obstacles. The path is planned at the first state of an episode and
     again where the arm is when it is further than ``replan_distance`` from it (the learner drove it away).
 
@@ -96,7 +96,7 @@ class OmplCasadiPlanner(Planner):
         self.sim = simulator
         self.config = config
         self._ompl = OmplPlanner(simulator, config)
-        self._tracker = CasadiTrajectoryProjector(simulator, projection, horizon=config.horizon)
+        self._tracker = TrajectoryProjector(simulator, projection, horizon=config.horizon)
         self._progress: _Progress | None = None
         self._paths = self._replans = self._path_failures = self._trimmed_labels = self._goal_labels = self._blocked_replans = 0
 

@@ -17,7 +17,7 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from learning.dagger.safe_pairs import PAIRS_FILE, PooledPairs, SafePairs
 from learning.models.safe_source import PATH_SEGMENTS, SafeSource
-from planning.casadi_projector import Projection
+from planning.trajectory_projector import Projection
 from planning.planner import PlannerSolveError
 from planning.planner_config import ProjectionConfig
 from systems.franka_system import FrankaSystem

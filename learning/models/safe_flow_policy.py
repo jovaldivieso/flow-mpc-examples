@@ -8,16 +8,16 @@ from torch import nn
 
 from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import ActionPolicy, observation_features
-from planning.casadi_projector import CasadiTrajectoryProjector
+from planning.trajectory_projector import TrajectoryProjector
 
 
 
 class SafeFlowMPCPolicy(ActionPolicy):
-    """Wraps a FlowPolicy with a CasADi safety projection at every inference step (SafeFlowMPC, Oelerich et al., 2026).
+    """Wraps a FlowPolicy with a safety projection at every inference step (SafeFlowMPC, Oelerich et al., 2026).
 
     Loss and reset delegate to the inner FlowPolicy. ``select_action`` integrates the flow over the chunk of positions:
     after every flow step the proposal is moved toward the goal by the inner policy's guidance and projected onto the
-    safe set by ``CasadiTrajectoryProjector``, and the projected positions are the flow's next state. The jerks of the
+    safe set by ``TrajectoryProjector``, and the projected positions are the flow's next state. The jerks of the
     last projection are what the system executes, the first of them now.
 
     The integration does not start from Gaussian noise but from the previous tick's safe positions (one control period
@@ -32,7 +32,7 @@ class SafeFlowMPCPolicy(ActionPolicy):
     the inner policy's behind the ``inner_policy.`` prefix, which ``load_network_state_dict`` maps checkpoint keys onto.
     """
 
-    def __init__(self, inner_policy: FlowPolicy, projector: CasadiTrajectoryProjector) -> None:
+    def __init__(self, inner_policy: FlowPolicy, projector: TrajectoryProjector) -> None:
         super().__init__()
         self.inner_policy = inner_policy
         self.projector = projector

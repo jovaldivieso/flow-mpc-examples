@@ -15,7 +15,7 @@ from learning.models.flow_policy import FlowPolicy
 from learning.models.policy import observation_features
 from learning.models.policy_factory import PolicyFactory, PolicySpec
 from learning.models.pose_guidance import PoseGuidance
-from planning.casadi_projector import CasadiTrajectoryProjector, Projection
+from planning.trajectory_projector import TrajectoryProjector, Projection
 from systems.franka_system import Q_READY, FrankaSystem
 from systems.point_mass_system import PointMassSystem
 from test.planner_fixtures import pinned_config
@@ -568,7 +568,7 @@ class PolicyFactoryTests(unittest.TestCase):
         policy = PolicyFactory.create(_spec(), PointMassSystem({}), {})
         self.assertIsInstance(policy, FlowPolicy)
         self.assertIsInstance(policy.guidance, PoseGuidance)  # the flow is always guided toward the goal
-        self.assertIsInstance(policy.tracker, CasadiTrajectoryProjector)
+        self.assertIsInstance(policy.tracker, TrajectoryProjector)
         self.assertFalse(policy.tracker.safe)  # the tracking within the limits alone
         self.assertEqual(policy.tracker.tracked_horizon, 4)
         self.assertEqual(policy.tracker.tick_steps, EXECUTION)

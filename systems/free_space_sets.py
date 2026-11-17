@@ -45,35 +45,34 @@ class FreeSpaceSets:
         if self.size == 0:
             return normals, offsets
 
-        centers = np.array([center for center, _ in self.obstacles])
+        centers = np.array([center for center, _ in self.obstacles], dtype=float)
         inflated = np.array([radius for _, radius in self.obstacles])[None, :] + radii[:, None] + self.margin  # (S, O)
-        nearest = self._nearest_points(start, end, centers)  # (S, O, 3)
-        away = nearest - centers[None, :, :]
-        gap = np.linalg.norm(away, axis=-1) - inflated
+        # The offset of every center from the point of every segment nearest to it, away = start + f (end - start) - center
+        segment = end - start
+        squared_length = np.einsum("sc,sc->s", segment, segment)
+        to_center = centers[None, :, :] - start[:, None, :]  # (S, O, 3)
+        along = np.einsum("soc,sc->so", to_center, segment)
+        fraction = np.clip(np.where(squared_length[:, None] > 1e-12, along / np.maximum(squared_length, 1e-12)[:, None], 0.0), 0.0, 1.0)
+        away = fraction[..., None] * segment[:, None, :] - to_center
+        length = np.sqrt(np.einsum("soc,soc->so", away, away))
+        gap = length - inflated
         inside = gap < 0.0
-        away = np.where(inside[..., None], start[:, None, :] - centers[None, :, :], away)
-        length = np.linalg.norm(away, axis=-1, keepdims=True)
-        direction = np.where(length > 1e-9, away / np.maximum(length, 1e-9), np.eye(3)[0])  # (S, O, 3)
-        plane = np.einsum("soc,oc->so", direction, centers) + inflated  # offset of the half-space of every pair
-
+        if inside.any():  # the segment enters the inflated obstacle: the half-space of its point nearest to the start
+            away[inside] = -to_center[inside]
+            length[inside] = np.linalg.norm(away[inside], axis=-1)
         excluded = np.zeros(gap.shape, dtype=bool)
         spheres = np.arange(num_spheres)
         for i in range(self.size):
             nearest_open = np.argmin(np.where(excluded, np.inf, gap), axis=1)
             has_open = ~excluded[spheres, nearest_open]
-            normal, offset = direction[spheres, nearest_open], plane[spheres, nearest_open]
+            # The half-space of each sphere's chosen obstacle: its normal points from the center to the segment
+            chosen_length = length[spheres, nearest_open]
+            normal = away[spheres, nearest_open] / np.maximum(chosen_length, 1e-9)[:, None]
+            normal[chosen_length <= 1e-9] = np.eye(3)[0]
+            offset = np.einsum("sc,sc->s", normal, centers[nearest_open]) + inflated[spheres, nearest_open]
             normals[has_open, i], offsets[has_open, i] = normal[has_open], offset[has_open]
             # An obstacle whose inflated sphere lies entirely on the excluded side of the half-space adds nothing to the set
-            reach = np.einsum("sc,oc->so", normal, centers) + inflated
+            reach = normal @ centers.T + inflated
             excluded |= has_open[:, None] & (reach - offset[:, None] <= EXCLUDED_TOLERANCE)
             excluded[spheres, nearest_open] |= has_open
         return normals, offsets
-
-    @staticmethod
-    def _nearest_points(start: np.ndarray, end: np.ndarray, centers: np.ndarray) -> np.ndarray:
-        """The point of the segment ``start[s]`` -> ``end[s]`` nearest to every center, (S, O, 3)."""
-        direction = end - start
-        squared_length = np.einsum("sc,sc->s", direction, direction)
-        along = np.einsum("soc,sc->so", centers[None, :, :] - start[:, None, :], direction)
-        fraction = np.where(squared_length[:, None] > 1e-12, along / np.maximum(squared_length, 1e-12)[:, None], 0.0)
-        return start[:, None, :] + np.clip(fraction, 0.0, 1.0)[..., None] * direction[:, None, :]
