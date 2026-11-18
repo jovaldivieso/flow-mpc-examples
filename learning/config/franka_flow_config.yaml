@@ -8,7 +8,7 @@ model:
 
   # The policy predicts a chunk of prediction_horizon joint positions per state (DAgger labels it with the expert's plan)
   prediction_horizon: 16
-  execution_horizon: 8          # control periods the first jerks of the chunk are executed for before the policy is asked again
+  execution_horizon: 1          # control periods the first jerks of the chunk are executed for before the policy is asked again
   unet:
     dim: 32                     # base channel count (a multiple of 8)
     dim_mults: [1, 2, 4, 8]     # channel multipliers of the levels; every level but the first halves the horizon

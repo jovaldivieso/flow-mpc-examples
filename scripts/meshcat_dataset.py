@@ -146,7 +146,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument(
-        "--config",
+        "--expert-config",
         type=Path,
         default=Path("scripts/config/franka_config.yaml"),
         help="expert yaml config, only its dt and the robot model are used (default: %(default)s)",
@@ -164,7 +164,7 @@ def main() -> None:
     parser.add_argument("--success-tol", type=float, default=0.02, help="TCP distance to the goal [m] for a green path in --overview (default: %(default)s)")
     args = parser.parse_args()
 
-    dyn = FrankaSystem(load_and_validate_system_config(args.config))
+    dyn = FrankaSystem(load_and_validate_system_config(args.expert_config))
     indices = [int(i) for i in ast.literal_eval(args.indices)] if args.indices else None
     episodes = load_episodes(args.root, dyn, 10**9 if args.overview else args.episodes, args.seed, args.first, indices)
     played = episodes[: args.episodes] if indices is None else episodes

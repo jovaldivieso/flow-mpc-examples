@@ -89,7 +89,7 @@ def summarize(dyn: FrankaSystem, rollout: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
+    parser.add_argument("--expert-config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
     parser.add_argument("--num-traj", type=int, default=10, help="number of random rollouts, seeds 0..N-1 (default: %(default)s)")
     parser.add_argument("--seeds", type=str, default=None, help="explicit seeds instead of 0..N-1, e.g. '[0, 3, 7]'")
     parser.add_argument("--num-steps", type=int, default=250, help="maximum steps per rollout (default: %(default)s)")
@@ -101,7 +101,7 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
     args = parser.parse_args()
 
-    config = load_and_validate_system_config(args.config)
+    config = load_and_validate_system_config(args.expert_config)
     initialize_ompl(config["ompl_seed"])
     if args.tolerance_overrides:
         config = validate_system_config({**config, **ast.literal_eval(args.tolerance_overrides)})

@@ -116,7 +116,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model-dir", required=True, help="DAgger checkpoint, e.g. outputs/train_dagger/<name>/flow_dagger_checkpoint.pt")
     parser.add_argument("--policy-type", choices=["flow", "safeflow"], default=None, help="default: the checkpoint's own policy type")
-    parser.add_argument("--config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
+    parser.add_argument("--expert-config", type=Path, default=Path("scripts/config/franka_config.yaml"), help="expert yaml config (default: %(default)s)")
+    parser.add_argument("--policy-config", type=Path, default=None, help="policy yaml config overriding the checkpoint's policy_config.yaml")
     parser.add_argument("--seeds", type=str, default="[10000]", help="seeds of the starts and goals, e.g. '[10000, 10001]' (default: %(default)s)")
     parser.add_argument("--num-steps", type=int, default=200, help="maximum steps per rollout (default: %(default)s)")
     parser.add_argument("--tolerance-overrides", type=str, default=None, help="dict of pos_tol / rot_tol / vel_tol overriding the config's")
@@ -128,7 +129,7 @@ def main() -> None:
     parser.add_argument("--speed", type=float, default=1.0, help="playback speed relative to real time (default: %(default)s)")
     args = parser.parse_args()
 
-    config = load_and_validate_system_config(args.config)
+    config = load_and_validate_system_config(args.expert_config)
     if args.show_workspace and config["system"] != "franka":
         parser.error("--show-workspace is the workspace of the franka system")
     initialize_ompl(config["ompl_seed"])
@@ -137,7 +138,7 @@ def main() -> None:
     device = torch.device(args.device)
     dyn = SystemFactory.create(config["system"], config)
     policy_type = args.policy_type or checkpoint_policy_type(args.model_dir)
-    policy = load_policy(policy_type, args.model_dir, dyn, config, device)
+    policy = load_policy(policy_type, args.model_dir, dyn, config, device, policy_config=args.policy_config)
     planner = PlannerFactory.create(config["expert"], dyn, config) if args.show_expert else None
     seeds = [int(s) for s in ast.literal_eval(args.seeds)]
 

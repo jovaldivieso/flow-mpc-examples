@@ -129,7 +129,7 @@ venv/bin/python learning/train_dagger.py --experiment-name toy_flow \
   --policy-config learning/config/triple_integrator_flow_config.yaml
 ```
 
-`scripts.meshcat_policy` also plays a point-mass checkpoint (pass `--config scripts/config/triple_integrator_config.yaml`).
+`scripts.meshcat_policy` also plays a point-mass checkpoint (pass `--expert-config scripts/config/triple_integrator_config.yaml`).
 
 ### Expert config (`scripts/config/franka_table_config.yaml`)
 
@@ -191,13 +191,13 @@ Each round executes a mix of expert and learner actions (`expert_beta_per_iterat
 ```bash
 venv/bin/python -m scripts.evaluate_policy \
   --model-dir outputs/train_dagger/franka_flow/flow_dagger_checkpoint.pt \
-  --config scripts/config/franka_obstacles_config.yaml \
+  --expert-config scripts/config/franka_obstacles_config.yaml \
   --num-steps 200 --seeds "[0, 1, 2, 3, 4]" \
   --tolerance-overrides '{"pos_tol": 0.02, "rot_tol": 0.30, "vel_tol": 0.1}' \
   [--output-path outputs/eval.npz]
 ```
 
-`evaluate_policy` and `meshcat_policy` share their options (`--model-dir`, `--policy-type`, `--config`, `--seeds`, `--num-steps`, `--tolerance-overrides`, `--device`, with the same defaults), so a rollout looked at in Meshcat can be evaluated with the same command line. It rolls out the expert and the policy from the same seeded start and goal and reports the success rate, the collision / timeout / solve-failure rates, steps, the final error, and the solve times of the expert and the policy. `--policy-type` is the checkpoint's own by default; pass `flow` or `safeflow` to evaluate it as the other.
+`evaluate_policy` and `meshcat_policy` share their options (`--model-dir`, `--policy-type`, `--expert-config`, `--policy-config`, `--seeds`, `--num-steps`, `--tolerance-overrides`, `--device`, with the same defaults), so a rollout looked at in Meshcat can be evaluated with the same command line. It rolls out the expert and the policy from the same seeded start and goal and reports the success rate, the collision / timeout / solve-failure rates, steps, the final error, and the solve times of the expert and the policy. `--policy-type` is the checkpoint's own by default; pass `flow` or `safeflow` to evaluate it as the other.
 
 ### Check the expert, visualize
 

@@ -371,6 +371,33 @@ class LoadPolicyTests(unittest.TestCase):
 
         self.assertEqual(policy.execution_horizon, 1)
 
+    def test_a_policy_config_yaml_overrides_execution_horizon_and_inference_steps(self) -> None:
+        config = pinned_config()
+        simulator = FrankaSystem(config)
+        template = PolicyFactory.create(_spec(simulator, action_scale=(1.0,) * N), simulator, config)
+        checkpoint = self._checkpoint(simulator, template, template.state_dict())
+        with tempfile.TemporaryDirectory() as directory:
+            ckpt_path = os.path.join(directory, "checkpoint.pt")
+            torch.save(checkpoint, ckpt_path)
+            sibling_yaml = Path(directory) / "policy_config.yaml"
+            sibling_yaml.write_text(
+                "model:\n  execution_horizon: 5\n  flow:\n    num_inference_steps: 4\n",
+                encoding="utf-8",
+            )
+            override_yaml = Path(directory) / "override.yaml"
+            override_yaml.write_text(
+                "model:\n  execution_horizon: 1\n  flow:\n    num_inference_steps: 9\n",
+                encoding="utf-8",
+            )
+
+            sibling_policy = load_policy("flow", ckpt_path, simulator, config, torch.device("cpu"))
+            override_policy = load_policy("flow", ckpt_path, simulator, config, torch.device("cpu"), policy_config=override_yaml)
+
+        self.assertEqual(sibling_policy.execution_horizon, 5)
+        self.assertEqual(sibling_policy.velocity_net.num_inference_steps, 4)
+        self.assertEqual(override_policy.execution_horizon, 1)
+        self.assertEqual(override_policy.velocity_net.num_inference_steps, 9)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import time
 import torch
 import ast
 import argparse
+from pathlib import Path
 import numpy as np
 from typing import Any, Mapping
 
@@ -28,7 +29,7 @@ from systems.position_history import PositionHistory
 from systems.rollout_termination import RolloutTerminationTracker
 from systems.system import SystemSimulator
 from systems.system_factory import SystemFactory
-from learning.config_loaders import UnetConfig
+from learning.config_loaders import UnetConfig, load_execution_horizon, load_flow_config
 from learning.data_utils import build_dataset_features
 from learning.dagger import apply_config_overrides, build_policy_actions
 from learning.dagger.policy_action import apply_execution_noise
@@ -334,31 +335,48 @@ def _load_checkpoint_policy_components(
     )
 
 
+def _resolve_policy_config_path(model_dir: str, policy_config: str | Path | None) -> Path | None:
+    if policy_config is not None:
+        return Path(policy_config)
+    sibling_config = Path(model_dir).parent / "policy_config.yaml"
+    return sibling_config if sibling_config.is_file() else None
+
+
 def load_policy(
     policy_type: str,
     model_dir: str,
     simulator: SystemSimulator,
     planner_config: Mapping[str, Any],
     device: torch.device,
+    policy_config: str | Path | None = None,
 ):
     """The policy of a DAgger checkpoint (the EMA weights when it has them), in eval mode on ``device``.
 
     ``planner_config`` is the validated expert config a ``safeflow`` policy builds its projector from.
+    Inference-only settings (``execution_horizon`` and ``num_inference_steps``) are read from ``policy_config``
+    or a sibling ``policy_config.yaml`` next to the checkpoint when present, falling back to the checkpoint metadata.
     """
     checkpoint, state_dict, cond_dim, action_dim, history_length, unet, prediction_horizon = (
         _load_checkpoint_policy_components(model_dir, simulator, policy_type, device)
     )
     flow_config = checkpoint["flow_config"]
+    policy_config_path = _resolve_policy_config_path(model_dir, policy_config)
+    if policy_config_path is not None:
+        execution_horizon = load_execution_horizon(policy_config_path, prediction_horizon)
+        num_inference_steps = load_flow_config(policy_config_path).num_inference_steps
+    else:
+        execution_horizon = int(checkpoint.get("execution_horizon", 1))  # absent: a run that executed one step per call
+        num_inference_steps = int(flow_config["num_inference_steps"])
     spec = PolicySpec(
         policy_type=policy_type,
         action_dim=action_dim,
         cond_dim=cond_dim,
         history_length=history_length,
-        execution_horizon=int(checkpoint.get("execution_horizon", 1)),  # absent: a run that executed one step per call
+        execution_horizon=execution_horizon,
         prediction_horizon=prediction_horizon,
         unet_dim=unet.dim,
         unet_dim_mults=unet.dim_mults,
-        num_inference_steps=int(flow_config["num_inference_steps"]),
+        num_inference_steps=num_inference_steps,
         action_scale=tuple(flow_config["action_scale"]),
     )
     policy = PolicyFactory.create(spec, simulator, planner_config)
@@ -388,6 +406,7 @@ def run_evaluation(
     action_noise_std: float = 0.0,
     output_path: str | None = None,
     device_override: str | None = None,
+    policy_config: str | Path | None = None,
 ):
     if tolerance_overrides:
         config = apply_config_overrides(config, tolerance_overrides)
@@ -409,7 +428,7 @@ def run_evaluation(
     print(f"running inference on {device}")
     print(f"action noise seed: {action_noise_seed}")
 
-    policy = load_policy(policy_type, model_dir, simulator, validated_config, device)
+    policy = load_policy(policy_type, model_dir, simulator, validated_config, device, policy_config=policy_config)
 
     # Instantiate expert planner once and reset it for each rollout.
     expert_planner = PlannerFactory.create(validated_config["expert"], simulator, validated_config)
@@ -723,10 +742,16 @@ def main():
         help="default: the checkpoint's own policy type",
     )
     parser.add_argument(
-        "--config",
+        "--expert-config",
         type=str,
         default=os.path.join(PROJECT_ROOT, "scripts", "config", "franka_config.yaml"),
         help="expert yaml config (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--policy-config",
+        type=Path,
+        default=None,
+        help="policy yaml config overriding the checkpoint's policy_config.yaml",
     )
     parser.add_argument(
         "--seeds",
@@ -794,7 +819,7 @@ def main():
     )
 
     args = parser.parse_args()
-    config = load_and_validate_system_config(config_path=args.config)
+    config = load_and_validate_system_config(config_path=args.expert_config)
     initialize_ompl(config["ompl_seed"])
 
     tolerance_overrides = None
@@ -818,6 +843,7 @@ def main():
         action_noise_std=args.action_noise_std,
         output_path=args.output_path,
         device_override=args.device,
+        policy_config=args.policy_config,
     )
 
 
