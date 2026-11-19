@@ -10,6 +10,9 @@ chunk (without projection, with guidance, and the plan the policy settles on).
 
     python scripts/analyze_failures.py --checkpoint outputs/train_dagger/<run>/flow_dagger_iter_003.pt \
         --expert-config scripts/config/franka_obstacles_config.yaml --policy-config learning/config/<policy>.yaml
+
+The policy runs with the inference settings of ``--policy-config``; the run's own ``outputs/train_dagger/<run>/policy_config.yaml``
+evaluates it as it was trained.
 """
 
 from __future__ import annotations
@@ -268,10 +271,11 @@ def analyze(
     eval_tolerances: Mapping[str, float],
     expert_tolerances: Mapping[str, float],
     with_expert: bool,
+    policy_config: Path,
 ) -> list[dict[str, Any]]:
     eval_config = validate_system_config(apply_config_overrides(config, eval_tolerances))
     simulator = SystemFactory.create(eval_config["system"], eval_config)
-    policy = load_policy(checkpoint_policy_type(checkpoint), checkpoint, simulator, eval_config, torch.device("cpu"))
+    policy = load_policy(checkpoint_policy_type(checkpoint), checkpoint, simulator, eval_config, torch.device("cpu"), policy_config)
     starts = EpisodeStarts.from_specs(simulator, None, None)
     noise_seed = default_action_noise_seed_for_config(eval_config)
     expert_config = validate_system_config(apply_config_overrides(config, expert_tolerances))
@@ -366,7 +370,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--expert-config", required=True)
-    parser.add_argument("--policy-config", type=Path, required=True, help="the training config of the run (evaluation settings)")
+    parser.add_argument(
+        "--policy-config", type=Path, required=True,
+        help="policy config: the evaluation settings and the policy's inference settings (execution_horizon, num_inference_steps)",
+    )
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--seed-start", type=int)
     parser.add_argument("--steps", type=int)
@@ -386,6 +393,7 @@ def main() -> None:
         training.get("eval_tolerance_overrides") or training.get("tolerance_overrides") or {},
         training.get("tolerance_overrides") or {},
         args.expert,
+        args.policy_config,
     )
     report(episodes)
     if args.output:
